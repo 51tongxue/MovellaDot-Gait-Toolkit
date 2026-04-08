@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.XsensDotCollector" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">#0D0D0F</item>
+        <item name="android:windowBackground">#0D0D0F</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorPrimary">#3B82F6</item>
+        <item name="android:colorPrimaryDark">#2563EB</item>
+    </style>
+</resources>

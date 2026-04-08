@@ -1,0 +1,2052 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北京体育大学体育工程学院跳远分析系统</title>
+  <!-- 离线资源库 -->
+  <script src="lib/chart.umd.js"></script>
+  <script src="lib/chartjs-plugin-annotation.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d0d0f;
+      --surface: #16161a;
+      --card: #1c1c21;
+      --border: #2a2a32;
+      --text: #e8e8ed;
+      --muted: #71717a;
+      --green: #22c55e;
+      --orange: #f97316;
+      --accent: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      font-size: 15px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.4rem 0.5rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    }
+    .header-brand { 
+      display: flex; 
+      align-items: center; 
+      gap: 0.75rem; 
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .logo-box {
+      background: #fff;
+      padding: 4px 6px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .header-logo {
+      height: 26px;
+      width: auto;
+      object-fit: contain;
+    }
+    .header-text {
+      display: flex;
+      align-items: center;
+    }
+    .header-title { 
+      font-weight: 700; 
+      font-size: 0.93rem; 
+      letter-spacing: -0.01em;
+      color: var(--text);
+      white-space: nowrap;
+      display: block;
+    }
+    .header-brand { gap: 0.35rem; }
+    /* 移除了之前的响应式媒体查询，改为全局统一紧凑布局 */
+    .header-tabs { 
+      display: flex; 
+      gap: 0.1rem; 
+      flex-shrink: 0;
+      margin-left: 0.5rem;
+    }
+    /* 自定义模态框样式 */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 20000;
+    }
+    .modal-content {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      width: 90%;
+      max-width: 340px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      animation: modalFadeIn 0.2s ease-out;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .modal-title { font-weight: 700; font-size: 1.1rem; margin-bottom: 0.75rem; color: #fff; }
+    .modal-text { font-size: 0.9rem; color: var(--muted); margin-bottom: 1.5rem; line-height: 1.5; }
+    .modal-actions { display: flex; gap: 0.75rem; }
+    .btn-modal { 
+      flex: 1; padding: 0.7rem; border-radius: 8px; font-weight: 600; cursor: pointer; border: none; font-size: 0.9rem;
+    }
+    .btn-confirm { background: #ff4757; color: #fff; }
+    .btn-cancel { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .header-tabs span {
+      padding: 0.35rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.725rem;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .header-tabs span:hover { color: var(--text); }
+    .header-tabs span.active { background: var(--card); color: var(--green); }
+
+    /* 全局视图切换 */
+    .view-content { display: none; }
+    .view-content.active { display: block; }
+
+    /* 实验室视图样式 */
+    .lab-section { padding: 1.25rem; }
+    .lab-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.5rem;
+    }
+    .lab-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+    }
+    .lab-card h4 { margin: 0 0 1rem 0; font-size: 0.9rem; color: var(--muted); display: flex; align-items: center; gap: 0.5rem; }
+    .lab-chart-wrap { height: 320px; position: relative; }
+
+    /* 文件选择区 */
+    .file-section {
+      padding: 1.25rem 1.5rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .file-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem;
+      max-width: 1000px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .file-card-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 1rem;
+      width: 100%;
+    }
+    .file-card-row-main {
+      align-items: center;
+      justify-content: space-between;
+    }
+    .file-source {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .file-label {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-right: 0.25rem;
+    }
+    .file-card-right {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-shrink: 1;
+      min-width: 0;
+    }
+    .file-param {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .file-param .param-input {
+      width: 52px;
+      padding: 0.35rem 0.4rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    .device-info {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+    #device-id-val {
+      color: var(--orange);
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+    }
+    .foot-side {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-left: 0.5rem;
+      padding-left: 0.5rem;
+      border-left: 1px solid var(--border);
+    }
+    .file-section label.mass {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+    .file-section input[type="number"] {
+      width: 64px;
+      padding: 0.5rem 0.5rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+    .file-section select {
+      min-width: 320px; /* Increased min-width */
+      flex: 1; /* Added flex property */
+      padding: 0.5rem 0.75rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+    .file-divider {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .btn-upload-wrap {
+      position: relative;
+    }
+    .file-section input[type="file"] {
+      position: absolute;
+      width: 0.1px;
+      height: 0.1px;
+      opacity: 0;
+      overflow: hidden;
+      z-index: -1;
+    }
+    .btn-upload {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.5rem 0.9rem;
+      background: var(--card);
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 0.875rem;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .btn-upload:hover {
+      border-color: var(--green);
+      color: var(--green);
+    }
+    .file-name {
+      font-size: 0.8rem;
+      color: var(--muted);
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .file-name.has-file { color: var(--green); }
+    .btn-analyze {
+      padding: 0.4rem 1rem;
+      background: var(--green);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: filter 0.15s;
+      flex-shrink: 0;
+    }
+    .btn-analyze:hover { filter: brightness(1.12); }
+    .btn-analyze:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-msg {
+      font-size: 0.8rem;
+      margin-top: 0.75rem;
+      padding: 0.35rem 0;
+      display: none;
+    }
+    .status-msg.err { color: #f87171; }
+    .status-msg.ok { color: var(--green); }
+
+    .range-hint {
+      font-size: 0.8rem;
+      color: var(--green);
+      padding: 0.4rem 0.75rem;
+      margin-bottom: 0.75rem;
+      background: rgba(34,197,94,0.12);
+      border: 1px solid rgba(34,197,94,0.35);
+      border-radius: 8px;
+    }
+
+    .graph-section { padding: 1rem 1.25rem; background: var(--surface); }
+    .graph-wrap {
+      height: 200px;
+      border-radius: 8px;
+      background: var(--card);
+      padding: 0.75rem;
+    }
+    .graph-wrap canvas { width: 100% !important; height: 100% !important; }
+    .summary-bars {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      margin-top: 1rem;
+    }
+    .summary-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.65rem 1rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .summary-bar.orange {
+      background: linear-gradient(90deg, rgba(249,115,22,0.25) 0%, rgba(249,115,22,0.08) 100%);
+      border: 1px solid rgba(249,115,22,0.35);
+      color: var(--orange);
+    }
+    .summary-bar.summary-bar-metric {
+      /* 颜色由 JS 根据当前指标动态设置 */
+      background: linear-gradient(90deg, rgba(34,197,94,0.25) 0%, rgba(34,197,94,0.08) 100%);
+      border: 1px solid rgba(34,197,94,0.35);
+      color: #22c55e;
+    }
+    .summary-bar .label { font-size: 1rem; color: var(--muted); font-family: 'Outfit', sans-serif; font-weight: 500; }
+    .summary-bar .value { 
+      font-size: 1rem; 
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .metrics-section { padding: 1rem 1.25rem 2rem; }
+    .metrics-section h3 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin: 0 0 0.75rem 0;
+    }
+    .metric-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.6rem 0.85rem;
+      background: var(--card);
+      border-radius: 6px;
+      margin-bottom: 0.4rem;
+      border: 1px solid transparent;
+    }
+    .metric-row[data-metric] {
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .metric-row[data-metric]:hover {
+      background: rgba(255,255,255,0.04);
+    }
+    .metric-row[data-metric].active-chart {
+      /* 边框/背景由 JS 按当前指标颜色设置 */
+      background: rgba(255,255,255,0.08); /* 占位样式 */
+    }
+    .metric-row .metric-arrow {
+      margin-left: 0.5rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .metric-row[data-metric] .metric-arrow { opacity: 0.7; }
+    .metric-row[data-metric].active-chart .metric-arrow { opacity: 1; }
+    .metric-left { display: flex; align-items: center; gap: 0.65rem; }
+    .metric-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .metric-dot.green { background: var(--green); }
+    .metric-dot.orange { background: var(--orange); }
+    .metric-dot.blue { background: var(--accent); }
+    /* 各指标独立颜色，与图表折线一致 */
+    .metric-dot-cadence { background: #22c55e; }
+    .metric-dot-speed { background: #3b82f6; }
+    .metric-dot-stride-length { background: #06b6d4; }
+    .metric-dot-contact { background: #84cc16; }
+    .metric-dot-swing { background: #f97316; }
+    .metric-dot-stride-time { background: #16a34a; }
+    .metric-dot-double-support { background: #10b981; }
+    .metric-dot-flight-time { background: #f59e0b; }
+    .metric-dot-vgrf { background: #a855f7; }
+    .metric-name { font-size: 0.9rem; }
+    .metric-value { font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 0.95rem; color: var(--muted); }
+    .metric-value.empty { color: var(--muted); font-weight: 400; }
+    .metric-unit { font-size: 0.75rem; color: var(--muted); margin-left: 0.2rem; }
+
+    /* 每步数据表格 */
+    .table-section { padding: 1rem 1.25rem 2rem; }
+    .table-section h3 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin: 0 0 0.75rem 0;
+    }
+    .strides-table-wrap { overflow-x: auto; border-radius: 8px; background: var(--card); border: 1px solid var(--border); }
+    .strides-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .strides-table th, .strides-table td { padding: 0.45rem 0.6rem; text-align: right; border-bottom: 1px solid var(--border); }
+    .strides-table th { text-align: right; color: var(--muted); font-weight: 600; white-space: nowrap; }
+    .strides-table td:first-child { text-align: center; color: var(--muted); }
+    .strides-table tr:hover td { background: rgba(255,255,255,0.03); }
+    .strides-table .col-status { text-transform: lowercase; }
+    .strides-table .col-status.walk { color: var(--green); }
+    .strides-table .col-status.run { color: var(--orange); }
+
+    .metric-chip {
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .metric-chip.active {
+      /* 选中时颜色由 JS 按当前指标设置 */
+      border-color: var(--green); /* 占位样式 */
+    }
+    .metric-chips-row {
+      margin-top: 0.6rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    /* SPLITS 视图 */
+    .splits-section { padding: 1.25rem; }
+    .split-info {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .split-metric-name { font-size: 0.9rem; color: var(--green); margin-bottom: 0.5rem; }
+    .split-metric-name .unit { color: var(--muted); font-size: 0.8rem; }
+    .splits-five-num {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .splits-five-num span { display: inline-flex; gap: 0.25rem; }
+    .splits-five-num .val { color: var(--text); font-family: 'JetBrains Mono', monospace; }
+    .splits-graph-wrap { margin: 1rem 0; }
+    .splits-metric-chips {
+      margin-top: 0.6rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .splits-metric-chips .chip-label { margin-right: 0.25rem; }
+
+    /* 文件列表选择弹窗 */
+    .file-list-modal {
+      display: none;
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      z-index: 99999;
+      background: rgba(0,0,0,0.8);
+      padding: 120px 16px 40px;
+      box-sizing: border-box;
+    }
+    .file-list-modal.open { display: block; }
+    .file-list-box {
+      background: #222;
+      border-radius: 12px;
+      padding: 10px;
+      max-width: 600px;
+      margin: 0 auto;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.9);
+      border: 2px solid #555;
+    }
+    #file-list-container { }
+    .file-list-item {
+      background: #333;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 6px;
+      min-height: 44px;
+      cursor: pointer;
+      border: 1px solid #555;
+      box-sizing: border-box;
+    }
+    .file-list-item:active { background: #1a4a8f; }
+    .file-list-item-name { color: #fff; font-size: 16px; font-weight: 600; display: block; }
+    .file-list-item-path { color: #aaa; font-size: 12px; margin-top: 4px; display: block; word-break: break-all; }
+    .file-list-empty { color: #ccc; text-align: center; padding: 20px 10px; font-size: 15px; line-height: 1.8; }
+    .btn-grant-perm {
+      display: inline-block; margin-top: 0.8rem; padding: 0.5rem 1.2rem;
+      background: #2563eb; color: #fff; border: none; border-radius: 8px;
+      font-size: 0.85rem; cursor: pointer;
+    }
+    .btn-grant-perm:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-brand">
+      <div class="logo-box">
+        <img src="lib/logo.png" alt="BSU Logo" class="header-logo" onerror="this.parentElement.style.display='none'">
+      </div>
+      <div class="header-text">
+        <span class="header-title">北京体育大学体育工程学院跳远分析系统</span>
+      </div>
+    </div>
+    <div class="header-tabs" id="header-tabs">
+      <span data-view="main" class="active">RUN</span>
+      <span data-view="splits">SPLITS</span>
+      <span data-view="lab">LAB</span>
+      <span data-view="history">HISTORY</span>
+    </div>
+  </header>
+
+  <div id="view-main" class="view-content active">
+    <section class="file-section">
+      <div class="file-card">
+        <div class="file-card-row file-card-row-main">
+          <div class="file-source">
+            <div class="btn-upload-wrap">
+              <input type="file" id="file-upload" accept=".csv">
+              <label for="file-upload" class="btn-upload" id="btn-upload-generic">上传 CSV</label>
+            </div>
+            <button type="button" class="btn-upload" id="btn-offline-files" style="margin-left:0.4rem;" title="离线导出文件夹（offline_export，120Hz）">离线文件</button>
+            <button type="button" class="btn-upload" id="btn-online-files"  style="margin-left:0.4rem;" title="实时采集文件夹（data_logging，60Hz）">在线文件</button>
+            <span id="file-name" class="file-name">未选择文件</span>
+          </div>
+          <div class="file-card-right">
+            <div class="device-info">
+              <span>设备 ID:</span>
+              <span id="device-id-val">—</span>
+              <span class="foot-side" id="foot-side-val">—</span>
+            </div>
+            <label class="file-param">身高 (cm) <input type="number" id="height" value="170" min="100" max="220" step="1" class="param-input"></label>
+            <label class="file-param">体重 (kg) <input type="number" id="mass" value="75" min="30" max="200" step="1" class="param-input"></label>
+            <button type="button" class="btn-analyze" id="btn-analyze">计算</button>
+          </div>
+        </div>
+      </div>
+      <div id="status-msg" class="status-msg"></div>
+    </section>
+
+  <section class="graph-section">
+    <div id="run-range-hint" class="range-hint" style="display:none;"></div>
+    <div class="graph-wrap">
+      <canvas id="chart-main"></canvas>
+    </div>
+    <div class="metric-chips-row">
+      <span>图表指标：</span>
+      <span id="metric-chip-cadence" class="metric-chip active">步频</span>
+      <span id="metric-chip-speed" class="metric-chip">步速</span>
+      <span id="metric-chip-stride-length" class="metric-chip">步幅</span>
+      <span id="metric-chip-stride-time" class="metric-chip">步态周期时间</span>
+      <span id="metric-chip-contact" class="metric-chip">触地时间</span>
+      <span id="metric-chip-double-support" class="metric-chip">双足支撑时间</span>
+      <span id="metric-chip-flight-time" class="metric-chip">腾空时间</span>
+      <span id="metric-chip-swing" class="metric-chip">摆动时间</span>
+      <span id="metric-chip-vgrf" class="metric-chip">vGRF 峰值</span>
+    </div>
+    <div class="summary-bars">
+      <div class="summary-bar orange">
+        <span class="label">时长</span>
+        <span id="summary-duration" class="value">—</span>
+      </div>
+      <div id="summary-bar-metric" class="summary-bar summary-bar-metric">
+        <span id="summary-metric-label" class="label">步频 (平均)</span>
+        <span id="summary-metric-value" class="value">— steps/min</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="metrics-section">
+    <h3>步态参数（汇总）</h3>
+    <!-- 顺序：步频 → 步速 → 步幅 → 步态周期时间 → 触地时间 → 双足支撑时间 → 腾空时间 → 摆动时间 → vGRF峰值 -->
+    <div class="metric-row" data-metric="cadence">
+      <div class="metric-left"><span class="metric-dot metric-dot-cadence"></span><span class="metric-name">步频</span></div>
+      <span><span id="m-cadence" class="metric-value empty">—</span><span class="metric-unit">steps/min</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="speed">
+      <div class="metric-left"><span class="metric-dot metric-dot-speed"></span><span class="metric-name">步速</span></div>
+      <span><span id="m-velocity" class="metric-value empty">—</span><span class="metric-unit">m/s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="stride_length">
+      <div class="metric-left"><span class="metric-dot metric-dot-stride-length"></span><span class="metric-name">步幅</span></div>
+      <span><span id="m-stride-length" class="metric-value empty">—</span><span class="metric-unit">m</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="stride_time">
+      <div class="metric-left"><span class="metric-dot metric-dot-stride-time"></span><span class="metric-name">步态周期时间</span></div>
+      <span><span id="m-stride-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="contact">
+      <div class="metric-left"><span class="metric-dot metric-dot-contact"></span><span class="metric-name">触地时间</span></div>
+      <span><span id="m-contact-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="double_support">
+      <div class="metric-left"><span class="metric-dot metric-dot-double-support"></span><span class="metric-name">双足支撑时间</span></div>
+      <span><span id="m-double-support" class="metric-value empty">—</span><span class="metric-unit">s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="flight_time">
+      <div class="metric-left"><span class="metric-dot metric-dot-flight-time"></span><span class="metric-name">腾空时间</span></div>
+      <span><span id="m-flight-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="swing">
+      <div class="metric-left"><span class="metric-dot metric-dot-swing"></span><span class="metric-name">摆动时间</span></div>
+      <span><span id="m-swing-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span class="metric-arrow">›</span></span>
+    </div>
+    <div class="metric-row" data-metric="vgrf">
+      <div class="metric-left"><span class="metric-dot metric-dot-vgrf"></span><span class="metric-name">vGRF 峰值</span></div>
+      <span><span id="m-vgrf" class="metric-value empty">—</span><span class="metric-unit">BW</span></span>
+    </div>
+    <div class="metric-row">
+      <div class="metric-left"><span class="metric-dot green"></span><span class="metric-name">已识别步数</span></div>
+      <span id="m-n-strides" class="metric-value empty">0</span>
+    </div>
+  </section>
+
+  <section class="table-section">
+    <h3>步态数据</h3>
+    <div class="strides-table-wrap">
+      <table class="strides-table" id="strides-table">
+        <thead>
+          <tr>
+            <th>步数</th>
+            <th>步速 (m/s)</th>
+            <th>步幅 (m)</th>
+            <th>步频 (steps/min)</th>
+            <th>步态周期时间 (s)</th>
+            <th>触地时间 (s)</th>
+            <th>双足支撑时间 (s)</th>
+            <th>腾空时间 (s)</th>
+            <th>摆动时间 (s)</th>
+            <th>vGRF 峰值 (BW)</th>
+            <th>步态状态</th>
+          </tr>
+        </thead>
+        <tbody id="strides-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<!-- SPLITS 视图：箱线图 + 趋势线 -->
+<div id="view-splits" class="view-content">
+  <section class="splits-section">
+    <h3>SPLITS</h3>
+    <div id="splits-range-hint" class="range-hint" style="display:none;"></div>
+    <div class="split-info">
+      <div class="split-metric-name" id="splits-metric-label">步频: <span class="unit">steps/min</span></div>
+      <div class="splits-five-num">
+        <span>Minimum: <span id="splits-min" class="val">—</span></span>
+        <span>Q1: <span id="splits-q1" class="val">—</span></span>
+        <span>Median: <span id="splits-median" class="val">—</span></span>
+        <span>Q3: <span id="splits-q3" class="val">—</span></span>
+        <span>Maximum: <span id="splits-max" class="val">—</span></span>
+      </div>
+    </div>
+    <div class="splits-graph-wrap">
+      <div class="graph-wrap">
+        <canvas id="chart-splits"></canvas>
+      </div>
+    </div>
+    <div class="splits-metric-chips">
+      <span class="chip-label">图表指标：</span>
+      <span id="splits-metric-chip-cadence" class="metric-chip active" data-metric="cadence">步频</span>
+      <span id="splits-metric-chip-speed" class="metric-chip" data-metric="speed">步速</span>
+      <span id="splits-metric-chip-stride-length" class="metric-chip" data-metric="stride_length">步幅</span>
+      <span id="splits-metric-chip-stride-time" class="metric-chip" data-metric="stride_time">步态周期时间</span>
+      <span id="splits-metric-chip-contact" class="metric-chip" data-metric="contact">触地时间</span>
+      <span id="splits-metric-chip-double-support" class="metric-chip" data-metric="double_support">双足支撑时间</span>
+      <span id="splits-metric-chip-flight-time" class="metric-chip" data-metric="flight_time">腾空时间</span>
+      <span id="splits-metric-chip-swing" class="metric-chip" data-metric="swing">摆动时间</span>
+      <span id="splits-metric-chip-vgrf" class="metric-chip" data-metric="vgrf">vGRF 峰值</span>
+    </div>
+  </section>
+</div>
+
+<!-- 实验室视图 -->
+<div id="view-lab" class="view-content">
+  <section class="lab-section">
+    <h3>LAB 实验室</h3>
+    <div class="lab-time-range" style="display:flex;flex-wrap:wrap;align-items:center;gap:1rem;margin-bottom:1.25rem;padding:1rem 1.25rem;background:linear-gradient(135deg, rgba(34,197,94,0.08) 0%, var(--card) 100%);border:1px solid var(--green);border-radius:10px;">
+      <span style="font-weight:600;color:var(--green);">处理时间范围 (s)</span>
+      <label class="file-param">开始 <input type="number" id="lab-start-time" placeholder="0" min="0" step="0.1" class="param-input" style="width:72px;"></label>
+      <span style="color:var(--muted);">—</span>
+      <label class="file-param">结束 <input type="number" id="lab-end-time" placeholder="全长" min="0" step="0.1" class="param-input" style="width:72px;"></label>
+      <div class="file-param" style="display:flex;flex-wrap:wrap;align-items:center;gap:0.65rem;max-width:100%;flex-basis:100%;" title="先选传感器佩戴侧，再选起跳步处理方式">
+        <span style="font-weight:600;color:var(--muted);white-space:nowrap;">① 传感器</span>
+        <label style="display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;"><input type="radio" name="lab-takeoff-foot" value="1" checked> 起跳脚</label>
+        <label style="display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;" title="仅支持关闭或手动指定第 N 个 TC"><input type="radio" name="lab-takeoff-foot" value="0"> 非起跳脚</label>
+      </div>
+      <div class="file-param" style="display:flex;flex-wrap:wrap;align-items:center;gap:0.65rem;max-width:100%;flex-basis:100%;" title="跳远：起跳 TC 之后按规则裁剪；自动识别仅在选择「起跳脚」时可用">
+        <span style="font-weight:600;color:var(--muted);white-space:nowrap;">② 起跳步</span>
+        <label style="display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;"><input type="radio" name="lab-takeoff-mode" value="off" checked> 关闭</label>
+        <label id="lab-takeoff-mode-auto-label" style="display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;"><input type="radio" name="lab-takeoff-mode" value="auto" id="lab-takeoff-mode-auto"> 自动识别</label>
+        <label style="display:inline-flex;align-items:center;gap:0.25rem;cursor:pointer;"><input type="radio" name="lab-takeoff-mode" value="manual"> 手动</label>
+        <input type="number" id="lab-takeoff-step" placeholder="第 N 个 TC" min="1" step="1" class="param-input" style="width:72px;display:none;" disabled>
+      </div>
+      <button type="button" class="btn-analyze" id="btn-lab-analyze" style="padding:0.5rem 1.25rem;font-size:0.9rem;">按选定范围计算</button>
+      <span id="lab-takeoff-hint" style="flex-basis:100%;font-size:0.8rem;color:var(--muted);margin-top:0.35rem;"></span>
+    </div>
+    <div class="lab-grid">
+      <div class="lab-card">
+        <h4><span style="width:8px;height:8px;background:#ef4444;border-radius:50%"></span> 步态事件检测</h4>
+        <div class="lab-chart-wrap">
+          <canvas id="chart-lab-gyro"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 历史记录视图 -->
+<div id="view-history" class="view-content">
+  <section class="history-section" style="padding:1.5rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;">
+      <h3 style="margin:0;">分析历史 (最近 20 条)</h3>
+      <button onclick="clearAllHistory()" style="margin-left:auto;padding:0.4rem 0.8rem;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:0.8rem;cursor:pointer;">清除全部分析历史</button>
+    </div>
+    <div id="history-list" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem;">
+      <!-- 历史条目由 JS 动态生成 -->
+      <div style="grid-column:1/-1;text-align:center;padding:4rem;color:var(--muted);background:var(--card);border-radius:12px;border:1px dashed var(--border);">
+        暂无计算历史记录
+      </div>
+    </div>
+  </section>
+</div>
+
+  <!-- 全局确认模态框：必须放在 view-content 之外，否则在 HISTORY 等标签下不可见 -->
+  <div id="modal-overlay" class="modal-overlay">
+    <div class="modal-content">
+      <div id="modal-title" class="modal-title">确认</div>
+      <div id="modal-text" class="modal-text">内容</div>
+      <div class="modal-actions">
+        <button id="btn-modal-cancel" class="btn-modal btn-cancel">取消</button>
+        <button id="btn-modal-confirm" class="btn-modal btn-confirm">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 当前图表显示的指标
+    let currentMetricKey = 'cadence';
+    let chart = null;
+    let chartSplits = null;
+    let chartLabGyro = null;
+    window.labData = { signals: {}, events: {} }; // 初始化 LAB 数据容器
+    window.lastStrides = []; // 初始化步态周期容器
+
+    const statusEl = document.getElementById('status-msg');
+    const fileSelect = document.getElementById('file-select');
+    const fileUpload = document.getElementById('file-upload');
+    const btnAnalyze = document.getElementById('btn-analyze');
+    const massInput = document.getElementById('mass');
+    const heightInput = document.getElementById('height');
+
+    function setStatus(msg, isErr) {
+      statusEl.textContent = msg;
+      statusEl.className = 'status-msg' + (isErr ? ' err' : ' ok');
+      statusEl.style.display = msg ? 'block' : 'none';
+    }
+
+    function fmt(v, d) { return (v != null && Number.isFinite(v) ? Number(v).toFixed(d) : '—'); }
+    function setMetric(id, v, decimals) {
+      const el = document.getElementById(id);
+      el.textContent = fmt(v, decimals);
+      el.classList.toggle('empty', v == null || !Number.isFinite(v));
+    }
+
+    const fileNameEl = document.getElementById('file-name');
+
+    /**
+     * 从文件名中提取设备 MAC ID（12位十六进制）。
+     * 兼容两种格式：
+     *   在线格式: Xsens DOT_D422CD00937F_20260318_153045.csv  → DOT_ 前缀
+     *   离线格式: D422CD00937F_20260326_003411.csv            → MAC 直接开头
+     */
+    function extractDeviceId(filename) {
+      const name = filename.split('/').pop().split('\\').pop();
+      // 在线格式：DOT_XXXXXXXXXXXX
+      let m = name.match(/DOT_([0-9A-F]{12})/i);
+      if (m) return m[1].toUpperCase();
+      // 离线格式：XXXXXXXXXXXX_YYYYMMDD
+      m = name.match(/^([0-9A-F]{12})_\d{8}/i);
+      if (m) return m[1].toUpperCase();
+      return null;
+    }
+
+    function footSideFromId(did) {
+      if (!did) return '—';
+      const u = did.toUpperCase();
+      if (u === 'D422CD007E6E') return '左脚';
+      if (u === 'D422CD00937F') return '右脚';
+      return '—';
+    }
+
+    function updateFileNameDisplay() {
+      const file = fileUpload.files[0];
+      const deviceIdVal = document.getElementById('device-id-val');
+      
+      if (file) {
+        fileNameEl.textContent = file.name;
+        fileNameEl.classList.add('has-file');
+        const did = extractDeviceId(file.name);
+        deviceIdVal.textContent = did || '未知';
+        document.getElementById('foot-side-val').textContent = footSideFromId(did);
+      } else {
+        fileNameEl.textContent = '未选择文件';
+        fileNameEl.classList.remove('has-file');
+        deviceIdVal.textContent = '—';
+        document.getElementById('foot-side-val').textContent = '—';
+      }
+    }
+    function formatFileName(f) {
+      // 在线格式：DOT_XXXXXXXXXXXX_YYYYMMDD_HHMMSS
+      let m = f.match(/DOT_([0-9A-F]+)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/i);
+      if (m) {
+        const shortId = m[1].slice(-4);
+        return `DOT_\u2026${shortId}  ${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]}:${m[7]}`;
+      }
+      // 离线格式：XXXXXXXXXXXX_YYYYMMDD_HHMMSS
+      m = f.match(/^([0-9A-F]{12})_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/i);
+      if (m) {
+        const shortId = m[1].slice(-4);
+        return `\u2026${shortId}  ${m[2]}-${m[3]}-${m[4]} ${m[5]}:${m[6]}:${m[7]}`;
+      }
+      return f;
+    }
+    // 通过文件列表选中的绝对路径（离线/在线按钮专用）
+    let selectedFilePath = null;
+
+    function updateSelectedPath(path) {
+      selectedFilePath = path;
+      const name = path.split('/').pop();
+      fileNameEl.textContent = name;
+      fileNameEl.classList.add('has-file');
+      const did = extractDeviceId(name);
+      document.getElementById('device-id-val').textContent = did || '未知';
+      document.getElementById('foot-side-val').textContent = footSideFromId(did);
+      // 清空 fileUpload 选中，避免与路径模式冲突
+      fileUpload.value = '';
+    }
+
+    function showFileListModal(title, paths) {
+      const modal = document.getElementById('file-list-modal');
+      const container = document.getElementById('file-list-container');
+      container.innerHTML = '';
+      if (!paths || paths.length === 0) {
+        // 检查是否有权限，给出不同提示
+        var hasPermission = true;
+        if (typeof AndroidInterface !== 'undefined') {
+          try { hasPermission = AndroidInterface.isStorageManagerGranted(); } catch(e) {}
+        }
+        if (!hasPermission) {
+          container.innerHTML =
+            '<div class="file-list-empty">' +
+            '⚠️ 未授予「所有文件访问权限」<br>' +
+            '需要此权限才能读取 Xsens DOT 录制文件<br>' +
+            '<button class="btn-grant-perm" onclick="if(typeof AndroidInterface!==\'undefined\')AndroidInterface.openStorageSettings()">前往设置授权</button>' +
+            '</div>';
+        } else {
+          container.innerHTML =
+            '<div class="file-list-empty">该目录下暂无 CSV 文件</div>';
+        }
+      } else {
+        paths.forEach(function(p) {
+          const name = p.split('/').pop();
+          const item = document.createElement('div');
+          item.className = 'file-list-item';
+          const displayName = formatFileName(name) || name;
+          const did = extractDeviceId(name);
+          const foot = footSideFromId(did);
+          const footTag = foot !== '—'
+            ? '<span style="display:inline-block;margin-left:8px;padding:1px 8px;border-radius:4px;font-size:12px;font-weight:700;background:' + (foot === '左脚' ? '#1a5fa8' : '#8a2020') + ';color:#fff;">' + foot + '</span>'
+            : '';
+          item.innerHTML =
+            '<div class="file-list-item-name">' + displayName + footTag + '</div>' +
+            '<div class="file-list-item-path">' + name + '</div>';
+          item.onclick = function() { updateSelectedPath(p); closeFileListModal(); };
+          container.appendChild(item);
+        });
+      }
+      // 用 absolute 定位，高度覆盖整个页面内容
+      var h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, window.innerHeight);
+      modal.style.minHeight = h + 'px';
+      // 滚动到顶部让弹窗可见
+      window.scrollTo(0, 0);
+      modal.classList.add('open');
+    }
+
+    function closeFileListModal() {
+      document.getElementById('file-list-modal').classList.remove('open');
+    }
+
+    document.getElementById('btn-offline-files').addEventListener('click', function() {
+      if (typeof AndroidInterface !== 'undefined') {
+        var paths = [];
+        try { paths = JSON.parse(AndroidInterface.getOfflineFileList() || '[]'); } catch(e) {}
+        showFileListModal('离线文件（120Hz）', paths);
+      } else {
+        setStatus('仅在 Android 端支持文件列表功能', true);
+      }
+    });
+
+    document.getElementById('btn-online-files').addEventListener('click', function() {
+      if (typeof AndroidInterface !== 'undefined') {
+        var paths = [];
+        try { paths = JSON.parse(AndroidInterface.getOnlineFileList() || '[]'); } catch(e) {}
+        showFileListModal('在线文件（60Hz）', paths);
+      } else {
+        setStatus('仅在 Android 端支持文件列表功能', true);
+      }
+    });
+
+    function syncTakeoffManualVisibility() {
+      const manual = document.querySelector('input[name="lab-takeoff-mode"]:checked')?.value === 'manual';
+      const inp = document.getElementById('lab-takeoff-step');
+      if (inp) {
+        inp.style.display = manual ? 'inline-block' : 'none';
+        inp.disabled = !manual;
+      }
+    }
+
+    /** 非起跳脚时不显示「自动识别」；若当前为自动则改回关闭 */
+    function syncTakeoffFootAndMode() {
+      const foot = document.querySelector('input[name="lab-takeoff-foot"]:checked');
+      const isTakeoff = foot && foot.value === '1';
+      const autoLabel = document.getElementById('lab-takeoff-mode-auto-label');
+      const autoInput = document.getElementById('lab-takeoff-mode-auto');
+      if (autoLabel) {
+        autoLabel.style.display = isTakeoff ? 'inline-flex' : 'none';
+      }
+      if (!isTakeoff && autoInput && autoInput.checked) {
+        const off = document.querySelector('input[name="lab-takeoff-mode"][value="off"]');
+        if (off) off.checked = true;
+      }
+      syncTakeoffManualVisibility();
+    }
+
+    document.querySelectorAll('input[name="lab-takeoff-mode"]').forEach(r => {
+      r.addEventListener('change', () => { syncTakeoffManualVisibility(); });
+    });
+    document.querySelectorAll('input[name="lab-takeoff-foot"]').forEach(r => {
+      r.addEventListener('change', syncTakeoffFootAndMode);
+    });
+    syncTakeoffFootAndMode();
+
+    function resolveTakeoffFootStr() {
+      const mode = document.querySelector('input[name="lab-takeoff-mode"]:checked');
+      if (mode && mode.value === 'auto') {
+        return '1';
+      }
+      const foot = document.querySelector('input[name="lab-takeoff-foot"]:checked');
+      return foot && foot.value === '0' ? '0' : '1';
+    }
+
+    function resolveTakeoffStepStr(takeoffStepOverride) {
+      if (takeoffStepOverride !== undefined && takeoffStepOverride !== null && takeoffStepOverride !== '') {
+        const n = parseInt(String(takeoffStepOverride), 10);
+        if (n === 0) return '0';
+        if (isFinite(n) && n >= 1) return String(n);
+        return '-1';
+      }
+      const foot = document.querySelector('input[name="lab-takeoff-foot"]:checked');
+      const isTakeoff = foot && foot.value === '1';
+      const mode = document.querySelector('input[name="lab-takeoff-mode"]:checked');
+      const m = mode ? mode.value : 'off';
+      if (m === 'off') return '-1';
+      if (m === 'auto') {
+        return isTakeoff ? '0' : '-1';
+      }
+      const tel = document.getElementById('lab-takeoff-step');
+      if (tel && tel.value.trim() !== '') {
+        const n = parseInt(tel.value.trim(), 10);
+        if (isFinite(n) && n >= 1) return String(n);
+      }
+      return '-1';
+    }
+
+    async function runAnalyze(filename, formData, startTimeS, endTimeS, takeoffStepOverride) {
+      statusEl.textContent = '';
+      btnAnalyze.disabled = true;
+      const labBtn = document.getElementById('btn-lab-analyze');
+      if (labBtn) labBtn.disabled = true;
+      setStatus('计算中…', false);
+      let ok = false;
+      try {
+        const mass = parseFloat(massInput.value) || 75;
+        const height = parseFloat(heightInput.value) || 170;
+        const takeoffStr = resolveTakeoffStepStr(takeoffStepOverride);
+        const takeoffFootStr = resolveTakeoffFootStr();
+        let data;
+
+        if (typeof AndroidInterface !== 'undefined' && !formData) {
+            const startParam = (startTimeS !== null && startTimeS !== undefined) ? Number(startTimeS) : -1.0;
+            const endParam = (endTimeS !== null && endTimeS !== undefined) ? Number(endTimeS) : -1.0;
+            const resultJson = AndroidInterface.analyzeGait(filename, mass.toString(), startParam.toString(), endParam.toString(), takeoffStr, takeoffFootStr);
+            data = JSON.parse(resultJson);
+        } else if (typeof AndroidInterface !== 'undefined' && formData) {
+            // Android 模式：读取文件内容并通过桥接接口发送
+            const startParam = (startTimeS !== null && startTimeS !== undefined) ? Number(startTimeS) : -1.0;
+            const endParam = (endTimeS !== null && endTimeS !== undefined) ? Number(endTimeS) : -1.0;
+            const file = formData.get('file');
+            const content = await file.text();
+            const resultJson = AndroidInterface.analyzeGaitContent(content, mass.toString(), startParam.toString(), endParam.toString(), takeoffStr, takeoffFootStr);
+            data = JSON.parse(resultJson);
+        } else {
+            const startParam = (startTimeS != null && startTimeS !== '') ? `&start_time_s=${Number(startTimeS)}` : '';
+            const endParam = (endTimeS != null && endTimeS !== '') ? `&end_time_s=${Number(endTimeS)}` : '';
+            let res;
+            if (formData) {
+              res = await fetch(`/api/analyze/upload?mass=${mass}&height=${height}${startParam}${endParam}`, {
+                method: 'POST', body: formData,
+              });
+            } else {
+              const body = { filename, mass, height };
+              if (startTimeS != null && startTimeS !== '') body.start_time_s = Number(startTimeS);
+              if (endTimeS != null && endTimeS !== '') body.end_time_s = Number(endTimeS);
+              if (takeoffStr !== '-1') body.long_jump_takeoff_step = parseInt(takeoffStr, 10); // -1 关；0 自动；≥1 手动
+              body.long_jump_is_takeoff_foot = resolveTakeoffFootStr() === '1';
+              res = await fetch('/api/analyze', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+              });
+            }
+            if (!res.ok) throw new Error('网络请求失败');
+            data = await res.json();
+        }
+
+        console.log("DEBUG: Raw data from bridge:", JSON.stringify(data).substring(0, 500) + "...");
+        console.log("DEBUG: summary object:", data.summary);
+        console.log("DEBUG: num strides:", data.summary ? data.summary.n_strides : 'N/A');
+        
+        if (!data.ok) {
+          setStatus(data.error || '分析失败', true);
+          return;
+        }
+        if (data.summary && data.summary.n_strides === 0) {
+          setStatus('分析完成，但未识别到步态周期（可能数据过短或传感器方向不对）', true);
+        } else {
+          setStatus('', false);
+        }
+        if (startTimeS != null || endTimeS != null) {
+          data.timeRange = { start: startTimeS ?? null, end: endTimeS ?? null };
+        } else {
+          data.timeRange = null;
+        }
+        if (typeof Chart === 'undefined') {
+          // 如果本地文件加载也报错，说明文件可能未被打包进入 APK
+          throw new Error('未检测到离线图表库，请重新安装应用');
+        }
+        const actualName = filename || (fileUpload.files[0] ? fileUpload.files[0].name : '手动上传文件');
+        updateUI(data);
+        saveToHistory(actualName, data);
+        ok = true;
+      } catch (e) {
+        setStatus(e.message || '系统错误', true);
+        console.error('Analysis error:', e);
+      } finally {
+        btnAnalyze.disabled = false;
+        const labBtn = document.getElementById('btn-lab-analyze');
+        if (labBtn) labBtn.disabled = false;
+      }
+      return ok;
+    }
+
+    btnAnalyze.onclick = async () => {
+      const file = fileUpload.files[0];
+      if (file) {
+        const fd = new FormData();
+        fd.append('file', file);
+        await runAnalyze(null, fd, null, null);
+        return;
+      }
+      if (selectedFilePath) {
+        await runAnalyze(selectedFilePath, null, null, null);
+        return;
+      }
+      const filename = fileSelect ? fileSelect.value : null;
+      if (!filename) {
+        setStatus('请选择录制文件或上传 CSV', true);
+        return;
+      }
+      await runAnalyze(filename, null, null, null);
+    };
+
+    fileUpload.onchange = () => {
+      // 上传新文件时，清空通过列表选中的路径
+      selectedFilePath = null;
+      updateFileNameDisplay();
+    };
+
+    const headerTabs = document.getElementById('header-tabs');
+    document.getElementById('btn-lab-analyze').onclick = async () => {
+      const startVal = document.getElementById('lab-start-time').value.trim();
+      const endVal = document.getElementById('lab-end-time').value.trim();
+      const startTimeS = startVal === '' ? null : parseFloat(startVal);
+      const endTimeS = endVal === '' ? null : parseFloat(endVal);
+      if (startTimeS != null && endTimeS != null && startTimeS >= endTimeS) {
+        setStatus('开始时间须小于结束时间', true);
+        return;
+      }
+      const file = fileUpload.files[0];
+      let ok = false;
+      if (file) {
+        const fd = new FormData();
+        fd.append('file', file);
+        ok = await runAnalyze(null, fd, startTimeS, endTimeS);
+      } else if (selectedFilePath) {
+        ok = await runAnalyze(selectedFilePath, null, startTimeS, endTimeS);
+      } else {
+        const filename = fileSelect ? fileSelect.value : null;
+        if (!filename) {
+          setStatus('请先选择或上传文件', true);
+          return;
+        }
+        ok = await runAnalyze(filename, null, startTimeS, endTimeS);
+      }
+      // 按选定范围计算成功后，自动切换到 RUN 视图以展示更新结果
+      if (ok && (startTimeS != null || endTimeS != null)) {
+        const runTab = headerTabs.querySelector('span[data-view="main"]');
+        if (runTab) runTab.click();
+      }
+    };
+
+    // 视图切换逻辑
+    const viewContents = document.querySelectorAll('.view-content');
+    headerTabs.addEventListener('click', (e) => {
+      const tab = e.target.closest('span');
+      if (!tab) return;
+      const viewId = tab.dataset.view;
+      if (!viewId) return;
+
+      // 更新标签状态
+      headerTabs.querySelectorAll('span').forEach(s => s.classList.remove('active'));
+      tab.classList.add('active');
+
+      // 切换视图容器
+      viewContents.forEach(v => v.classList.remove('active'));
+      const targetView = document.getElementById('view-' + viewId);
+      if (targetView) targetView.classList.add('active');
+
+      // 如果进入实验室视图且有残留数据，刷新图表
+      if (viewId === 'lab') {
+        renderLabCharts();
+      }
+      if (viewId === 'splits') {
+        updateSplitsChart();
+      }
+      if (viewId === 'history') {
+        renderHistoryList();
+      }
+    });
+
+    // --- 历史记录核心逻辑 ---
+    const MAX_HISTORY = 20;
+
+    function parseMetadata(filename) {
+      let dateShow = "";
+      let side = "未知";
+
+      // 1. 识别侧性：优先从设备 ID 判断，兼容两种文件名格式
+      const did = extractDeviceId(filename);
+      const sidFromId = footSideFromId(did);
+      if (sidFromId !== '—') {
+        side = sidFromId;
+      } else {
+        // 备用：按关键字判断（手动命名文件兼容）
+        const upperName = filename.toUpperCase();
+        if (upperName.includes('_L_') || upperName.includes('LEFT')) {
+          side = "左脚";
+        } else if (upperName.includes('_R_') || upperName.includes('RIGHT')) {
+          side = "右脚";
+        }
+      }
+
+      // 2. 识别时间戳 (尝试匹配 YYYYMMDD_HHMMSS 或 YYYYMMDD)
+      const fullMatch = filename.match(/20\d{6}_\d{6}/); // 20260318_153045
+      if (fullMatch) {
+        const s = fullMatch[0];
+        dateShow = `${s.substring(0,4)}/${s.substring(4,6)}/${s.substring(6,8)} ${s.substring(9,11)}:${s.substring(11,13)}:${s.substring(13,15)}`;
+      } else {
+        const dateMatch = filename.match(/20\d{6}/);
+        if (dateMatch) {
+          const d = dateMatch[0];
+          dateShow = `${d.substring(0,4)}/${d.substring(4,6)}/${d.substring(6,8)}`;
+        }
+      }
+
+      return { date: dateShow, side: side };
+    }
+
+    function saveToHistory(filename, data) {
+      try {
+        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
+        
+        // --- 去重逻辑：如果相同文件名已存在，先移除旧记录，保留最新的 ---
+        history = history.filter(item => item.filename !== filename);
+
+        const meta = parseMetadata(filename);
+        const entry = {
+          id: Date.now(),
+          timestamp: new Date().toLocaleString(),
+          filename: filename,
+          recordDate: meta.date || new Date().toLocaleDateString(),
+          side: meta.side,
+          summary: data.summary,
+          fullData: data
+        };
+        history.unshift(entry);
+        if (history.length > MAX_HISTORY) history = history.slice(0, MAX_HISTORY);
+        localStorage.setItem('gait_history', JSON.stringify(history));
+      } catch (e) { console.error('History save error:', e); }
+    }
+
+    function renderHistoryList() {
+      const container = document.getElementById('history-list');
+      let history = [];
+      try { history = JSON.parse(localStorage.getItem('gait_history') || '[]'); } catch(e){}
+      
+      if (history.length === 0) {
+        container.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:4rem;color:var(--muted);background:var(--card);border-radius:12px;border:1px dashed var(--border);">暂无计算历史记录</div>';
+        return;
+      }
+
+      container.innerHTML = history.map(item => {
+        const s = item.summary || {};
+        return `
+        <div class="card" style="padding:1.25rem;cursor:default;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:0.75rem;">
+            <div style="display:flex;flex-direction:column;gap:4px;">
+              <div style="font-weight:600;font-size:0.85rem;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" title="${item.filename}">${item.filename}</div>
+              <div style="display:flex;gap:8px;font-size:0.75rem;">
+                <span style="background:rgba(0,184,148,0.15);color:var(--green);padding:1px 6px;border-radius:4px;font-weight:600;">${item.side || '未知'}</span>
+                <span style="color:var(--muted);">${item.recordDate || item.timestamp.split(' ')[0]}</span>
+              </div>
+            </div>
+            <div style="font-size:0.7rem;color:var(--muted);opacity:0.6;">#${item.id.toString().slice(-4)}</div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;font-size:0.8rem;margin-bottom:1rem;color:var(--text); opacity: 0.9;">
+            <div>步频: <span style="font-family:monospace;color:#fff;">${s.step_frequency_hz ? (s.step_frequency_hz * 60).toFixed(1) : '--'}</span></div>
+            <div>步速: <span style="font-family:monospace;color:#fff;">${s.stride_velocity_mps ? s.stride_velocity_mps.toFixed(2) : '--'}</span></div>
+            <div>步幅: <span style="font-family:monospace;color:#fff;">${s.stride_length_m ? s.stride_length_m.toFixed(2) : '--'}</span></div>
+            <div>vGRF: <span style="font-family:monospace;color:#fff;">${s.vGRF_peak_BW ? s.vGRF_peak_BW.toFixed(2) : '--'}</span></div>
+          </div>
+          <div style="display:flex;gap:0.5rem;">
+            <button onclick="loadFromHistory(${item.id})" style="flex:1;padding:0.4rem;background:var(--green);color:white;border:none;border-radius:4px;font-size:0.8rem;cursor:pointer;font-weight:600;">查看详情</button>
+            <button onclick="deleteHistoryItem(${item.id})" style="padding:0.4rem 0.6rem;background:rgba(255,255,255,0.05);color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;"><svg style="width:14px;height:14px;pointer-events:none;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg></button>
+          </div>
+        </div>
+      `;}).join('');
+    }
+
+    function loadFromHistory(id) {
+      try {
+        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
+        const item = history.find(x => x.id === id);
+        if (item) {
+          updateUI(item.fullData);
+          // 从历史记录恢复设备 ID 和左脚/右脚显示
+          const did = extractDeviceId(item.filename || '');
+          document.getElementById('device-id-val').textContent = did || '未知';
+          document.getElementById('foot-side-val').textContent = item.side || footSideFromId(did);
+          fileNameEl.textContent = item.filename || '历史记录';
+          fileNameEl.classList.toggle('has-file', !!item.filename);
+          // 自动跳转到 RUN 视图查看结果
+          const runTab = headerTabs.querySelector('span[data-view="main"]');
+          if (runTab) runTab.click();
+          setStatus('已成功加载历史分析数据', false);
+          setTimeout(() => setStatus('', false), 2000);
+        }
+      } catch (e) { console.error('History load error:', e); }
+    }
+
+    // --- 终极稳定性历史逻辑 (不显示网址，且 100% 成功) ---
+    let modalTargetId = null; 
+    let modalActionType = null; // 'delete' 或 'clear'
+
+    function openConfirmModal(type, id = null) {
+      modalActionType = type;
+      modalTargetId = id;
+      
+      const overlay = document.getElementById('modal-overlay');
+      const titleEl = document.getElementById('modal-title');
+      const textEl = document.getElementById('modal-text');
+      const btnConfirm = document.getElementById('btn-modal-confirm');
+
+      if (type === 'delete') {
+        titleEl.textContent = '删除记录';
+        textEl.textContent = '确定要删除这条分析记录吗？';
+        btnConfirm.textContent = '确定删除';
+        btnConfirm.style.background = '#ff4757';
+      } else {
+        titleEl.textContent = '清空历史';
+        textEl.textContent = '确定要清除所有分析历史记录吗？';
+        btnConfirm.textContent = '立即清空';
+        btnConfirm.style.background = '#ff4757';
+      }
+      
+      overlay.style.display = 'flex';
+    }
+
+    function closeModal() {
+      document.getElementById('modal-overlay').style.display = 'none';
+      modalTargetId = null;
+      modalActionType = null;
+    }
+
+    // 全局静态绑定
+    document.getElementById('btn-modal-confirm').onclick = function() {
+      console.log("DEBUG: Final Modal Confirm Clicked", modalActionType, modalTargetId);
+      if (modalActionType === 'delete' && modalTargetId) {
+        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
+        history = history.filter(x => x.id !== modalTargetId);
+        localStorage.setItem('gait_history', JSON.stringify(history));
+      } else if (modalActionType === 'clear') {
+        localStorage.removeItem('gait_history');
+      }
+      renderHistoryList();
+      closeModal();
+    };
+
+    document.getElementById('btn-modal-cancel').onclick = function() {
+      closeModal();
+    };
+
+    function deleteHistoryItem(id) {
+       openConfirmModal('delete', id);
+    }
+
+    function clearAllHistory() {
+       openConfirmModal('clear');
+    }
+
+    // 存储全局信号数据
+    window.labData = { signals: null, events: null };
+
+    const CHART_METRIC_KEYS = ['cadence','speed','stride_length','stride_time','contact','double_support','flight_time','swing','vgrf'];
+    // 各指标颜色：与下方列表圆点、图表折线一致
+    const METRIC_COLORS = {
+      cadence: '#22c55e',
+      speed: '#3b82f6',
+      stride_length: '#06b6d4',
+      contact: '#84cc16',
+      swing: '#f97316',
+      stride_time: '#16a34a',
+      double_support: '#10b981',
+      flight_time: '#f59e0b',
+      vgrf: '#a855f7'
+    };
+    // 主图表初始化 (增加安全检查)
+    if (typeof Chart !== 'undefined') {
+      chart = new Chart(document.getElementById('chart-main'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: '步频',
+          data: [],
+          borderColor: '#22c55e',
+          backgroundColor: 'rgba(34,197,94,0.15)',
+          pointBackgroundColor: '#22c55e',
+          pointBorderColor: '#22c55e',
+          pointHoverBackgroundColor: '#22c55e',
+          pointHoverBorderColor: '#22c55e',
+          fill: true,
+          tension: 0.2,
+          pointRadius: 2,
+          borderWidth: 2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: {
+            display: true,
+            grid: { color: 'rgba(255,255,255,0.06)' },
+            ticks: { color: '#71717a' },
+            title: { display: true, text: '步数', color: '#71717a' }
+          },
+          y: {
+            display: true,
+            grid: { color: 'rgba(255,255,255,0.06)' },
+            ticks: { color: '#71717a' },
+            title: { display: true, text: '步频 (steps/min)', color: '#71717a' }
+          }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+    }
+
+    function hexToRgba(hex, a) {
+      const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+      return `rgba(${r},${g},${b},${a})`;
+    }
+
+    function buildSeries(strides) {
+      const sArr = Array.isArray(strides) ? strides : [];
+      switch (currentMetricKey) {
+        case 'speed':
+          return {
+            label: '步速',
+            unitLabel: '步速 (m/s)',
+            data: sArr.map(s => s.stride_velocity_mps != null ? s.stride_velocity_mps : null),
+          };
+        case 'stride_length':
+          return {
+            label: '步幅',
+            unitLabel: '步幅 (m)',
+            data: sArr.map(s => s.stride_length_m != null ? s.stride_length_m : null),
+          };
+        case 'contact':
+          return {
+            label: '触地时间',
+            unitLabel: '触地时间 (s)',
+            data: sArr.map(s => s.contact_time_s != null ? s.contact_time_s : null),
+          };
+        case 'swing':
+          return {
+            label: '摆动时间',
+            unitLabel: '摆动时间 (s)',
+            data: strides.map(s => s.swing_time_s != null ? s.swing_time_s : null),
+          };
+        case 'stride_time':
+          return {
+            label: '步态周期时间',
+            unitLabel: '步态周期时间 (s)',
+            data: strides.map(s => s.stride_time_s != null ? s.stride_time_s : null),
+          };
+        case 'double_support':
+          return {
+            label: '双足支撑时间',
+            unitLabel: '双足支撑时间 (s)',
+            data: strides.map(s => s.double_support_time_s != null ? s.double_support_time_s : (s.double_support_time_ms != null ? s.double_support_time_ms / 1000 : null)),
+          };
+        case 'flight_time':
+          return {
+            label: '腾空时间',
+            unitLabel: '腾空时间 (s)',
+            data: strides.map(s => s.flight_time_s != null ? s.flight_time_s : (s.flight_time_ms != null ? s.flight_time_ms / 1000 : null)),
+          };
+        case 'vgrf':
+          return {
+            label: 'vGRF 峰值',
+            unitLabel: 'vGRF 峰值 (BW)',
+            data: strides.map(s => s.vGRF_peak_BW != null ? s.vGRF_peak_BW : null),
+          };
+        case 'cadence':
+        default:
+          return {
+            label: '步频',
+            unitLabel: '步频 (steps/min)',
+            data: strides.map(s => s.step_frequency_hz != null ? s.step_frequency_hz * 60 : null),
+          };
+      }
+    }
+
+    function syncMetricHighlight() {
+      const color = METRIC_COLORS[currentMetricKey] || '#22c55e';
+      const colorBg = hexToRgba(color, 0.12);
+      CHART_METRIC_KEYS.forEach(k => {
+        const chip = document.getElementById(`metric-chip-${k.replace(/_/g, '-')}`);
+        if (chip) {
+          chip.classList.toggle('active', k === currentMetricKey);
+          if (k === currentMetricKey) {
+            chip.style.borderColor = color;
+            chip.style.color = color;
+            chip.style.background = colorBg;
+          } else {
+            chip.style.borderColor = '';
+            chip.style.color = '';
+            chip.style.background = '';
+          }
+        }
+      });
+      document.querySelectorAll('.metric-row[data-metric]').forEach(row => {
+        const key = row.getAttribute('data-metric');
+        const active = key === currentMetricKey;
+        row.classList.toggle('active-chart', active);
+        const rowColor = METRIC_COLORS[key];
+        if (active && rowColor) {
+          row.style.borderColor = hexToRgba(rowColor, 0.5);
+          row.style.background = hexToRgba(rowColor, 0.08);
+          const arrow = row.querySelector('.metric-arrow');
+          if (arrow) arrow.style.color = rowColor;
+        } else {
+          row.style.borderColor = '';
+          row.style.background = '';
+          const arrow = row.querySelector('.metric-arrow');
+          if (arrow) arrow.style.color = '';
+        }
+      });
+    }
+
+    function updateSummaryBar() {
+      const strides = window.lastStrides;
+      const labelEl = document.getElementById('summary-metric-label');
+      const valueEl = document.getElementById('summary-metric-value');
+      const barEl = document.getElementById('summary-bar-metric');
+      const color = METRIC_COLORS[currentMetricKey] || '#22c55e';
+      const [r, g, b] = [parseInt(color.slice(1,3),16), parseInt(color.slice(3,5),16), parseInt(color.slice(5,7),16)];
+      if (barEl) {
+        barEl.style.background = `linear-gradient(90deg, rgba(${r},${g},${b},0.25) 0%, rgba(${r},${g},${b},0.08) 100%)`;
+        barEl.style.borderColor = `rgba(${r},${g},${b},0.35)`;
+        barEl.style.color = color;
+      }
+      if (!strides || !Array.isArray(strides) || strides.length === 0) {
+        labelEl.textContent = '步频 (平均)';
+        valueEl.textContent = '— steps/min';
+        return;
+      }
+      const series = buildSeries(strides);
+      const vals = (series.data || []).filter(v => v != null && Number.isFinite(v));
+      const avg = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+      const m = series.unitLabel && series.unitLabel.match(/\(([^)]+)\)/);
+      const unit = m ? m[1] : (series.unitLabel || '');
+      labelEl.textContent = series.label + ' (平均)';
+      const decimals = avg >= 10 ? 1 : avg >= 1 ? 2 : 3;
+      valueEl.textContent = avg != null ? avg.toFixed(decimals) + ' ' + unit : '— ' + unit;
+    }
+
+    function applyChartMetric(key) {
+      if (!CHART_METRIC_KEYS.includes(key)) return;
+      currentMetricKey = key;
+      syncMetricHighlight();
+      if (chart && window.lastStrides && Array.isArray(window.lastStrides)) {
+        chart.data.labels = (window.lastStrides || []).map((_, i) => (i + 1) + '');
+        const series = buildSeries(window.lastStrides);
+        const lineColor = METRIC_COLORS[currentMetricKey] || '#22c55e';
+        const n = series.data.length;
+        chart.data.datasets[0].label = series.label;
+        chart.data.datasets[0].data = series.data;
+        chart.data.datasets[0].borderColor = lineColor;
+        chart.data.datasets[0].backgroundColor = hexToRgba(lineColor, 0.15);
+        chart.data.datasets[0].pointBackgroundColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointBorderColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointHoverBackgroundColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointHoverBorderColor = Array(n).fill(lineColor);
+        chart.options.scales.y.title.text = series.unitLabel;
+        chart.update('none');
+      }
+      updateSummaryBar();
+      updateSplitsChart();
+    }
+
+    function updateUI(data) {
+      const summary = data ? data.summary : null;
+      const strides = (data && Array.isArray(data.strides)) ? data.strides : [];
+      
+      // 核心数据存储
+      if (data && data.signals) {
+          window.labData.signals = data.signals;
+          window.labData.events = data.events || {};
+      }
+      window.lastStrides = strides;
+      window.lastTimeRange = data && data.timeRange ? data.timeRange : null;
+
+      const emptyIds = ['m-cadence','m-stride-time','m-contact-time','m-swing-time','m-stride-length','m-velocity','m-vgrf','m-double-support','m-flight-time','m-gait-status'];
+      if (!summary) {
+        const takeoffHintEmpty = document.getElementById('lab-takeoff-hint');
+        if (takeoffHintEmpty) takeoffHintEmpty.textContent = '';
+        document.getElementById('summary-duration').textContent = '—';
+        document.getElementById('summary-metric-label').textContent = '步频 (平均)';
+        document.getElementById('summary-metric-value').textContent = '— steps/min';
+        emptyIds.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) { el.textContent = '—'; el.classList.add('empty'); }
+        });
+        document.getElementById('m-n-strides').textContent = '0';
+        document.getElementById('m-n-strides').classList.add('empty');
+        document.getElementById('strides-tbody').innerHTML = '';
+        if (chart) {
+          chart.data.labels = [];
+          chart.data.datasets[0].data = [];
+          chart.update('none');
+        }
+        currentMetricKey = 'cadence';
+        document.querySelectorAll('.metric-row[data-metric]').forEach(row => {
+          row.classList.remove('active-chart');
+          row.style.borderColor = '';
+          row.style.background = '';
+          const arrow = row.querySelector('.metric-arrow');
+          if (arrow) arrow.style.color = '';
+        });
+        CHART_METRIC_KEYS.forEach(k => {
+          const chip = document.getElementById(`metric-chip-${k.replace(/_/g, '-')}`);
+          if (chip) {
+            chip.classList.toggle('active', k === 'cadence');
+            chip.style.borderColor = '';
+            chip.style.color = '';
+            chip.style.background = '';
+          }
+        });
+        updateSummaryBar();
+        updateSplitsChart();
+        updateRangeIndicator();
+        return;
+      }
+      const dur = summary.duration_s;
+      const m = dur != null ? Math.floor(dur / 60) : 0;
+      const s = dur != null ? Math.floor(dur % 60) : 0;
+      document.getElementById('summary-duration').textContent = m + ':' + (s < 10 ? '0' : '') + s;
+      updateSummaryBar();
+
+      setMetric('m-cadence', summary.step_frequency_hz != null ? summary.step_frequency_hz * 60 : null, 1);
+      setMetric('m-stride-time', summary.stride_time_s, 3);
+      setMetric('m-contact-time', summary.contact_time_s, 3);
+      setMetric('m-swing-time', summary.swing_time_s, 3);
+      setMetric('m-stride-length', summary.stride_length_m, 3);
+      setMetric('m-velocity', summary.stride_velocity_mps, 3);
+      // vGRF 峰值：无数据时显式显示长横线，与其它指标一致
+      const vgrfEl = document.getElementById('m-vgrf');
+      if (summary.vGRF_peak_BW != null && Number.isFinite(summary.vGRF_peak_BW)) {
+        vgrfEl.textContent = Number(summary.vGRF_peak_BW).toFixed(2);
+        vgrfEl.classList.remove('empty');
+      } else {
+        vgrfEl.textContent = '—';
+        vgrfEl.classList.add('empty');
+      }
+      setMetric('m-double-support', summary.double_support_time_ms != null ? summary.double_support_time_ms / 1000 : null, 3);
+      setMetric('m-flight-time', summary.flight_time_ms != null ? summary.flight_time_ms / 1000 : null, 3);
+      const statusEl = document.getElementById('m-gait-status');
+      if (statusEl) {
+        const v = summary.gait_status_last || summary.last_stride?.gait_status;
+        statusEl.textContent = v || '—';
+        statusEl.classList.toggle('empty', !v);
+      }
+      document.getElementById('m-n-strides').textContent = summary.n_strides != null ? summary.n_strides : '0';
+      document.getElementById('m-n-strides').classList.toggle('empty', !summary.n_strides);
+
+      const takeoffHint = document.getElementById('lab-takeoff-hint');
+      if (takeoffHint) {
+        if (summary.long_jump_takeoff_auto) {
+          if (summary.long_jump_takeoff_auto_applied && summary.long_jump_takeoff_step > 0) {
+            takeoffHint.textContent = '自动识别：第 ' + summary.long_jump_takeoff_step + ' 个 TC 为起跳';
+            takeoffHint.style.color = 'var(--green)';
+          } else {
+            takeoffHint.textContent = '自动识别未应用';
+            takeoffHint.style.color = '#f59e0b';
+          }
+        } else if (summary.long_jump_takeoff_step > 0) {
+          takeoffHint.textContent = '手动起跳步：第 ' + summary.long_jump_takeoff_step + ' 个 TC';
+          takeoffHint.style.color = 'var(--muted)';
+        } else {
+          takeoffHint.textContent = '';
+        }
+      }
+
+      if (chart) {
+        chart.data.labels = (strides || []).map((_, i) => (i + 1) + '');
+        const series = buildSeries(strides);
+        const lineColor = METRIC_COLORS[currentMetricKey] || '#22c55e';
+        const n = series.data.length;
+        chart.data.datasets[0].label = series.label;
+        chart.data.datasets[0].data = series.data;
+        chart.data.datasets[0].borderColor = lineColor;
+        chart.data.datasets[0].backgroundColor = hexToRgba(lineColor, 0.15);
+        chart.data.datasets[0].pointBackgroundColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointBorderColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointHoverBackgroundColor = Array(n).fill(lineColor);
+        chart.data.datasets[0].pointHoverBorderColor = Array(n).fill(lineColor);
+        chart.options.scales.y.title.text = series.unitLabel;
+        chart.update('none');
+      }
+      syncMetricHighlight();
+
+      const tbody = document.getElementById('strides-tbody');
+      tbody.innerHTML = (strides || []).map((row, i) => {
+        const stepFreq = row.step_frequency_hz != null ? (row.step_frequency_hz * 60).toFixed(1) : '—';
+        const ds = row.double_support_time_s != null ? row.double_support_time_s.toFixed(3) : (row.double_support_time_ms != null ? (row.double_support_time_ms / 1000).toFixed(3) : '—');
+        const fl = row.flight_time_s != null ? row.flight_time_s.toFixed(3) : (row.flight_time_ms != null ? (row.flight_time_ms / 1000).toFixed(3) : '—');
+        const status = row.gait_status || '—';
+        const statusClass = status === 'walk' ? 'walk' : status === 'run' ? 'run' : '';
+        return `<tr>
+          <td>${i + 1}</td>
+          <td>${fmt(row.stride_velocity_mps, 3)}</td>
+          <td>${fmt(row.stride_length_m, 3)}</td>
+          <td>${stepFreq}</td>
+          <td>${fmt(row.stride_time_s, 3)}</td>
+          <td>${fmt(row.contact_time_s, 3)}</td>
+          <td>${ds}</td>
+          <td>${fl}</td>
+          <td>${fmt(row.swing_time_s, 3)}</td>
+          <td>${fmt(row.vGRF_peak_BW, 2)}</td>
+          <td class="col-status ${statusClass}">${status}</td>
+        </tr>`;
+      }).join('');
+
+      updateSplitsChart();
+      updateRangeIndicator();
+
+      const labEndEl = document.getElementById('lab-end-time');
+      if (labEndEl && summary && summary.duration_s != null) {
+        labEndEl.placeholder = summary.duration_s.toFixed(1);
+        labEndEl.setAttribute('title', '留空则使用全长 ' + summary.duration_s.toFixed(1) + ' s');
+      }
+
+      if (document.getElementById('view-lab').classList.contains('active')) {
+        renderLabCharts();
+      }
+    }
+
+    // 更新 RUN/SPLITS 中的时间范围提示
+    function updateRangeIndicator() {
+      const tr = window.lastTimeRange;
+      const runEl = document.getElementById('run-range-hint');
+      const splitsEl = document.getElementById('splits-range-hint');
+      const show = tr && (tr.start != null || tr.end != null);
+      const txt = show
+        ? '当前显示范围: ' + (tr.start != null ? tr.start.toFixed(1) : '0') + ' – ' + (tr.end != null ? tr.end.toFixed(1) : '全长') + ' s（来自 LAB 选定范围）'
+        : '';
+      [runEl, splitsEl].forEach(el => {
+        if (el) {
+          el.textContent = txt;
+          el.style.display = show ? 'block' : 'none';
+        }
+      });
+    }
+
+    // 暴露绘图函数以防闭包问题
+    window.renderLabCharts = renderLabCharts;
+
+    // 图表指标 chip 点击
+    CHART_METRIC_KEYS.forEach(key => {
+      const el = document.getElementById(`metric-chip-${key.replace(/_/g, '-')}`);
+      if (el) el.addEventListener('click', () => { applyChartMetric(key); });
+    });
+
+    // SPLITS 图表：趋势线 + 箱线图（Q1-Q3 箱体 + 中位线）
+    // 五数概括：仅纳入有效值，排除空/未计算到的步（null、undefined、NaN、0 等）
+    function computeFiveNumberSummary(arr) {
+      const vals = (arr || []).filter(v => v != null && Number.isFinite(v) && v !== 0);
+      if (vals.length === 0) return null;
+      const sorted = [...vals].sort((a, b) => a - b);
+      const n = sorted.length;
+      const q1Idx = Math.floor(n * 0.25);
+      const medIdx = Math.floor(n * 0.5);
+      const q3Idx = Math.floor(n * 0.75);
+      return {
+        min: sorted[0],
+        q1: sorted[q1Idx],
+        median: sorted[medIdx],
+        q3: sorted[q3Idx],
+        max: sorted[n - 1]
+      };
+    }
+    function updateSplitsChart() {
+      const strides = window.lastStrides;
+      // 强制销毁旧图表以彻底清除残留状态（解决颜色切换不彻底问题）
+      if (chartSplits) {
+        chartSplits.destroy();
+        chartSplits = null;
+      }
+
+      if (!strides || !Array.isArray(strides) || strides.length === 0) {
+        document.getElementById('splits-min').textContent = '—';
+        document.getElementById('splits-q1').textContent = '—';
+        document.getElementById('splits-median').textContent = '—';
+        document.getElementById('splits-q3').textContent = '—';
+        document.getElementById('splits-max').textContent = '—';
+        return;
+      }
+      
+      const series = buildSeries(strides);
+      const data = series.data;
+      const fns = computeFiveNumberSummary(data);
+      const lineColor = METRIC_COLORS[currentMetricKey] || '#22c55e';
+      const boxColor = hexToRgba(lineColor, 0.25);
+      const boxBorder = hexToRgba(lineColor, 0.7);
+
+      const m = series.unitLabel && series.unitLabel.match(/\(([^)]+)\)/);
+      const unit = m ? m[1] : (series.unitLabel || '');
+      document.getElementById('splits-metric-label').innerHTML = series.label + ': <span class="unit">' + unit + '</span>';
+      document.getElementById('splits-min').textContent = fns ? fns.min.toFixed(2) : '—';
+      document.getElementById('splits-q1').textContent = fns ? fns.q1.toFixed(2) : '—';
+      document.getElementById('splits-median').textContent = fns ? fns.median.toFixed(2) : '—';
+      document.getElementById('splits-q3').textContent = fns ? fns.q3.toFixed(2) : '—';
+      document.getElementById('splits-max').textContent = fns ? fns.max.toFixed(2) : '—';
+
+      const ctx = document.getElementById('chart-splits');
+      if (!ctx) return;
+      if (typeof Chart === 'undefined') return;
+
+      chartSplits = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: strides.map((_, i) => (i + 1) + ''),
+          datasets: [{
+            label: series.label,
+            data: data,
+            borderColor: lineColor,
+            backgroundColor: hexToRgba(lineColor, 0.15),
+            pointBackgroundColor: lineColor,
+            pointBorderColor: lineColor,
+            pointHoverBackgroundColor: lineColor,
+            pointHoverBorderColor: '#fff',
+            fill: true,
+            tension: 0.2,
+            pointRadius: 3,
+            borderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          scales: {
+            x: {
+              display: true,
+              grid: { color: 'rgba(255,255,255,0.06)' },
+              ticks: { color: '#71717a' },
+              title: { display: true, text: '步数', color: '#71717a' }
+            },
+            y: {
+              display: true,
+              grid: { color: 'rgba(255,255,255,0.06)' },
+              ticks: { color: '#71717a' },
+              title: { display: true, text: series.unitLabel, color: '#71717a' }
+            }
+          },
+          plugins: {
+            legend: { display: false },
+            annotation: {
+              annotations: (fns && data.length > 0) ? {
+                boxIQR: {
+                  type: 'box',
+                  xMin: -0.5,
+                  xMax: data.length - 0.5,
+                  yMin: fns.q1,
+                  yMax: fns.q3,
+                  backgroundColor: boxColor,
+                  borderColor: boxBorder,
+                  borderWidth: 1
+                },
+                medianLine: {
+                  type: 'line',
+                  yMin: fns.median,
+                  yMax: fns.median,
+                  borderColor: boxBorder,
+                  borderWidth: 1.5,
+                  borderDash: [4, 2]
+                }
+              } : {}
+            }
+          }
+        }
+      });
+      syncSplitsMetricHighlight();
+    }
+    function syncSplitsMetricHighlight() {
+      const color = METRIC_COLORS[currentMetricKey] || '#22c55e';
+      const colorBg = hexToRgba(color, 0.12);
+      CHART_METRIC_KEYS.forEach(k => {
+        const chip = document.getElementById(`splits-metric-chip-${k.replace(/_/g, '-')}`);
+        if (chip) {
+          chip.classList.toggle('active', k === currentMetricKey);
+          chip.style.borderColor = k === currentMetricKey ? color : '';
+          chip.style.color = k === currentMetricKey ? color : '';
+          chip.style.background = k === currentMetricKey ? colorBg : '';
+        }
+      });
+    }
+    // SPLITS 指标 chip 点击
+    document.querySelectorAll('.splits-metric-chips [data-metric]').forEach(el => {
+      el.addEventListener('click', () => {
+        const key = el.getAttribute('data-metric');
+        if (key) {
+          applyChartMetric(key);
+          updateSplitsChart();
+        }
+      });
+    });
+
+    // 下方步态参数行点击 → 切换曲线
+    document.querySelectorAll('.metric-row[data-metric]').forEach(row => {
+      row.addEventListener('click', () => {
+        const key = row.getAttribute('data-metric');
+        if (key) applyChartMetric(key);
+      });
+    });
+
+    // 强制初始化高亮
+    syncMetricHighlight();
+    // LAB 绘图逻辑
+
+    function renderLabCharts() {
+      if (!window.labData || !window.labData.signals) {
+          console.warn('LAB 数据未准备好');
+          return;
+      }
+      const sig = window.labData.signals;
+      if (!sig.timestamps || !sig.gyro_y) {
+          console.error('信号数据不完整');
+          return;
+      }
+      const eve = window.labData.events;
+      const ts = sig.timestamps.map(t => (t / 1000).toFixed(3));
+
+      // 销毁旧图表 (增加安全检查)
+      if (typeof Chart === 'undefined') {
+          console.error('Chart.js is not loaded');
+          return;
+      }
+      if (chartLabGyro && typeof chartLabGyro.destroy === 'function') chartLabGyro.destroy();
+
+      // 构建事件标注数据集 (Scatter 点)：IC、TC、MS、MSW
+      // 与 Python 返回的毫秒时间对齐到最近采样点（避免原先 findIndex <17ms 在 60Hz 下过严导致 MS 等点被丢弃）
+      const stamps = sig.timestamps;
+      let medianDt = 17;
+      if (stamps.length >= 2) {
+        const d0 = Math.abs(Number(stamps[1]) - Number(stamps[0]));
+        medianDt = Number.isFinite(d0) && d0 > 0 ? d0 : 17;
+      }
+      const maxSnapErr = Math.max(35, medianDt * 2.5);
+      function nearestSampleIndex(tMs) {
+        const t = Number(tMs);
+        if (!Number.isFinite(t) || !stamps.length) return -1;
+        let best = 0;
+        let bestD = Math.abs(Number(stamps[0]) - t);
+        for (let i = 1; i < stamps.length; i++) {
+          const d = Math.abs(Number(stamps[i]) - t);
+          if (d < bestD) { bestD = d; best = i; }
+        }
+        return bestD <= maxSnapErr ? best : -1;
+      }
+
+      const eventDatasets = [];
+      const eventColors = { hs: '#ef4444', to: '#22c55e', ms: '#f59e0b', msw: '#8b5cf6' };
+      const eventNames = { hs: 'IC', to: 'TC', ms: 'MS', msw: 'MSW' };
+
+      ['hs', 'to', 'ms', 'msw'].forEach(type => {
+        if (eve && eve[type]) {
+          const points = eve[type].map(t => {
+            const idx = nearestSampleIndex(t);
+            if (idx === -1) return null;
+            return { x: ts[idx], y: sig.gyro_y[idx] };
+          }).filter(p => p !== null);
+
+          if (points.length > 0) {
+            eventDatasets.push({
+              label: eventNames[type],
+              data: points,
+              backgroundColor: eventColors[type],
+              pointRadius: 6,
+              pointHoverRadius: 8,
+              type: 'scatter',
+              zIndex: 10
+            });
+          }
+        }
+      });
+
+      // 1. 陀螺仪图表
+      const ctxGyro = document.getElementById('chart-lab-gyro');
+      if (ctxGyro) {
+          chartLabGyro = new Chart(ctxGyro, {
+            data: {
+              labels: ts,
+              datasets: [
+                {
+                  label: '角速度 (X)',
+                  data: sig.gyro_y,
+                  borderColor: '#fff',
+                  borderWidth: 1.5,
+                  pointRadius: 0,
+                  fill: false,
+                  tension: 0.1,
+                  type: 'line'
+                },
+                ...eventDatasets.map(d => ({
+                    ...d, 
+                    data: d.data
+                }))
+              ]
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              animation: false,
+              scales: {
+                x: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#71717a', maxTicksLimit: 12 }, title: { display: true, text: '时间 (s)', color: '#71717a' } },
+                y: { grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#71717a' }, title: { display: true, text: '°/s', color: '#71717a' } }
+              },
+              plugins: { legend: { position: 'top', labels: { color: '#e8e8ed', boxWidth: 12, font: { size: 11 } } } }
+            }
+          });
+      }
+    }
+    syncMetricHighlight(); // 初始化高亮样式
+  </script>
+
+  <!-- 文件列表选择弹窗（离线/在线文件） -->
+  <div id="file-list-modal" class="file-list-modal" onclick="if(event.target===this)closeFileListModal()">
+    <div class="file-list-box">
+      <div id="file-list-container"></div>
+    </div>
+  </div>
+</body>
+</html>

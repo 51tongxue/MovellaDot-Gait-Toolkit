@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+
+# Local / secrets
+local.properties
+*.jks
+*.keystore
+
+# Android / Gradle
+**/build/
+.gradle/
+classes.jar
+*.bak
+**/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+.externalNativeBuild/
+.cxx/
+
+# Large distributables (keep local; do not commit)
+*.xapk
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+*.egg-info/
+.eggs/
+venv/
+.env
+
+# Logs
+*.log
