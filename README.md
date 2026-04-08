@@ -56,12 +56,18 @@ cd android-gait-dashboard
 MovellaDot-Gait-Toolkit/
 ├── android-xsens-dot/           # 采集 APK（Movella DOT SDK）
 ├── android-gait-dashboard/      # 步态分析 APK（Python 步态管线）
+├── legacy/                      # 旧版 XMDS 快照（归档，见下）
+│   └── Xsens-Multi-Dots-Streamer/
 ├── SDK for Android v2025_1_1/   # SDK 文档与参考（随发行版更新）
 ├── Movella DOT SDK Programming Guide_Android.pdf
 └── README.md
 ```
 
 说明：根目录若存在本地数据目录（如 `data_logging/`），一般为运行时生成，可不纳入版本控制。
+
+### 历史版本（归档）
+
+独立成库之前，本工具集曾作为 [Xsens_GRF_estimation](https://github.com/51tongxue/Xsens_GRF_estimation) 仓库中的 [`scripts/Xsens-Multi-Dots-Streamer`](https://github.com/51tongxue/Xsens_GRF_estimation/tree/main/scripts/Xsens-Multi-Dots-Streamer) 维护。该路径的源码快照已并入本仓库 **`legacy/Xsens-Multi-Dots-Streamer/`**，详见 [legacy/README.md](legacy/README.md)。日常开发请以根目录两个 Android 工程为准。
 
 ---
 

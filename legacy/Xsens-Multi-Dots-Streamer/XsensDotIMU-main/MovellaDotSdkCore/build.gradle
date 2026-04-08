@@ -1,0 +1,2 @@
+configurations.maybeCreate("default")
+artifacts.add("default", file('MovellaDotSdkCore_ANDROID_v2023.6.0_STABLE_RELEASE.aar'))

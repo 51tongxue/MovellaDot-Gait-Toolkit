@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 三个传感器节点（DOT）呈三角分布，整体上移 -->
+    <path
+        android:pathData="M54,28.5 a7,7 0 1,1 0,14 a7,7 0 1,1 0,-14"
+        android:strokeWidth="2"
+        android:strokeColor="#1e40af"
+        android:fillColor="#3b82f6"/>
+    <path
+        android:pathData="M36,66.5 a7,7 0 1,1 0,14 a7,7 0 1,1 0,-14"
+        android:strokeWidth="2"
+        android:strokeColor="#1e40af"
+        android:fillColor="#3b82f6"/>
+    <path
+        android:pathData="M72,66.5 a7,7 0 1,1 0,14 a7,7 0 1,1 0,-14"
+        android:strokeWidth="2"
+        android:strokeColor="#1e40af"
+        android:fillColor="#3b82f6"/>
+    <!-- 连接线：表示数据流/蓝牙同步 -->
+    <path
+        android:pathData="M54,42.5 L42,56.5 M54,42.5 L66,56.5 M42,72.5 L66,72.5"
+        android:strokeWidth="2.5"
+        android:strokeColor="#60a5fa"
+        android:fillColor="#00000000"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"/>
+</vector>
