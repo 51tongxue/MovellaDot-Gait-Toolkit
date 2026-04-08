@@ -1,6 +1,6 @@
 # Xsens-Multi-Dots-Streamer (XMDS)
 
-> **归档说明**：本目录为 [Xsens_GRF_estimation](https://github.com/51tongxue/Xsens_GRF_estimation) 仓库中 [`scripts/Xsens-Multi-Dots-Streamer`](https://github.com/51tongxue/Xsens_GRF_estimation/tree/main/scripts/Xsens-Multi-Dots-Streamer) 的快照（提交 `8308c562`），对应 **MovellaDot-Gait-Toolkit** 的早期版本，**仅作历史参考**。当前开发与构建请使用本仓库根目录下的 `android-xsens-dot` 与 `android-gait-dashboard`。
+> **归档说明**：本目录为 [Xsens_GRF_estimation](https://github.com/51tongxue/Xsens_GRF_estimation) 曾有的 `scripts/Xsens-Multi-Dots-Streamer` 的快照（与提交 [`6e6c36b`](https://github.com/51tongxue/Xsens_GRF_estimation/tree/6e6c36b/scripts/Xsens-Multi-Dots-Streamer) 一致；上游 `main` 已移除该路径），对应 **MovellaDot-Gait-Toolkit** 的早期版本，**仅作历史参考**。当前开发与构建请使用本仓库根目录下的 `android-xsens-dot` 与 `android-gait-dashboard`。
 
 ---
 

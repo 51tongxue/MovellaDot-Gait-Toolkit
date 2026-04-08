@@ -67,7 +67,7 @@ MovellaDot-Gait-Toolkit/
 
 ### 历史版本（归档）
 
-独立成库之前，本工具集曾作为 [Xsens_GRF_estimation](https://github.com/51tongxue/Xsens_GRF_estimation) 仓库中的 [`scripts/Xsens-Multi-Dots-Streamer`](https://github.com/51tongxue/Xsens_GRF_estimation/tree/main/scripts/Xsens-Multi-Dots-Streamer) 维护。该路径的源码快照已并入本仓库 **`legacy/Xsens-Multi-Dots-Streamer/`**，详见 [legacy/README.md](legacy/README.md)。日常开发请以根目录两个 Android 工程为准。
+独立成库之前，本工具集曾作为 [Xsens_GRF_estimation](https://github.com/51tongxue/Xsens_GRF_estimation) 仓库中的 `scripts/Xsens-Multi-Dots-Streamer` 维护；该路径已从上游 `main` 删除，快照已并入本仓库 **`legacy/Xsens-Multi-Dots-Streamer/`**（上游历史树见 [`6e6c36b`](https://github.com/51tongxue/Xsens_GRF_estimation/tree/6e6c36b/scripts/Xsens-Multi-Dots-Streamer)），详见 [legacy/README.md](legacy/README.md)。日常开发请以根目录两个 Android 工程为准。
 
 ---
 
