@@ -101,6 +101,18 @@ class GaitViewModel(application: Application) : AndroidViewModel(application) {
         return analysisManager.analyzeGait(path, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr)
     }
 
+    fun analyze(
+        path: String,
+        weightStr: String,
+        startTimeStr: String,
+        endTimeStr: String,
+        takeoffStepStr: String,
+        takeoffFootStr: String,
+        isTripleJumpStr: String,
+    ): String {
+        return analysisManager.analyzeGait(path, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, isTripleJumpStr)
+    }
+
     fun analyzeContent(content: String, weightStr: String): String {
         return analysisManager.analyzeGaitContent(content, weightStr)
     }
@@ -128,6 +140,18 @@ class GaitViewModel(application: Application) : AndroidViewModel(application) {
         takeoffFootStr: String,
     ): String {
         return analysisManager.analyzeGaitContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr)
+    }
+
+    fun analyzeContent(
+        content: String,
+        weightStr: String,
+        startTimeStr: String,
+        endTimeStr: String,
+        takeoffStepStr: String,
+        takeoffFootStr: String,
+        isTripleJumpStr: String,
+    ): String {
+        return analysisManager.analyzeGaitContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, isTripleJumpStr)
     }
 }
 
@@ -246,6 +270,19 @@ fun GaitDashboardScreen(
                         }
 
                         @JavascriptInterface
+                        fun analyzeGait(
+                            filePath: String,
+                            weightStr: String,
+                            startTimeStr: String,
+                            endTimeStr: String,
+                            takeoffStepStr: String,
+                            takeoffFootStr: String,
+                            isTripleJumpStr: String,
+                        ): String {
+                            return viewModel.analyze(filePath, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, isTripleJumpStr)
+                        }
+
+                        @JavascriptInterface
                         fun analyzeGaitContent(content: String, weightStr: String): String {
                             return viewModel.analyzeContent(content, weightStr)
                         }
@@ -276,6 +313,19 @@ fun GaitDashboardScreen(
                             takeoffFootStr: String,
                         ): String {
                             return viewModel.analyzeContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr)
+                        }
+
+                        @JavascriptInterface
+                        fun analyzeGaitContent(
+                            content: String,
+                            weightStr: String,
+                            startTimeStr: String,
+                            endTimeStr: String,
+                            takeoffStepStr: String,
+                            takeoffFootStr: String,
+                            isTripleJumpStr: String,
+                        ): String {
+                            return viewModel.analyzeContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, isTripleJumpStr)
                         }
                     }, "AndroidInterface")
 

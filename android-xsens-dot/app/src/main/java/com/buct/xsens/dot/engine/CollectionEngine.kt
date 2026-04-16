@@ -317,38 +317,55 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
             if (targetDeviceCount == 1) {
                 val wasActive = measurementStarted  // 重连场景下为 true
-                dev.setOutputRate(STREAM_OUTPUT_RATE_HZ)
+                dev.setOutputRate(if (wasActive) STREAM_OUTPUT_RATE_HZ else syncOutputRate)
                 dev.measurementMode = desiredMode
                 mainHandler.postDelayed({
-                    if (dev.startMeasuring()) {
-                        measurementStarted = true
-                        startLossReporting()
-                        _state.value = CollectionState.Measuring
-                        if (wasActive) {
+                    if (wasActive) {
+                        if (dev.startMeasuring()) {
+                            startLossReporting()
+                            _state.value = CollectionState.Measuring
                             appendSyncLog("[$addr] 重新连接，测量已恢复")
                             onDeviceReconnected?.invoke(addr)
+                        } else {
+                            appendSyncLog("[$addr] 启动测量失败，请断开重连")
                         }
                     } else {
-                        appendSyncLog("[$addr] 启动测量失败，请断开重连")
+                        // 离线模式断联重连，不再强制启动测量
+                        appendSyncLog("[$addr] 已恢复原设定采样率 (${syncOutputRate}Hz)")
+                        onDeviceReconnected?.invoke(addr)
                     }
                 }, 2000)
             } else {
                 if (measurementStarted) {
                     // 此分支：其他设备仍在测量中，仅对刚重连的设备独立恢复
                     appendSyncLog("[$addr] 重新连接，恢复测量…")
-                    dev.setOutputRate(syncOutputRate)
+                    dev.setOutputRate(STREAM_OUTPUT_RATE_HZ)
                     dev.measurementMode = desiredMode
                     dev.startMeasuring()
                     onDeviceReconnected?.invoke(addr)
-                } else if (initDoneAddresses.size == targetDeviceCount && !_isSynced.value) {
-                    // 全部设备就绪：统一应用当前目标采样率，确保各设备 ODR 一致（避免部分设备停留在固件默认值）
-                    devices.forEach { d -> d.setOutputRate(syncOutputRate) }
-                    mainHandler.postDelayed({
-                        devices.forEach { d ->
-                            appendSyncLog("[${d.address}] rate=${d.currentOutputRate}Hz | filter=${d.currentFilterProfileIndex}")
+                } else {
+                    // 离线模式 / 同步后断联重连，恢复预设的输出刷新率 (如 120Hz)
+                    dev.setOutputRate(syncOutputRate)
+                    dev.measurementMode = desiredMode
+                    onDeviceReconnected?.invoke(addr)
+                    
+                    if (initDoneAddresses.size == targetDeviceCount && !_isSynced.value) {
+                        // 全部设备就绪且还未同步：统一应用当前目标采样率，确保各设备 ODR 一致
+                        devices.forEach { d -> d.setOutputRate(syncOutputRate) }
+                        mainHandler.postDelayed({
+                            devices.forEach { d ->
+                                appendSyncLog("[${d.address}] rate=${d.currentOutputRate}Hz | filter=${d.currentFilterProfileIndex}")
+                            }
+                            appendSyncLog("全部 $targetDeviceCount 台设备已就绪，请选择「SDK 硬件同步」")
+                        }, 300)
+                    } else if (_isSynced.value) {
+                        if (!dev.isSynced) {
+                            _isSynced.value = false
+                            appendSyncLog("[$addr] 重新连接但遭遇【硬件同步丢失】，请重新执行 SDK 同步！")
+                        } else {
+                            appendSyncLog("[$addr] 已恢复设定采样率 (${syncOutputRate}Hz) 且硬件同步状态完好 ✓")
                         }
-                        appendSyncLog("全部 $targetDeviceCount 台设备已就绪，请选择「SDK 硬件同步」")
-                    }, 300)
+                    }
                 }
             }
         }
