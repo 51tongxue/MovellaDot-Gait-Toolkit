@@ -37,7 +37,8 @@ def _detect_format(idata):
 # 步态分析核心配置
 GRAVITY = 9.80665
 MS_PER_S = 1000.0
-LOW_CUTOFF_HZ = 7
+GYRO_LOW_CUTOFF_HZ = 10
+ACC_LOW_CUTOFF_HZ = 6
 BASE_FS_HZ = 60          # 基准采样率（用于 Savgol 窗口缩放）
 BASE_SAVGOL_WINDOW = 15  # 基准 Savgol 窗口（60Hz，须为奇数）
 # MSW_WINDOW_MS：仅用于 argrelextrema 的 order（局部极大邻域宽度），不保证相邻 MSW 的时间间隔
@@ -49,10 +50,11 @@ TC_OFFSET_AFTER_IC_MS = 50
 
 FS_ESTIMATE_MIN_HZ = 10
 FS_ESTIMATE_MAX_HZ = 2000
+SAMPLE_TIME_SYNC_START_TOLERANCE_FRAMES = 30.0
 
 
 def estimate_sample_rate_hz(timestamps_ms):
-    """由相对时间戳（ms）差分的中位数估计采样率 (Hz)。有效样本不足时返回 60 作为兜底。"""
+    """由相对时间戳（ms）估计采样率；过滤丢帧间隔后取平均，避免整数毫秒量化造成 120Hz 被误判为 125Hz。"""
     ts = np.asarray(timestamps_ms, dtype=np.float64)
     if ts.size < 2:
         return 60.0
@@ -61,10 +63,289 @@ def estimate_sample_rate_hz(timestamps_ms):
     if d.size < 1:
         return 60.0
     dt_med = float(np.median(d))
-    if dt_med <= 0:
+    nominal_d = d[d <= dt_med * 1.5]
+    if nominal_d.size < 1:
         return 60.0
-    fs = MS_PER_S / dt_med
+    dt_mean = float(np.mean(nominal_d))
+    if dt_mean <= 0:
+        return 60.0
+    fs = MS_PER_S / dt_mean
     return float(np.clip(fs, FS_ESTIMATE_MIN_HZ, FS_ESTIMATE_MAX_HZ))
+
+
+def read_csv_header_metadata(file_path, max_lines=200):
+    """读取导出 CSV 表头前的 key,value 元数据，同时返回真正数据表头所在行号。"""
+    metadata = {}
+    skip = 0
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                columns = [part.strip() for part in line.strip().split(',')]
+                if 'PacketCounter' in columns or 'SampleTimeFine' in columns:
+                    skip = i
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                parts = stripped.split(',', 1)
+                if len(parts) == 2 and parts[0].strip():
+                    metadata[parts[0].strip().lower()] = parts[1].strip()
+    except Exception:
+        return 0, {}
+    return skip, metadata
+
+
+def parse_bool_metadata(metadata, key):
+    value = metadata.get(key.lower())
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ('1', 'true', 'yes', 'y', 'synced'):
+        return True
+    if normalized in ('0', 'false', 'no', 'n', 'unsynced'):
+        return False
+    return None
+
+
+def nearest_timestamp_index(idata, timestamp):
+    if idata is None or len(idata) == 0 or 'Timestamp' not in idata.columns:
+        return None
+    distances = np.abs(idata['Timestamp'] - timestamp)
+    if len(distances) == 0:
+        return None
+    return distances.idxmin()
+
+
+def estimate_initial_sample_time_interval(sample_times):
+    values = pd.to_numeric(sample_times, errors='coerce').dropna().to_numpy(dtype=np.float64)
+    if values.size < 2:
+        return None
+    diffs = np.diff(values[:min(values.size, 20)])
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+    return float(np.median(diffs))
+
+
+def try_align_pair_by_sample_time(primary_df, paired_df, time_scale, force_synced=False):
+    """
+    仅当两侧开头 SampleTimeFine 对得上时，才认定为同步录制并按 SampleTimeFine 对齐。
+    未达到同步条件时返回 None，由调用方回退到 PacketCounter。
+    """
+    if 'SampleTimeFine' not in primary_df.columns or 'SampleTimeFine' not in paired_df.columns:
+        return None, {"reason": "missing_sample_time_fine"}
+
+    primary = primary_df.copy()
+    paired = paired_df.copy()
+    key_col = '_SampleTimeFineKey'
+    primary[key_col] = pd.to_numeric(primary['SampleTimeFine'], errors='coerce')
+    paired[key_col] = pd.to_numeric(paired['SampleTimeFine'], errors='coerce')
+    primary = primary[primary[key_col].notna()]
+    paired = paired[paired[key_col].notna()]
+    if primary.empty or paired.empty:
+        return None, {"reason": "empty_sample_time_fine"}
+
+    primary_start = float(primary[key_col].iloc[0])
+    paired_start = float(paired[key_col].iloc[0])
+    primary_interval = estimate_initial_sample_time_interval(primary[key_col])
+    paired_interval = estimate_initial_sample_time_interval(paired[key_col])
+    intervals = [x for x in (primary_interval, paired_interval) if x is not None and x > 0]
+    if not intervals:
+        return None, {"reason": "missing_sample_time_interval"}
+    initial_interval = min(intervals)
+    start_tolerance = max(1.0, initial_interval * SAMPLE_TIME_SYNC_START_TOLERANCE_FRAMES)
+    start_delta = abs(primary_start - paired_start)
+    if not force_synced and start_delta > start_tolerance:
+        return None, {
+            "reason": "sample_time_start_mismatch",
+            "start_delta": start_delta,
+            "start_tolerance": start_tolerance,
+        }
+
+    overlap_start = max(float(primary[key_col].min()), float(paired[key_col].min()))
+    overlap_end = min(float(primary[key_col].max()), float(paired[key_col].max()))
+    if overlap_start > overlap_end:
+        return None, {"reason": "no_sample_time_overlap"}
+
+    primary = primary[(primary[key_col] >= overlap_start) & (primary[key_col] <= overlap_end)]
+    paired = paired[(paired[key_col] >= overlap_start) & (paired[key_col] <= overlap_end)]
+    primary = primary.drop_duplicates(subset=[key_col], keep='first')
+    paired = paired.drop_duplicates(subset=[key_col], keep='first')
+
+    common_times = np.intersect1d(
+        primary[key_col].to_numpy(dtype=np.float64),
+        paired[key_col].to_numpy(dtype=np.float64),
+    )
+    if common_times.size == 0:
+        return None, {
+            "reason": "no_common_sample_time_after_start_match",
+            "start_delta": start_delta,
+            "start_tolerance": start_tolerance,
+        }
+
+    primary = primary[primary[key_col].isin(common_times)].sort_values(key_col).reset_index(drop=True)
+    paired = paired[paired[key_col].isin(common_times)].sort_values(key_col).reset_index(drop=True)
+    sample_start = float(common_times[0])
+    sample_end = float(common_times[-1])
+
+    if 'Timestamp' in primary.columns:
+        timestamp_by_sample = dict(
+            zip(
+                primary[key_col].to_numpy(dtype=np.float64),
+                primary['Timestamp'].to_numpy(dtype=np.int64),
+            )
+        )
+        primary['Timestamp'] = primary[key_col].map(timestamp_by_sample).astype(np.int64)
+        paired['Timestamp'] = paired[key_col].map(timestamp_by_sample).astype(np.int64)
+    else:
+        primary['Timestamp'] = np.round((primary[key_col] - sample_start) * time_scale).astype(np.int64)
+        paired['Timestamp'] = np.round((paired[key_col] - sample_start) * time_scale).astype(np.int64)
+
+    primary = primary.drop(columns=[key_col])
+    paired = paired.drop(columns=[key_col])
+    info = {
+        "start": sample_start,
+        "end": sample_end,
+        "rows": int(len(common_times)),
+        "method": "SampleTimeFine",
+        "start_delta": start_delta,
+        "start_tolerance": start_tolerance,
+        "force_synced": bool(force_synced),
+    }
+    return (primary, paired, info), {
+        "reason": "synced_sample_time",
+        "common_rows": int(common_times.size),
+        "start_delta": start_delta,
+        "start_tolerance": start_tolerance,
+        "force_synced": bool(force_synced),
+    }
+
+
+def align_pair_by_packet_counter(primary_df, paired_df, dt_ms):
+    """
+    非同步左右脚数据按各自相对 PacketCounter 对齐。
+    两侧从各自第一帧归零，取共同相对帧号，避免长度不一致。
+    """
+    primary = primary_df.copy()
+    paired = paired_df.copy()
+    key_col = '_RelativePacketCounter'
+
+    def attach_relative_packet_counter(df):
+        if 'PacketCounter' not in df.columns:
+            df = df.copy()
+            df['PacketCounter'] = np.arange(len(df), dtype=np.int64)
+        raw = pd.to_numeric(df['PacketCounter'], errors='coerce')
+        valid = raw.notna()
+        df = df[valid].copy()
+        raw = raw[valid].reset_index(drop=True)
+        if df.empty:
+            raise ValueError("PacketCounter 为空，无法配对左右脚数据")
+        diff = raw.diff().fillna(0)
+        diff[diff < 0] += 65536
+        unwrapped = diff.cumsum() + raw.iloc[0]
+        df[key_col] = (unwrapped - unwrapped.iloc[0]).to_numpy(dtype=np.float64)
+        return df
+
+    primary = attach_relative_packet_counter(primary)
+    paired = attach_relative_packet_counter(paired)
+    primary = primary.drop_duplicates(subset=[key_col], keep='first')
+    paired = paired.drop_duplicates(subset=[key_col], keep='first')
+    common_counts = np.intersect1d(
+        primary[key_col].to_numpy(dtype=np.float64),
+        paired[key_col].to_numpy(dtype=np.float64),
+    )
+    if common_counts.size == 0:
+        raise ValueError("左右脚 PacketCounter 没有共同相对帧号，无法配对")
+
+    primary = primary[primary[key_col].isin(common_counts)].sort_values(key_col).reset_index(drop=True)
+    paired = paired[paired[key_col].isin(common_counts)].sort_values(key_col).reset_index(drop=True)
+    counter_start = float(common_counts[0])
+    counter_end = float(common_counts[-1])
+    primary['Timestamp'] = np.round((primary[key_col] - counter_start) * dt_ms).astype(np.int64)
+    paired['Timestamp'] = np.round((paired[key_col] - counter_start) * dt_ms).astype(np.int64)
+    primary = primary.drop(columns=[key_col])
+    paired = paired.drop(columns=[key_col])
+    info = {
+        "start": counter_start,
+        "end": counter_end,
+        "rows": int(len(common_counts)),
+        "method": "PacketCounter",
+    }
+    return primary, paired, info
+
+
+def apply_time_window(idata, start_time_s, end_time_s):
+    data = idata
+    if start_time_s >= 0:
+        data = data[data['Timestamp'] >= start_time_s * 1000.0]
+    if end_time_s >= 0:
+        data = data[data['Timestamp'] <= end_time_s * 1000.0]
+    data = data.copy()
+    data.reset_index(drop=True, inplace=True)
+    return data
+
+
+def prepare_idata_for_analysis(idata, log_label=""):
+    idata = idata.copy()
+    idata.reset_index(drop=True, inplace=True)
+
+    fmt = _detect_format(idata)
+    label = f" ({log_label})" if log_label else ""
+    print(f"GAIT_LOG_INFO: Detected CSV format{label}: {fmt}")
+
+    if fmt == 'offline':
+        # 离线格式：Acc_X/Y/Z 为局部坐标系原始加速度（m/s²），需用四元数旋转到全局坐标系后去重力
+        acc_array = idata[['Acc_X', 'Acc_Y', 'Acc_Z']].to_numpy(dtype=float) / GRAVITY
+        quat_array = idata[['Quat_W', 'Quat_X', 'Quat_Y', 'Quat_Z']].to_numpy(dtype=float)
+
+        rotated = np.zeros_like(acc_array)
+        for i in range(len(idata)):
+            rotated[i] = _rotate_vector_by_quaternion(acc_array[i], quat_array[i])
+
+        acc_xy = rotated[:, :2]
+        if len(acc_xy) > 1 and len(quat_array) > 0:
+            cov_mat = np.cov(acc_xy, rowvar=False)
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_mat)
+            main_axis = eigenvectors[:, np.argmax(eigenvalues)]
+
+            q0 = quat_array[0]
+            w0, x0, y0, z0 = q0
+            ref_vx = 1.0 - 2.0 * (y0**2 + z0**2)
+            ref_vy = 2.0 * (x0*y0 + w0*z0)
+            if np.dot(main_axis, [ref_vx, ref_vy]) < 0:
+                main_axis = -main_axis
+
+            yaw_pca = np.arctan2(main_axis[1], main_axis[0])
+            cos_a, sin_a = np.cos(-yaw_pca), np.sin(-yaw_pca)
+            rot_x = acc_xy[:, 0] * cos_a - acc_xy[:, 1] * sin_a
+            rot_y = acc_xy[:, 0] * sin_a + acc_xy[:, 1] * cos_a
+            rotated[:, 0] = rot_x
+            rotated[:, 1] = rot_y
+
+        idata['ACC.X'] = rotated[:, 0]
+        idata['ACC.Y'] = rotated[:, 1]
+        idata['ACC.Z'] = rotated[:, 2] - 1.0
+        idata['Gmax(°/s)'] = idata['Gyr_Y']
+        idata['Gyro.X'] = idata['Gyr_X']
+        idata['Gyro.Y'] = idata['Gyr_Y']
+        idata['Gyro.Z'] = idata['Gyr_Z']
+    else:
+        idata['ACC.X'] = idata['freeAccX'] / GRAVITY
+        idata['ACC.Y'] = idata['freeAccY'] / GRAVITY
+        idata['ACC.Z'] = idata['freeAccZ'] / GRAVITY
+        idata['Gmax(°/s)'] = idata['gyroY']
+        idata['Gyro.X'] = idata['gyroX']
+        idata['Gyro.Y'] = idata['gyroY']
+        idata['Gyro.Z'] = idata['gyroZ']
+
+    fs_source = estimate_sample_rate_hz(idata['Timestamp'].values)
+    print(f"GAIT_LOG_INFO: Estimated sample rate{label} ≈ {fs_source:.2f} Hz (no resampling)")
+
+    HS, TO, MS, idata, ic_fusion = gait_identification(idata, fs=fs_source)
+    print(f"DEBUG: Identified events{label} - HS: {len(HS)}, TO: {len(TO)}, MS: {len(MS)}")
+    return idata, HS, TO, MS, ic_fusion, fs_source, fmt
 
 
 def _apply_filters_low(data, column, low_cutoff, fs):
@@ -116,13 +397,13 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     if savgol_win % 2 == 0:
         savgol_win += 1
 
-    # 内部滤波副本：对所有检测相关信号滤波，仅在函数内用于事件检测
-    # ACC 不写回 idata，保持原始值供步幅 ZUPT 积分
-    # Gmax 写回 idata 供前端/绘图展示，事件标记 Y 坐标与信号线保持一致
     det = idata.copy()
     for col in ['Gmax(°/s)', 'ACC.X', 'ACC.Y', 'ACC.Z']:
         if col in det.columns:
-            det = _apply_filters_low(det, col, LOW_CUTOFF_HZ, fs)
+            if col == 'Gmax(°/s)':
+                det = _apply_filters_low(det, col, GYRO_LOW_CUTOFF_HZ, fs)
+            else:
+                det = _apply_filters_low(det, col, ACC_LOW_CUTOFF_HZ, fs)
     idata['Gmax(°/s)'] = det['Gmax(°/s)'].values
     idata['gyroscopic_energy'] = np.sqrt(idata['Gyro.X'] ** 2 + idata['Gyro.Y'] ** 2 + idata['Gyro.Z'] ** 2)
 
@@ -149,12 +430,12 @@ def gait_identification(idata, fs=BASE_FS_HZ):
 
     def find_ic_time(seg_signal, seg_timestamps):
         if len(seg_signal) < 3: return None, False
-        
+
         from scipy.signal import find_peaks
         valleys, _ = find_peaks(-seg_signal)
-        
+
         valid_valleys = [v for v in valleys if seg_signal[v] < gyro_noise_level]
-        
+
         if len(valid_valleys) == 0:
             zc_idxs = [j for j in range(len(seg_signal)-1) if seg_signal[j] > 0 and seg_signal[j+1] <= 0]
             if zc_idxs:
@@ -163,41 +444,47 @@ def gait_identification(idata, fs=BASE_FS_HZ):
                 return cal_time, True
             return None, False
 
+        # --------- 原逻辑（已注释，保留作参考） ---------
+        # first_valley_idx = valid_valleys[0]
+        #
+        # if seg_signal[first_valley_idx] >= 0:
+        #     return seg_timestamps[first_valley_idx], False
+        # else:
+        #     zc_idxs = [j for j in range(first_valley_idx) if seg_signal[j] > 0 and seg_signal[j+1] <= 0]
+        #     if zc_idxs:
+        #         j = zc_idxs[0]
+        #         cal_time = seg_timestamps[j] + (seg_timestamps[j+1]-seg_timestamps[j]) * (-seg_signal[j])/(seg_signal[j+1]-seg_signal[j])
+        #         return cal_time, True
+        #     else:
+        #         return seg_timestamps[first_valley_idx], False
+
+        # --------- 新逻辑：存在波谷时，直接将第一个波谷作为 IC ---------
         first_valley_idx = valid_valleys[0]
-        
-        if seg_signal[first_valley_idx] >= 0:
-            return seg_timestamps[first_valley_idx], False
-        else:
-            zc_idxs = [j for j in range(first_valley_idx) if seg_signal[j] > 0 and seg_signal[j+1] <= 0]
-            if zc_idxs:
-                j = zc_idxs[0]
-                cal_time = seg_timestamps[j] + (seg_timestamps[j+1]-seg_timestamps[j]) * (-seg_signal[j])/(seg_signal[j+1]-seg_signal[j])
-                return cal_time, True
-            else:
-                return seg_timestamps[first_valley_idx], False
+        return seg_timestamps[first_valley_idx], False
 
     ic_windows = []
     for i in range(len(MSW_timestamps) - 1):
         ic_windows.append((MSW_timestamps[i], MSW_timestamps[i + 1]))
-        
+
     if len(MSW_timestamps) > 0:
         ic_windows.append((MSW_timestamps[-1], idata['Timestamp'].iloc[-1]))
 
     for idx_w, (w_start, w_end) in enumerate(ic_windows):
         mask = (idata['Timestamp'] >= w_start) & (idata['Timestamp'] <= w_end)
         ic_time, is_zc = find_ic_time(idata.loc[mask, 'Gmax(°/s)'].values, idata.loc[mask, 'Timestamp'].values)
-        
+
         # 强制兜底
         if ic_time is None and idx_w == len(ic_windows) - 1:
             seg_ts = idata.loc[mask, 'Timestamp'].values
             if len(seg_ts) > 0:
                 ic_time = seg_ts[-1]
                 is_zc = False
-                
+
         if ic_time is not None:
-            idx = (np.abs(idata['Timestamp'] - ic_time)).idxmin()
-            idata.loc[idx, 'IC'] = idata.loc[idx, 'Gmax(°/s)']
-            idata.loc[idx, 'IC_is_zc'] = is_zc
+            idx = nearest_timestamp_index(idata, ic_time)
+            if idx is not None:
+                idata.loc[idx, 'IC'] = idata.loc[idx, 'Gmax(°/s)']
+                idata.loc[idx, 'IC_is_zc'] = is_zc
 
     idata['TC'] = np.nan
     idata['TC_raw'] = np.nan
@@ -205,7 +492,7 @@ def gait_identification(idata, fs=BASE_FS_HZ):
 
     def find_tc_time(seg_signal, seg_timestamps, is_ic_zc):
         if len(seg_signal) < 3: return None, None
-        
+
         wl = min(5, len(seg_signal)//2*2+1)
         wl = max(3, wl)
         try:
@@ -216,9 +503,9 @@ def gait_identification(idata, fs=BASE_FS_HZ):
         from scipy.signal import find_peaks
         peaks, _ = find_peaks(-filtered)
         valid_valleys = [v for v in peaks if filtered[v] < 0]
-        
+
         if not valid_valleys: return None, None
-        
+
         if is_ic_zc:
             ic_alt_time = seg_timestamps[valid_valleys[0]]
             if len(valid_valleys) > 1:
@@ -243,27 +530,36 @@ def gait_identification(idata, fs=BASE_FS_HZ):
 
     for w_start, w_end, incl_end in tc_windows:
         mask = (idata['Timestamp'] >= w_start) & (idata['Timestamp'] <= w_end if incl_end else idata['Timestamp'] < w_end)
-        
+
         is_ic_zc = False
-        idx_start = (np.abs(idata['Timestamp'] - w_start)).idxmin()
+        idx_start = nearest_timestamp_index(idata, w_start)
+        if idx_start is None:
+            continue
         if pd.notna(idata.loc[idx_start, 'IC']):
             is_ic_zc = idata.loc[idx_start, 'IC_is_zc']
-            
+
         tc_time, ic_alt_time = find_tc_time(idata.loc[mask, 'Gmax(°/s)'].values, idata.loc[mask, 'Timestamp'].values, is_ic_zc)
-        
+
         if tc_time is not None:
-            idx = (np.abs(idata['Timestamp'] - tc_time)).idxmin()
-            idata.loc[idx, 'TC'] = idata.loc[idx, 'Gmax(°/s)']
-            
+            idx = nearest_timestamp_index(idata, tc_time)
+            if idx is not None:
+                idata.loc[idx, 'TC'] = idata.loc[idx, 'Gmax(°/s)']
+
         if ic_alt_time is not None:
-            idx_alt = (np.abs(idata['Timestamp'] - ic_alt_time)).idxmin()
-            idata.loc[idx_alt, 'IC_alt'] = idata.loc[idx_alt, 'Gmax(°/s)']
+            idx_alt = nearest_timestamp_index(idata, ic_alt_time)
+            if idx_alt is not None:
+                idata.loc[idx_alt, 'IC_alt'] = idata.loc[idx_alt, 'Gmax(°/s)']
 
     HS_timestamps = sorted(idata[idata['IC'].notna()]['Timestamp'].values)
     TO_timestamps = sorted(idata[idata['TC'].notna()]['Timestamp'].values)
 
-    # # ---------- IC 细化（ACC.Y 波谷 × 0.7 + 陀螺仪波谷 × 0.3）----------
-    # # 对每个粗检 IC，在动态窗口（相邻 IC 间距 15%）内找 ACC.Y 最小谷，
+    # # 记录原始 IC 供调试绘图
+    # original_hs = list(HS_timestamps)
+    # ic_windows = []
+    # acc_x_valleys_list = []
+
+    # # ---------- IC 细化（ACC.X 波谷 × 0.7 + 陀螺仪波谷 × 0.3）----------
+    # # 对每个粗检 IC，在动态窗口（相邻 IC 间距 15%）内找 ACC.X 最小谷，
     # # 同时在窗口内找最近陀螺仪谷底，加权融合得到更精确的 IC
     # HS_refined = list(HS_timestamps)
     # for i, ic_time in enumerate(HS_timestamps):
@@ -274,18 +570,23 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     #     else:
     #         window_size = (HS_timestamps[i] - HS_timestamps[i - 1]) * 0.15
 
-    #     window = idata[(idata['Timestamp'] >= ic_time - window_size) &
-    #                    (idata['Timestamp'] <= ic_time + window_size)]
+    #     w_start = ic_time - window_size
+    #     w_end = ic_time + window_size
+    #     window = idata[(idata['Timestamp'] >= w_start) &
+    #                    (idata['Timestamp'] <= w_end)]
     #     if window.empty:
     #         continue
 
-    #     # ACC.Y 最小谷（负峰）
-    #     acc_y_vals = window['ACC.Y'].values
-    #     acc_y_valleys, _ = find_peaks(-acc_y_vals, distance=5)
-    #     if len(acc_y_valleys) == 0:
+    #     ic_windows.append({'start': float(w_start), 'end': float(w_end)})
+
+    #     # ACC.X 最小谷（负峰）
+    #     acc_x_vals = window['ACC.X'].values
+    #     acc_x_valleys, _ = find_peaks(-acc_x_vals, distance=5)
+    #     if len(acc_x_valleys) == 0:
     #         continue
-    #     min_valley_local = acc_y_valleys[np.argmin(acc_y_vals[acc_y_valleys])]
-    #     acc_y_valley_time = window['Timestamp'].iloc[min_valley_local]
+    #     min_valley_local = acc_x_valleys[np.argmin(acc_x_vals[acc_x_valleys])]
+    #     acc_x_valley_time = window['Timestamp'].iloc[min_valley_local]
+    #     acc_x_valleys_list.append([float(acc_x_valley_time), float(acc_x_vals[min_valley_local])])
 
     #     # 陀螺仪最近谷底
     #     gyro_vals = window['Gmax(°/s)'].values
@@ -297,8 +598,8 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     #     else:
     #         gyro_valley_time = ic_time
 
-    #     # 加权融合（ACC.Y 主导 70%，陀螺仪辅助 30%）
-    #     fused = 0.7 * acc_y_valley_time + 0.3 * gyro_valley_time
+    #     # 加权融合（ACC.X 主导 70%，陀螺仪辅助 30%）
+    #     fused = 0.7 * acc_x_valley_time + 0.3 * gyro_valley_time
     #     nearest_idx = (np.abs(idata['Timestamp'] - fused)).idxmin()
     #     HS_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
 
@@ -333,140 +634,175 @@ def gait_identification(idata, fs=BASE_FS_HZ):
 
         # 加权融合（陀螺仪主导 70%，ACC.Z 辅助 30%）
         fused = 0.3 * acc_z_peak_time + 0.7 * tc_time
-        nearest_idx = (np.abs(idata['Timestamp'] - fused)).idxmin()
-        TO_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
+        nearest_idx = nearest_timestamp_index(idata, fused)
+        if nearest_idx is not None:
+            TO_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
 
     TO_timestamps = sorted(set(TO_refined))
 
-    # --------- 1️⃣ method
-    MS_timestamps = []
-    MS_values = []
-    data_end = int(idata['Timestamp'].iloc[-1])
-    for hs_idx, hs_time in enumerate(HS_timestamps):
-        following_TO_times = [to_time for to_time in TO_timestamps if to_time > hs_time]
-        if following_TO_times:
-            next_TO_time = following_TO_times[0]
-        elif hs_idx == len(HS_timestamps) - 1:
-            next_TO_time = min(hs_time + 1000, data_end)
-        else:
-            continue
-        # 提取支撑期数据
-        mask = (idata['Timestamp'] > hs_time) & (idata['Timestamp'] < next_TO_time)
-        support_data = idata.loc[mask].reset_index(drop=True)
-        N = len(support_data)
-        if N < 5:
-            continue
-        # --------- 1. 去除前后10% ---------
-        ten_percent = int(0.1 * N)
-        if N - 2 * ten_percent < 1:
-            continue
-        core_data = support_data.iloc[ten_percent:N - ten_percent].reset_index(drop=True)
-        timestamps = core_data['Timestamp'].values
-        # --------- 2. 滑动窗口平均（窗口大小为30%） ---------
-        window_ratio = 0.3
-        window_size = max(3, int(len(core_data) * window_ratio))
-        if window_size % 2 == 0:
-            window_size += 1  # 保证是奇数，中心对称
-        half_window = window_size // 2
-        gyro_energy_mean = []
-        for i in range(half_window, len(core_data) - half_window):
-            window = core_data.iloc[i - half_window: i + half_window + 1]
-            mean_energy = window['gyroscopic_energy'].mean()
-            gyro_energy_mean.append(mean_energy)
-        if not gyro_energy_mean:
-            continue
-        # --------- 3. 找滑动均值最小处，对应窗口中心时间 ---------
-        min_idx = np.argmin(gyro_energy_mean)
-        ms_candidate_time = timestamps[min_idx + half_window]
-        if ms_candidate_time not in MS_timestamps:
-            MS_timestamps.append(int(ms_candidate_time))
-            MS_values.append(gyro_energy_mean[min_idx])
-
-    # # ---------- MS 检测（Method 3）----------
-    # # 去除支撑期前后 10%，在核心段用滑窗计算角速度能量 T_ω 和加速度方差 T_v，
-    # # 以当前窗口方差与相邻步连续性加权融合得到支撑中期时刻
+    # # --------- 1️⃣ method
     # MS_timestamps = []
-    # a_last = np.array([0.0, 0.0])   # 上一步窗口中心 ACC.XY（用于连续性权重）
+    # MS_values = []
     # data_end = int(idata['Timestamp'].iloc[-1])
     # for hs_idx, hs_time in enumerate(HS_timestamps):
-    #     following_TO = [t for t in TO_timestamps if t > hs_time]
-    #     if following_TO:
-    #         next_TO = following_TO[0]
+    #     following_TO_times = [to_time for to_time in TO_timestamps if to_time > hs_time]
+    #     if following_TO_times:
+    #         next_TO_time = following_TO_times[0]
     #     elif hs_idx == len(HS_timestamps) - 1:
-    #         # 最后一个 IC 后无 TC：以 IC+1000ms 为右边界，仍尝试检测 MS
-    #         next_TO = min(hs_time + 1000, data_end)
+    #         next_TO_time = min(hs_time + 1000, data_end)
     #     else:
     #         continue
-
-    #     mask = (idata['Timestamp'] > hs_time) & (idata['Timestamp'] < next_TO)
-    #     stance = idata.loc[mask].reset_index(drop=True)
-    #     N_total = len(stance)
-    #     if N_total < 10:
+    #     # 提取支撑期数据
+    #     mask = (idata['Timestamp'] > hs_time) & (idata['Timestamp'] < next_TO_time)
+    #     support_data = idata.loc[mask].reset_index(drop=True)
+    #     N = len(support_data)
+    #     if N < 5:
     #         continue
-
-    #     # 去除前后各 10%
-    #     first10 = int(0.1 * N_total)
-    #     last10  = int(0.1 * N_total)
-    #     if N_total - first10 - last10 <= 5:
+    #     # --------- 1. 原逻辑：去除前后10% ---------
+    #     ten_percent = int(0.1 * N)
+    #     if N - 2 * ten_percent < 1:
     #         continue
-    #     mid_core = stance.iloc[first10: N_total - last10].reset_index(drop=True)
-    #     core_len = len(mid_core)
-    #     times    = mid_core['Timestamp'].values
-
-    #     # 滑窗大小 = 核心长度 30%（奇数）
-    #     window_size = max(5, int(core_len * 0.3))
+    #     core_data = support_data.iloc[ten_percent:N - ten_percent].reset_index(drop=True)
+    #     timestamps = core_data['Timestamp'].values
+    #     # --------- 2. 滑动窗口平均（窗口大小为30%） ---------
+    #     window_ratio = 0.3
+    #     window_size = max(3, int(len(core_data) * window_ratio))
     #     if window_size % 2 == 0:
-    #         window_size += 1
-    #     half_w = window_size // 2
-    #     if core_len <= window_size:
+    #         window_size += 1  # 保证是奇数，中心对称
+    #     half_window = window_size // 2
+    #     gyro_energy_mean = []
+    #     for i in range(half_window, len(core_data) - half_window):
+    #         window = core_data.iloc[i - half_window: i + half_window + 1]
+    #         mean_energy = window['gyroscopic_energy'].mean()
+    #         gyro_energy_mean.append(mean_energy)
+    #     if not gyro_energy_mean:
     #         continue
+    #     # --------- 3. 找滑动均值最小处，对应窗口中心时间 ---------
+    #     min_idx = np.argmin(gyro_energy_mean)
+    #     ms_candidate_time = timestamps[min_idx + half_window]
 
-    #     acc_xy_all = mid_core[['ACC.X', 'ACC.Y']].values
-    #     gyro_energy = []
-    #     acc_var     = []
-    #     for i in range(half_w, core_len - half_w):
-    #         wdata = mid_core.iloc[i - half_w: i + half_w + 1]
-    #         # T_ω：角速度能量
-    #         T_omega = ((wdata[['Gyro.X', 'Gyro.Y', 'Gyro.Z']] ** 2).sum(axis=1)).mean()
-    #         gyro_energy.append(T_omega)
-    #         # T_v：XY 加速度方差
-    #         accel    = wdata[['ACC.X', 'ACC.Y']].values
-    #         T_v      = np.mean(np.sum((accel - accel.mean(axis=0)) ** 2, axis=1))
-    #         acc_var.append(T_v)
+    #     # # --------- 新逻辑：直接在整个 hs 到 to 间找到 gyro_energy 最小的区间 (保留滑窗过滤毛刺) ---------
+    #     # timestamps = support_data['Timestamp'].values
+    #     # window_ratio = 0.3
+    #     # window_size = max(3, int(N * window_ratio))
+    #     # if window_size % 2 == 0:
+    #     #     window_size += 1
+    #     # half_window = window_size // 2
 
-    #     if not gyro_energy or not acc_var:
-    #         continue
+    #     # gyro_energy_mean = []
+    #     # for i in range(half_window, N - half_window):
+    #     #     window = support_data.iloc[i - half_window: i + half_window + 1]
+    #     #     gyro_energy_mean.append(window['gyroscopic_energy'].mean())
 
-    #     idx_w = int(np.argmin(gyro_energy))
-    #     idx_v = int(np.argmin(acc_var))
-    #     t_w   = times[idx_w + half_w]
-    #     t_v   = times[idx_v + half_w]
+    #     # if not gyro_energy_mean:
+    #     #     continue
 
-    #     # 连续性权重 w
-    #     a_curr   = acc_xy_all[idx_w + half_w]
-    #     diff_mag = np.linalg.norm(a_last - a_curr)
-    #     win      = acc_xy_all[idx_w: idx_w + window_size] if idx_w + window_size <= core_len \
-    #                else acc_xy_all[-window_size:]
-    #     var_win  = np.mean(np.sum((win - win.mean(axis=0)) ** 2, axis=1))
-    #     w        = var_win / (var_win + diff_mag + 1e-6)
+    #     # min_idx = np.argmin(gyro_energy_mean)
+    #     # ms_candidate_time = timestamps[min_idx + half_window]
 
-    #     # 加权融合并对齐到最近采样点
-    #     t_sp_est = w * t_w + (1 - w) * t_v
-    #     nearest  = (np.abs(idata['Timestamp'] - t_sp_est)).argmin()
-    #     t_sp     = int(idata.loc[nearest, 'Timestamp'])
+    #     if ms_candidate_time not in MS_timestamps:
+    #         MS_timestamps.append(int(ms_candidate_time))
+    #         MS_values.append(gyro_energy_mean[min_idx])
 
-    #     if t_sp not in MS_timestamps:
-    #         MS_timestamps.append(t_sp)
-    #         a_last = a_curr.copy()
+    # ---------- MS 检测（Method 3）----------
+    # 去除支撑期前后 10%，在核心段用滑窗计算角速度能量 T_ω 和加速度方差 T_v，
+    # 以当前窗口方差与相邻步连续性加权融合得到支撑中期时刻
+    MS_timestamps = []
+    MS_values = []
+    a_last = np.array([0.0, 0.0])   # 上一步窗口中心 ACC.XY（用于连续性权重）
+    data_end = int(idata['Timestamp'].iloc[-1])
+    for hs_idx, hs_time in enumerate(HS_timestamps):
+        following_TO = [t for t in TO_timestamps if t > hs_time]
+        if following_TO:
+            next_TO = following_TO[0]
+        elif hs_idx == len(HS_timestamps) - 1:
+            # 最后一个 IC 后无 TC：以 IC+1000ms 为右边界，仍尝试检测 MS
+            next_TO = min(hs_time + 1000, data_end)
+        else:
+            continue
+
+        mask = (idata['Timestamp'] > hs_time) & (idata['Timestamp'] < next_TO)
+        stance = idata.loc[mask].reset_index(drop=True)
+        N_total = len(stance)
+        if N_total < 10:
+            continue
+
+        # 去除前后各 10%
+        first10 = int(0.1 * N_total)
+        last10  = int(0.1 * N_total)
+        if N_total - first10 - last10 <= 5:
+            continue
+        mid_core = stance.iloc[first10: N_total - last10].reset_index(drop=True)
+        core_len = len(mid_core)
+        times    = mid_core['Timestamp'].values
+
+        # 滑窗大小 = 核心长度 30%（奇数）
+        window_size = max(5, int(core_len * 0.3))
+        if window_size % 2 == 0:
+            window_size += 1
+        half_w = window_size // 2
+        if core_len <= window_size:
+            continue
+
+        acc_xy_all = mid_core[['ACC.X', 'ACC.Y']].values
+        gyro_energy = []
+        acc_var     = []
+        for i in range(half_w, core_len - half_w):
+            wdata = mid_core.iloc[i - half_w: i + half_w + 1]
+            # T_ω：角速度能量
+            T_omega = ((wdata[['Gyro.X', 'Gyro.Y', 'Gyro.Z']] ** 2).sum(axis=1)).mean()
+            gyro_energy.append(T_omega)
+            # T_v：XY 加速度方差
+            accel    = wdata[['ACC.X', 'ACC.Y']].values
+            T_v      = np.mean(np.sum((accel - accel.mean(axis=0)) ** 2, axis=1))
+            acc_var.append(T_v)
+
+        if not gyro_energy or not acc_var:
+            continue
+
+        idx_w = int(np.argmin(gyro_energy))
+        idx_v = int(np.argmin(acc_var))
+        t_w   = times[idx_w + half_w]
+        t_v   = times[idx_v + half_w]
+
+        # 连续性权重 w
+        a_curr   = acc_xy_all[idx_w + half_w]
+        diff_mag = np.linalg.norm(a_last - a_curr)
+        win      = acc_xy_all[idx_w: idx_w + window_size] if idx_w + window_size <= core_len \
+                   else acc_xy_all[-window_size:]
+        var_win  = np.mean(np.sum((win - win.mean(axis=0)) ** 2, axis=1))
+        w        = var_win / (var_win + diff_mag + 1e-6)
+
+        # 加权融合并对齐到最近采样点
+        t_sp_est = w * t_w + (1 - w) * t_v
+        nearest = nearest_timestamp_index(idata, t_sp_est)
+        if nearest is None:
+            continue
+        t_sp = int(idata.loc[nearest, 'Timestamp'])
+
+        if t_sp not in MS_timestamps:
+            MS_timestamps.append(t_sp)
+            MS_values.append(gyro_energy[idx_w])
+            a_last = a_curr.copy()
 
     idata['MS'] = np.nan
     if MS_timestamps:
         t_arr = idata['Timestamp'].values
+        if len(t_arr) == 0:
+            return HS_timestamps, TO_timestamps, [], idata, None
         for t, val in zip(MS_timestamps, MS_values):
-            idx = np.abs(t_arr - t).argmin()
-            idata.loc[idx, 'MS'] = val
+            idx = nearest_timestamp_index(idata, t)
+            if idx is not None:
+                idata.loc[idx, 'MS'] = val
 
-    return HS_timestamps, TO_timestamps, MS_timestamps, idata
+    # ic_fusion = {
+    #     'original_hs': [int(x) for x in original_hs],
+    #     'ic_windows': ic_windows,
+    #     'acc_x_valleys': acc_x_valleys_list
+    # }
+    ic_fusion = None
+
+    return HS_timestamps, TO_timestamps, MS_timestamps, idata, ic_fusion
 
 
 # ---------------------------------------------------------------------------
@@ -529,13 +865,14 @@ def infer_takeoff_step_by_cadence_drop(
     TO_timestamps,
     min_drop_ratio=0.20,
     align_tol_ms=120.0,
-    search_last_n=6,
+    search_last_n=0,
 ):
     """
     自动估计跳远起跳步（第几个 TC，1-based）：在助跑段步频相对稳定后，
     第一次出现相对基线明显骤降的那一步，视为起跳（腾空导致步态周期拉长 → 瞬时步频下降）。
 
     基线取当前步之前若干步频的中位数（最多看前 3 步），降幅 = (基线 - 当前) / 基线。
+    默认扫描全段，避免跳跃后还继续走动时把真正起跳段排除在搜索范围外。
 
     返回 (takeoff_step_1based 或 -1, 说明字符串)。
     """
@@ -577,6 +914,75 @@ def infer_takeoff_step_by_cadence_drop(
     return n, ""
 
 
+def infer_takeoff_step_by_signal_burst(
+    TO_timestamps,
+    idata,
+    min_peak_z=4.0,
+    max_to_after_peak_ms=250.0,
+):
+    """
+    自动识别的后备策略：用角速度/加速度的强峰值定位跳跃冲击，再取峰值前最近的 TC。
+
+    这主要覆盖两类情况：
+    1. 起跳后还有较长的走动数据，步频突降不在最后几个周期；
+    2. 步频变化不稳定，但 IMU 信号在起跳/落地区有明显峰值。
+    """
+    TO = sorted(float(t) for t in TO_timestamps)
+    if len(TO) < 3 or idata is None or "Timestamp" not in idata.columns:
+        return -1, "数据不足"
+
+    ts = idata["Timestamp"].to_numpy(dtype=float)
+    if ts.size == 0:
+        return -1, "数据不足"
+
+    score_parts = []
+
+    def robust_z(values):
+        arr = np.asarray(values, dtype=np.float64)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        scale = max(1.4826 * mad, 1e-6)
+        return (arr - med) / scale
+
+    if "Gmax(°/s)" in idata.columns:
+        gyro_abs = np.abs(idata["Gmax(°/s)"].to_numpy(dtype=float))
+        score_parts.append(robust_z(gyro_abs))
+
+    acc_cols = [c for c in ("ACC.X", "ACC.Y", "ACC.Z") if c in idata.columns]
+    if len(acc_cols) == 3:
+        acc = idata[acc_cols].to_numpy(dtype=float)
+        acc_norm = np.linalg.norm(np.nan_to_num(acc, nan=0.0), axis=1)
+        score_parts.append(robust_z(acc_norm))
+
+    if not score_parts:
+        return -1, "缺少角速度/加速度信号"
+
+    score = np.max(np.vstack(score_parts), axis=0)
+    peak_idx = int(np.argmax(score))
+    peak_score = float(score[peak_idx])
+    if not np.isfinite(peak_score) or peak_score < min_peak_z:
+        return -1, "未找到明显起跳冲击"
+
+    peak_time = float(ts[peak_idx])
+    candidates = [
+        (i, t)
+        for i, t in enumerate(TO)
+        if t <= peak_time + max_to_after_peak_ms
+    ]
+    if candidates:
+        j, t_takeoff = candidates[-1]
+    else:
+        j = int(np.argmin([abs(t - peak_time) for t in TO]))
+        t_takeoff = TO[j]
+
+    print(
+        f"GAIT_LOG_INFO: auto takeoff step={j + 1} by signal burst "
+        f"(peak_z={peak_score:.1f}, peak_time={peak_time:.0f}ms, tc_time={t_takeoff:.0f}ms)"
+    )
+    return j + 1, "信号峰值识别"
+
+
 def calculate_gait_status(contact_time_info, swing_time_info):
     """步态状态、腾空时间、双支撑时间，返回 (gait_status_info, flight_time_info, double_support_time_info)"""
     gait_status_info = []
@@ -595,6 +1001,45 @@ def calculate_gait_status(contact_time_info, swing_time_info):
                 double_support_time = max(0, (contact_time - swing_time) / 2.0)
                 double_support_time_info.append((to_time, double_support_time))
     return gait_status_info, flight_time_info, double_support_time_info
+
+
+def calculate_bilateral_double_support(
+    primary_hs,
+    primary_to,
+    contralateral_hs,
+    contralateral_to,
+):
+    """按左右脚真实支撑区间交集计算双足支撑时间。
+
+    每个支撑区间由同一只脚的 IC -> 下一次 IC 前最早 TC 构成。返回值以主脚
+    TC 为键，数值是该次主脚支撑期间与对侧所有支撑区间的交叠总时长（ms）。
+    跑步时两侧支撑区间不相交，结果自然为 0。
+    """
+    def support_intervals(hs_events, to_events):
+        hs_sorted = sorted(float(t) for t in hs_events)
+        to_sorted = sorted(float(t) for t in to_events)
+        intervals = []
+        for index, hs_time in enumerate(hs_sorted):
+            next_hs = hs_sorted[index + 1] if index + 1 < len(hs_sorted) else None
+            candidates = [
+                to_time
+                for to_time in to_sorted
+                if to_time > hs_time and (next_hs is None or to_time < next_hs)
+            ]
+            if candidates:
+                intervals.append((hs_time, candidates[0]))
+        return intervals
+
+    primary_intervals = support_intervals(primary_hs, primary_to)
+    contra_intervals = support_intervals(contralateral_hs, contralateral_to)
+    result = []
+    for primary_start, primary_end in primary_intervals:
+        overlap_ms = sum(
+            max(0.0, min(primary_end, contra_end) - max(primary_start, contra_start))
+            for contra_start, contra_end in contra_intervals
+        )
+        result.append((primary_end, overlap_ms))
+    return result
 
 
 def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
@@ -657,26 +1102,29 @@ def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
                 vY_global[idx_global] = vY[j] - wj * vY[-1]
                 vZ_global[idx_global] = vZ[j] - wj * vZ[-1]
 
-            if i == len(MS_indices) - 2:
-                import matplotlib.pyplot as plt
-                plot_t = ts_sec[start_idx:end_idx+1]
-                plot_vx = vX_global[start_idx:end_idx+1]
-                plot_vy = vY_global[start_idx:end_idx+1]
-                plot_vz = vZ_global[start_idx:end_idx+1]
-                
-                plt.figure(figsize=(10, 5))
-                plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
-                plt.rcParams['axes.unicode_minus'] = False
-                plt.plot(plot_t, plot_vx, label='vX')
-                plt.plot(plot_t, plot_vy, label='vY')
-                plt.plot(plot_t, plot_vz, label='vZ')
-                plt.title(f"最后一个 MS ({plot_t[0]:.2f}s) 到 MS ({plot_t[-1]:.2f}s) 的三轴速度变化图")
-                plt.xlabel("时间 (s)")
-                plt.ylabel("速度 (m/s)")
-                plt.legend()
-                plt.grid(True)
-                plt.tight_layout()
-                plt.show(block=False)
+            # if i == len(MS_indices) - 2:
+            #     try:
+            #         import matplotlib.pyplot as plt
+            #         plot_t = ts_sec[start_idx:end_idx+1]
+            #         plot_vx = vX_global[start_idx:end_idx+1]
+            #         plot_vy = vY_global[start_idx:end_idx+1]
+            #         plot_vz = vZ_global[start_idx:end_idx+1]
+
+            #         plt.figure(figsize=(10, 5))
+            #         plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
+            #         plt.rcParams['axes.unicode_minus'] = False
+            #         plt.plot(plot_t, plot_vx, label='vX')
+            #         plt.plot(plot_t, plot_vy, label='vY')
+            #         plt.plot(plot_t, plot_vz, label='vZ')
+            #         plt.title(f"最后一个 MS ({plot_t[0]:.2f}s) 到 MS ({plot_t[-1]:.2f}s) 的三轴速度变化图")
+            #         plt.xlabel("时间 (s)")
+            #         plt.ylabel("速度 (m/s)")
+            #         plt.legend()
+            #         plt.grid(True)
+            #         plt.tight_layout()
+            #         plt.show(block=False)
+            #     except ImportError:
+            #         pass
 
     # 3. 对第一个 MS 之前的数据进行逆向积分（假设起始速度为0）
     first_ms_idx = MS_indices[0]
@@ -705,10 +1153,10 @@ def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
         idx_end_arr = np.where(ts_all == hs_end)[0]
         if len(idx_start_arr) == 0 or len(idx_end_arr) == 0:
             continue
-            
+
         idx_start = idx_start_arr[0]
         idx_end = idx_end_arr[0]
-        
+
         if idx_start >= idx_end:
             continue
 
@@ -716,11 +1164,11 @@ def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
         vx_seg = vX_global[idx_start:idx_end+1]
         vy_seg = vY_global[idx_start:idx_end+1]
         vz_seg = vZ_global[idx_start:idx_end+1]
-        
+
         n_seg = len(ts_seg)
         if n_seg < 2:
             continue
-            
+
         lX = 0.0
         lY = 0.0
         lZ = 0.0
@@ -729,9 +1177,9 @@ def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
             lX += (vx_seg[j] + vx_seg[j-1]) / 2.0 * dt
             lY += (vy_seg[j] + vy_seg[j-1]) / 2.0 * dt
             lZ += (vz_seg[j] + vz_seg[j-1]) / 2.0 * dt
-            
+
         stride_length = float(np.sqrt(lX**2 + lY**2 + lZ**2))
-        
+
         # 找到 HS 到 HS 之间的那一次 TO，作为标识
         between_TOs = [t for t in TO_timestamps if hs_start < t < hs_end]
         if between_TOs:
@@ -789,8 +1237,8 @@ def filter_to_for_long_jump(TO_timestamps, takeoff_step_1based):
 
 def filter_hs_for_long_jump(HS_timestamps, TO_timestamps, takeoff_step_1based):
     """
-    第 n 个 TO 为起跳时：保留该 TO 时刻 t_cut 之前的所有 IC（HS），
-    t_cut 之后仅保留时间上最后一个 IC（落地），去掉腾空段多检的 IC。
+    第 n 个 TO 为起跳时：保留该 TO 时刻 t_cut 之前及同一时刻的所有 IC（HS），
+    t_cut 之后的 IC 全部丢弃，避免把腾空/落地后的点继续当作助跑事件。
 
     返回 (filtered_HS_sorted_int, applied: bool)。TO 不足 n 时不改 HS。
     """
@@ -805,18 +1253,14 @@ def filter_hs_for_long_jump(HS_timestamps, TO_timestamps, takeoff_step_1based):
         )
         return [int(round(h)) for h in HS], False
     t_cut = TO[n - 1]
-    pre = [h for h in HS if h <= t_cut]
-    post = [h for h in HS if h > t_cut]
-    if not post:
-        return [int(round(h)) for h in HS], True
-    return [int(round(h)) for h in pre + [post[-1]]], True
+    kept = [h for h in HS if h <= t_cut]
+    return [int(round(h)) for h in kept], True
 
 
 def filter_ms_for_long_jump(MS_timestamps, TO_timestamps, takeoff_step_1based, HS_timestamps=None):
     """
-    跳远起跳 TC 之后：
-    如果在最后的着陆 IC 之后没有检测到 MS（通常因为数据提前结束），直接将最后的 IC 当作 MS。
-    防止在起跳后的腾空阶段截取到误检测的噪音 MS。
+    跳远起跳 TC 之后不再识别 MS。
+    只保留起跳 TC 时刻 t_cut 之前及同一时刻的 MS。
     """
     MS = sorted(float(t) for t in MS_timestamps)
     TO = sorted(float(t) for t in TO_timestamps)
@@ -825,31 +1269,16 @@ def filter_ms_for_long_jump(MS_timestamps, TO_timestamps, takeoff_step_1based, H
         return [int(round(m)) for m in MS], False
     if len(TO) < n:
         return [int(round(m)) for m in MS], False
-    
+
     t_cut = TO[n - 1]
-    pre = [m for m in MS if m <= t_cut]
-    
-    # 获取着陆的 IC
-    final_ms = None
-    if HS_timestamps is not None:
-        HS = sorted(float(t) for t in HS_timestamps)
-        post_hs = [h for h in HS if h > t_cut]
-        if post_hs:
-            last_ic = post_hs[-1]
-            # 看在这个 last_ic 之后，是否有真实的 MS
-            ms_after_ic = [m for m in MS if m > last_ic]
-            if ms_after_ic:
-                final_ms = ms_after_ic[-1]
-            else:
-                final_ms = last_ic  # 如果由于末尾数据过短没检测出MS，把IC当做MS
-                
-    if final_ms is not None:
-        return [int(round(m)) for m in pre + [final_ms]], True
-    else:
-        return [int(round(m)) for m in pre], True
+    kept = [m for m in MS if m <= t_cut]
+    return [int(round(m)) for m in kept], True
+
+
 def filter_msw_for_long_jump(MSW_timestamps, TO_timestamps, takeoff_step_1based):
     """
-    起跳 TC 之后只保留时间上最后一个 MSW（与落地侧 IC 一致）。
+    起跳 TC 之后不再识别 MSW。
+    只保留起跳 TC 时刻 t_cut 之前及同一时刻的 MSW。
     """
     MSW = sorted(float(t) for t in MSW_timestamps)
     TO = sorted(float(t) for t in TO_timestamps)
@@ -859,11 +1288,17 @@ def filter_msw_for_long_jump(MSW_timestamps, TO_timestamps, takeoff_step_1based)
     if len(TO) < n:
         return [int(round(x)) for x in MSW], False
     t_cut = TO[n - 1]
-    pre = [x for x in MSW if x <= t_cut]
-    post = [x for x in MSW if x > t_cut]
-    if not post:
-        return [int(round(x)) for x in MSW], True
-    return [int(round(x)) for x in pre + [post[-1]]], True
+    kept = [x for x in MSW if x <= t_cut]
+    return [int(round(x)) for x in kept], True
+
+
+def truncate_signal_at_takeoff(idata, takeoff_to_ms):
+    """以起跳脚离地 TO 为助跑分析硬终点，彻底排除其后的信号样本。"""
+    if idata is None or idata.empty or 'Timestamp' not in idata.columns:
+        return idata
+    truncated = idata[idata['Timestamp'] <= float(takeoff_to_ms)].copy()
+    truncated.reset_index(drop=True, inplace=True)
+    return truncated
 
 
 def sync_idata_ic_tc_to_event_lists(idata, HS_list, TO_list):
@@ -871,13 +1306,17 @@ def sync_idata_ic_tc_to_event_lists(idata, HS_list, TO_list):
     idata = idata.copy()
     idata['IC'] = np.nan
     idata['TC'] = np.nan
+    if idata.empty:
+        return idata
     gcol = 'Gmax(°/s)'
     for t in HS_list:
-        idx = (np.abs(idata['Timestamp'] - t)).idxmin()
-        idata.loc[idx, 'IC'] = idata.loc[idx, gcol]
+        idx = nearest_timestamp_index(idata, t)
+        if idx is not None:
+            idata.loc[idx, 'IC'] = idata.loc[idx, gcol]
     for t in TO_list:
-        idx = (np.abs(idata['Timestamp'] - t)).idxmin()
-        idata.loc[idx, 'TC'] = idata.loc[idx, gcol]
+        idx = nearest_timestamp_index(idata, t)
+        if idx is not None:
+            idata.loc[idx, 'TC'] = idata.loc[idx, gcol]
     return idata
 
 
@@ -889,9 +1328,13 @@ def sync_idata_msw_to_event_list(idata, MSW_timestamps_kept):
         return idata
     orig_times = idata.loc[mask, 'Timestamp'].astype(float).values
     orig_vals = idata.loc[mask, 'MSW'].values
+    if len(orig_times) == 0:
+        return idata
     idata['MSW'] = np.nan
     for t in MSW_timestamps_kept:
-        idx = (np.abs(idata['Timestamp'] - t)).idxmin()
+        idx = nearest_timestamp_index(idata, t)
+        if idx is None:
+            continue
         row_t = float(idata.loc[idx, 'Timestamp'])
         j = int(np.argmin(np.abs(orig_times - row_t)))
         idata.loc[idx, 'MSW'] = float(orig_vals[j])
@@ -906,24 +1349,52 @@ def sync_idata_ms_to_event_list(idata, MS_timestamps_kept):
         return idata
     orig_times = idata.loc[mask, 'Timestamp'].astype(float).values
     orig_vals = idata.loc[mask, 'MS'].values
+    if len(orig_times) == 0:
+        return idata
     idata['MS'] = np.nan
     for t in MS_timestamps_kept:
-        idx = (np.abs(idata['Timestamp'] - t)).idxmin()
+        idx = nearest_timestamp_index(idata, t)
+        if idx is None:
+            continue
         row_t = float(idata.loc[idx, 'Timestamp'])
         j = int(np.argmin(np.abs(orig_times - row_t)))
         idata.loc[idx, 'MS'] = float(orig_vals[j])
     return idata
 
 
-def calculate_spatio_temporal(HS, TO, MS, idata, is_long_jump=False):
+def calculate_spatio_temporal(
+    HS,
+    TO,
+    MS,
+    idata,
+    is_long_jump=False,
+    include_terminal_contact=False,
+    contralateral_hs=None,
+    contralateral_to=None,
+):
     """编排器：调用各独立函数，按 contact_time_info 遍历组装 stride 字典"""
     ct_info = calculate_contact_time(HS, TO)
+    terminal_to = max(TO) if (is_long_jump or include_terminal_contact) and TO else None
+    if terminal_to is not None and not any(to_time == terminal_to for to_time, _ in ct_info):
+        terminal_ic = max((h for h in HS if h < terminal_to), default=None)
+        if terminal_ic is not None:
+            ct_info.append((terminal_to, terminal_to - terminal_ic))
+            ct_info.sort(key=lambda item: item[0])
     sw_info = calculate_swing_time(HS, TO)
     st_info = calculate_stride_time(HS, TO)
     sf_info = calculate_step_frequency(HS, TO)
-    gs_info, ft_info, dst_info = calculate_gait_status(ct_info, sw_info)
+    gs_info, ft_info, inferred_dst_info = calculate_gait_status(ct_info, sw_info)
+    has_bilateral_events = contralateral_hs is not None and contralateral_to is not None
+    bilateral_dst_info = (
+        calculate_bilateral_double_support(HS, TO, contralateral_hs, contralateral_to)
+        if has_bilateral_events
+        else []
+    )
     sl_info = calculate_stride_length(idata, HS, TO, MS)
-    vgrf_info = calculate_vGRF(gs_info, ft_info, dst_info, ct_info)
+    # vGRF 的既有估算公式仍需要步行/跑步状态对应的单脚周期项；输出给用户和
+    # manifest 的双足支撑时间只能使用双侧事件交叠结果。
+    vgrf_support_info = bilateral_dst_info if has_bilateral_events else inferred_dst_info
+    vgrf_info = calculate_vGRF(gs_info, ft_info, vgrf_support_info, ct_info)
 
     ct_dict = dict(ct_info)
     sw_dict = dict(sw_info)
@@ -931,7 +1402,7 @@ def calculate_spatio_temporal(HS, TO, MS, idata, is_long_jump=False):
     sf_dict = dict(sf_info)
     gs_dict = dict(gs_info)
     ft_dict = dict(ft_info)
-    dst_dict = dict(dst_info)
+    dst_dict = dict(bilateral_dst_info)
     sl_dict = dict(sl_info)
     vgrf_dict = dict(vgrf_info)
 
@@ -941,7 +1412,25 @@ def calculate_spatio_temporal(HS, TO, MS, idata, is_long_jump=False):
         after = [h for h in HS if h > to_time]
         hs_start = max(before) if before else None
         hs_next = min(after) if after else None
-        if hs_start is None or hs_next is None:
+        if hs_start is None:
+            continue
+        if hs_next is None:
+            if terminal_to is None or to_time != terminal_to:
+                continue
+            strides.append({
+                "hs_timestamp_ms": int(hs_start),
+                "to_timestamp_ms": int(to_time),
+                "stride_time_s": None,
+                "contact_time_ms": int(round(contact_time)),
+                "double_support_time_ms": None,
+                "swing_time_ms": None,
+                "step_frequency_spm": None,
+                "stride_length_m": None,
+                "stride_velocity_mps": None,
+                "vGRF_peak_BW": None,
+                "flight_time_ms": None,
+                "gait_status": "Takeoff" if is_long_jump else "TerminalContact"
+            })
             continue
 
         stride_time = st_dict.get(to_time, hs_next - hs_start)
@@ -950,16 +1439,8 @@ def calculate_spatio_temporal(HS, TO, MS, idata, is_long_jump=False):
         stride_length = sl_dict.get(to_time, 0)
         gait_status = gs_dict.get(to_time, "Walk")
         flight_time = ft_dict.get(to_time, 0)
-        double_support = dst_dict.get(to_time, 0)
+        double_support = dst_dict.get(to_time)
         vgrf_peak_bw = vgrf_dict.get(to_time, 1.0)
-
-        # 针对跳远起跳步的特殊逻辑：起跳步无摆动时间，TC 到 IC 均为腾空时间
-        if is_long_jump and i == len(ct_info) - 1:
-            swing_time = 0.0
-            flight_time = hs_next - to_time
-            gait_status = "Jump"
-            if contact_time > 0:
-                vgrf_peak_bw = (np.pi / 2.0) * ((flight_time / 1000.0) / (contact_time / 1000.0) + 1.0)
 
         stride_velocity = stride_length / (stride_time / 1000.0) if stride_time > 0 else 0
 
@@ -967,14 +1448,18 @@ def calculate_spatio_temporal(HS, TO, MS, idata, is_long_jump=False):
             "hs_timestamp_ms": int(hs_start),
             "to_timestamp_ms": int(to_time),
             "stride_time_s": float(stride_time / 1000.0),
-            "contact_time_s": float(contact_time / 1000.0),
-            "swing_time_s": float(swing_time / 1000.0),
-            "step_frequency_hz": float(frequency_hz),
-            "stride_length_m": float(stride_length),
-            "stride_velocity_mps": float(stride_velocity),
-            "vGRF_peak_BW": float(vgrf_peak_bw),
-            "double_support_time_s": float(max(0, double_support) / 1000.0),
-            "flight_time_s": float(max(0, flight_time) / 1000.0),
+            "contact_time_ms": int(round(contact_time)),
+            "double_support_time_ms": (
+                int(round(max(0, double_support)))
+                if double_support is not None
+                else None
+            ),
+            "swing_time_ms": int(round(swing_time)),
+            "step_frequency_spm": int(round(frequency_hz * 60.0)),
+            "stride_length_m": round(float(stride_length), 2),
+            "stride_velocity_mps": round(float(stride_velocity), 2),
+            "vGRF_peak_BW": round(float(vgrf_peak_bw), 2),
+            "flight_time_ms": int(round(max(0, flight_time))),
             "gait_status": gait_status
         })
     return strides
@@ -1006,40 +1491,65 @@ def _parse_long_jump_is_takeoff_foot(val):
     return True
 
 
+def build_display_signals(idata, include_raw_gyro=False, max_points=1800):
+    """只压缩前端绘图数据，计算与事件识别仍使用完整采样序列。"""
+    if idata is None or len(idata) == 0:
+        return {}
+    if len(idata) > max_points:
+        indices = np.unique(np.linspace(0, len(idata) - 1, max_points, dtype=np.int64))
+        display = idata.iloc[indices]
+    else:
+        display = idata
+    signals = {
+        "timestamps": display["Timestamp"].tolist(),
+        "acc_x": display["ACC.X"].tolist(),
+        "acc_y": display["ACC.Y"].tolist(),
+        "acc_z": display["ACC.Z"].tolist(),
+        "gyro_y": display["Gmax(°/s)"].tolist(),
+    }
+    if include_raw_gyro:
+        signals.update({
+            "gyro_x": display["Gyro.X"].tolist(),
+            "gyro_y_raw": display["Gyro.Y"].tolist(),
+            "gyro_z": display["Gyro.Z"].tolist(),
+        })
+    return signals
+
+
 def cross_leg_hop_correction(idata_L, idata_R):
     df_l = idata_L.copy()
     df_r = idata_R.copy()
-    
+
     def process_hop_for_primary_leg(primary_df, secondary_df):
         import scipy.signal as signal
         prim_df = primary_df.copy()
         sec_df = secondary_df.copy()
-        
+
         gmax_vals = prim_df['Gmax(°/s)'].values
         timestamps = prim_df['Timestamp'].values
-        
+
         gyro_noise_level = prim_df['Gmax(°/s)'].std() * 0.5
         peaks, _ = signal.find_peaks(gmax_vals, height=gyro_noise_level, prominence=gyro_noise_level * 0.5)
-        
+
         m_shapes = []
         for i in range(len(peaks) - 1):
             t1 = timestamps[peaks[i]]
             t2 = timestamps[peaks[i+1]]
             if t2 - t1 <= 300:
                 m_shapes.append((t1, t2))
-                
+
         ic_times = prim_df[prim_df['IC'].notna()]['Timestamp'].values
-        
+
         for i in range(len(ic_times) - 1):
             t_ic_start = ic_times[i]
             t_ic_end = ic_times[i+1]
-            
+
             has_m_shape = False
             for (m_t1, m_t2) in m_shapes:
                 if m_t1 >= t_ic_start and m_t2 <= t_ic_end:
                     has_m_shape = True
                     break
-                    
+
             if has_m_shape:
                 sec_mask = (sec_df['Timestamp'] >= t_ic_start) & (sec_df['Timestamp'] <= t_ic_end)
                 sec_df.loc[sec_mask & sec_df['IC'].notna(), 'IC'] = np.nan
@@ -1048,7 +1558,7 @@ def cross_leg_hop_correction(idata_L, idata_R):
                 if 'MS' in sec_df.columns:
                     sec_df.loc[sec_mask & sec_df['MS'].notna(), 'MS'] = np.nan
                 sec_df.loc[sec_mask & sec_df['TC_raw'].notna(), 'TC_raw'] = np.nan
-                
+
                 tcs_after_hop = prim_df[(prim_df['Timestamp'] > t_ic_end) & prim_df['TC'].notna()]['Timestamp'].values
                 if len(tcs_after_hop) > 0:
                     tc_after_m = tcs_after_hop[0]
@@ -1063,7 +1573,7 @@ def cross_leg_hop_correction(idata_L, idata_R):
                         if 'MS' in prim_df.columns:
                             prim_df.loc[prim_mask & prim_df['MS'].notna(), 'MS'] = np.nan
                         prim_df.loc[prim_mask & prim_df['TC_raw'].notna(), 'TC_raw'] = np.nan
-                
+
         return prim_df, sec_df
 
     df_r_clean, df_l_clean = process_hop_for_primary_leg(df_r, df_l)
@@ -1083,26 +1593,19 @@ def process_gait_data(
 
         # 容错：Xsens 离线导出文件在表头前可能存在若干元数据行，
         # 找到含 PacketCounter 或 SampleTimeFine 的行作为真正的表头行。
-        skip = 0
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as _f:
-                for _i, _line in enumerate(_f):
-                    if _i >= 200:
-                        break
-                    if 'PacketCounter' in _line or 'SampleTimeFine' in _line:
-                        skip = _i
-                        break
-        except Exception:
-            skip = 0
+        skip, main_metadata = read_csv_header_metadata(file_path)
 
         idata = pd.read_csv(file_path, skiprows=skip if skip > 0 else None)
         idata.columns = idata.columns.str.strip()
         num_rows = len(idata)
         print(f"GAIT_LOG_INFO: Total rows read: {num_rows}, header_skip={skip}")
-        
+
         if 'SampleTimeFine' not in idata.columns:
             print("GAIT_LOG_ERROR: Missing SampleTimeFine column")
             return json.dumps({"ok": False, "error": "CSV 缺少 SampleTimeFine 列"})
+        if 'PacketCounter' not in idata.columns:
+            print("GAIT_LOG_WARN: Missing PacketCounter column, using row index as fallback")
+            idata['PacketCounter'] = np.arange(len(idata), dtype=np.int64)
 
         # 丢包检查逻辑
         t_diffs = idata['SampleTimeFine'].diff().dropna()
@@ -1117,11 +1620,11 @@ def process_gait_data(
             packet_loss_ratio = len(gaps) / num_rows if num_rows > 0 else 0
             print(f"GAIT_LOG_PACKET: dt_avg={dt_avg:.4f}, dt_std={dt_std:.4f}, max_gap={max_gap:.4f}")
             print(f"GAIT_LOG_PACKET: Potential gaps count: {len(gaps)}, Loss ratio estimate: {packet_loss_ratio:.2%}")
-        
+
         t0_local = idata['PacketCounter'].iloc[0]
         dt_series = idata['SampleTimeFine'].diff().dropna()
         dt_avg = dt_series.mean() if not dt_series.empty else 16666.0
-        
+
         # 启发式判断时间单位
         time_scale = 1.0
         if dt_avg > 500: # 可能是微秒 (60Hz dt~16666, 120Hz dt~8333)
@@ -1136,100 +1639,46 @@ def process_gait_data(
 
         dt_ms = dt_avg * time_scale
         print(f"DEBUG: dt_avg={dt_avg:.6f}, Guessing unit: {unit_guess}, time_scale={time_scale}, dt_ms={dt_ms}")
-        
+
         # 展开 PacketCounter 防止因为 16 bit 导致的中途溢出重置（+65536）
         raw_pc = idata['PacketCounter']
         diff_pc = raw_pc.diff().fillna(0)
         diff_pc[diff_pc < 0] += 65536
         unwrapped_pc = diff_pc.cumsum() + raw_pc.iloc[0]
-            
+
         idata['Timestamp'] = np.round((unwrapped_pc - t0_local) * dt_ms).astype(np.int64)
-        
-        # 应用时间范围裁剪
-        if start_time_s >= 0:
-            start_ms = start_time_s * 1000.0
-            idata = idata[idata['Timestamp'] >= start_ms]
-        if end_time_s >= 0:
-            end_ms = end_time_s * 1000.0
-            idata = idata[idata['Timestamp'] <= end_ms]
-            
+        idata_full = idata.copy()
+
+        # 单脚路径先按用户时间窗裁剪；左右脚配对路径会改用 idata_full 对齐后再裁剪一次。
+        idata = apply_time_window(idata, start_time_s, end_time_s)
         if idata.empty:
             return json.dumps({"ok": False, "error": "裁剪后的数据为空，请检查时间范围"})
-            
-        idata = idata.copy()
-        idata.reset_index(drop=True, inplace=True)
-            
-        fmt = _detect_format(idata)
-        print(f"GAIT_LOG_INFO: Detected CSV format: {fmt}")
 
-        if fmt == 'offline':
-            # 离线格式：Acc_X/Y/Z 为局部坐标系原始加速度（m/s²），需用四元数旋转到全局坐标系后去重力
-            acc_array = idata[['Acc_X', 'Acc_Y', 'Acc_Z']].to_numpy(dtype=float) / GRAVITY
-            quat_array = idata[['Quat_W', 'Quat_X', 'Quat_Y', 'Quat_Z']].to_numpy(dtype=float)
-            
-            # --- 增加：离线数据自动 Heading Reset ---
-            # 提取首帧的航向角（Yaw），构建绕 Z 轴的逆补偿四元数，将所有姿态的朝向归零
-            if len(quat_array) > 0:
-                q0 = quat_array[0]
-                w0, x0, y0, z0 = q0
-                # 取首帧在 ENU 坐标系下的水平 Yaw 角
-                yaw0 = np.arctan2(2.0 * (w0 * z0 + x0 * y0), 1.0 - 2.0 * (y0**2 + z0**2))
-                # 构建补偿四元数：绕 Z 轴反向旋转 yaw0
-                q_offset = np.array([np.cos(-yaw0 / 2.0), 0.0, 0.0, np.sin(-yaw0 / 2.0)])
-                for i in range(len(quat_array)):
-                    quat_array[i] = _quaternion_multiply(q_offset, quat_array[i])
-            # --------------------------------------
-
-            rotated = np.zeros_like(acc_array)
-            for i in range(len(idata)):
-                rotated[i] = _rotate_vector_by_quaternion(acc_array[i], quat_array[i])
-            idata['ACC.X'] = rotated[:, 0]
-            idata['ACC.Y'] = rotated[:, 1]
-            idata['ACC.Z'] = rotated[:, 2] - 1.0  # 去除重力分量（全局 Z 轴）
-            # 角速度：Gyr_X/Y/Z 已是 deg/s，直接使用
-            idata['Gmax(°/s)'] = idata['Gyr_Y']
-            idata['Gyro.X'] = idata['Gyr_X']
-            idata['Gyro.Y'] = idata['Gyr_Y']
-            idata['Gyro.Z'] = idata['Gyr_Z']
-        else:
-            # 在线格式：freeAccX/Y/Z 已是全局坐标系自由加速度（m/s²）
-            idata['ACC.X'] = idata['freeAccX'] / GRAVITY
-            idata['ACC.Y'] = idata['freeAccY'] / GRAVITY
-            idata['ACC.Z'] = idata['freeAccZ'] / GRAVITY
-            # gyroX/Y/Z 由 CsvRecorder 直接写入，单位已是 deg/s，无需换算
-            idata['Gmax(°/s)'] = idata['gyroY']
-            idata['Gyro.X'] = idata['gyroX']
-            idata['Gyro.Y'] = idata['gyroY']
-            idata['Gyro.Z'] = idata['gyroZ']
-
-        fs_source = estimate_sample_rate_hz(idata['Timestamp'].values)
-        print(f"GAIT_LOG_INFO: Estimated sample rate ≈ {fs_source:.2f} Hz (no resampling)")
-
-        HS, TO, MS, idata = gait_identification(idata, fs=fs_source)
-        print(f"DEBUG: Primary Identified events - HS: {len(HS)}, TO: {len(TO)}, MS: {len(MS)}")
+        idata, HS, TO, MS, ic_fusion, fs_source, _ = prepare_idata_for_analysis(idata, "primary")
 
         # 解析长跳的起跳发力脚（L/R）
         takeoff_side_req = None
         if isinstance(long_jump_is_takeoff_foot, str) and long_jump_is_takeoff_foot in ['L', 'R']:
             takeoff_side_req = long_jump_is_takeoff_foot
-        
+
         takeoff_raw = _parse_long_jump_takeoff_step(long_jump_takeoff_step)
         is_long_jump_mode = (takeoff_raw >= 0)
-        
+
         # 判断是否需要三级跳专属逻辑（包含跳跃清洗伴飞校准）
         is_triple_jump_mode = getattr(is_triple_jump, '__bool__', lambda: True)() or (isinstance(is_triple_jump, str) and is_triple_jump in ['L', 'R'])
-        
-        # 判断是否双脚模式（三级跳或者跳远）
-        is_dual_leg_mode = is_triple_jump_mode or is_long_jump_mode
-        
+
+        # 默认尝试左右脚配对：同目录存在同时间对侧 CSV 时输出双脚指标；
+        # 未找到配对文件时自动降级为单脚分析。
+        is_dual_leg_mode = True
+
         idata_contra = None
         if is_dual_leg_mode:
-            print(f"GAIT_LOG_INFO: Dual Leg mode enabled (Triple Jump: {is_triple_jump_mode}). Attempting dual leg sync...")
+            print(f"GAIT_LOG_INFO: Paired leg mode enabled (Triple Jump: {is_triple_jump_mode}). Attempting dual leg sync...")
             import os
             basename = os.path.basename(file_path)
             dirname = os.path.dirname(file_path) or '.'
             parts = basename.replace('.csv', '').split('_')
-            
+
             # Find contralateral paired file
             paired_path = None
             if len(parts) >= 3:
@@ -1249,108 +1698,120 @@ def process_gait_data(
                 if candidate_files:
                     candidate_files.sort(key=lambda x: x[0])
                     paired_path = os.path.join(dirname, candidate_files[0][1])
-            
+
             if paired_path is not None:
                 print(f"GAIT_LOG_INFO: Found paired foot file: {paired_path}")
                 try:
                     # 读取并提取对侧文件
-                    skip_contra = 0
-                    with open(paired_path, 'r', encoding='utf-8', errors='ignore') as _f:
-                        for _i, _line in enumerate(_f):
-                            if _i >= 200: break
-                            if 'PacketCounter' in _line or 'SampleTimeFine' in _line:
-                                skip_contra = _i
-                                break
-                    
+                    skip_contra, paired_metadata = read_csv_header_metadata(paired_path)
+
                     idata_c = pd.read_csv(paired_path, skiprows=skip_contra if skip_contra > 0 else None)
                     idata_c.columns = idata_c.columns.str.strip()
-                    t0_c = idata_c['PacketCounter'].iloc[0]
-                    
-                    # 保证同频对齐的绝对 PacketCounter 计算
-                    raw_pc_c = idata_c['PacketCounter']
-                    diff_pc_c = raw_pc_c.diff().fillna(0)
-                    diff_pc_c[diff_pc_c < 0] += 65536
-                    unwrapped_pc_c = diff_pc_c.cumsum() + raw_pc_c.iloc[0]
-                    # 注意：对侧文件的零点使用当前主文件的 t0_local 以保证零时间强行对齐
-                    idata_c['Timestamp'] = np.round((unwrapped_pc_c - t0_local) * dt_ms).astype(np.int64)
-                    
-                    if start_time_s >= 0: idata_c = idata_c[idata_c['Timestamp'] >= start_time_s * 1000.0]
-                    if end_time_s >= 0: idata_c = idata_c[idata_c['Timestamp'] <= end_time_s * 1000.0]
-                    idata_c.reset_index(drop=True, inplace=True)
-                    
-                    fmt_c = _detect_format(idata_c)
-                    if fmt_c == 'offline':
-                        acc_arr_c = idata_c[['Acc_X', 'Acc_Y', 'Acc_Z']].to_numpy(dtype=float) / GRAVITY
-                        quat_arr_c = idata_c[['Quat_W', 'Quat_X', 'Quat_Y', 'Quat_Z']].to_numpy(dtype=float)
-                        if len(quat_arr_c) > 0:
-                            w0, x0, y0, z0 = quat_arr_c[0]
-                            yaw0 = np.arctan2(2.0*(w0*z0+x0*y0), 1.0-2.0*(y0**2+z0**2))
-                            q_off_c = np.array([np.cos(-yaw0/2.0), 0.0, 0.0, np.sin(-yaw0/2.0)])
-                            for i in range(len(quat_arr_c)):
-                                quat_arr_c[i] = _quaternion_multiply(q_off_c, quat_arr_c[i])
-                        rot_c = np.zeros_like(acc_arr_c)
-                        for i in range(len(idata_c)):
-                            rot_c[i] = _rotate_vector_by_quaternion(acc_arr_c[i], quat_arr_c[i])
-                        idata_c['ACC.X'] = rot_c[:, 0]
-                        idata_c['ACC.Y'] = rot_c[:, 1]
-                        idata_c['ACC.Z'] = rot_c[:, 2] - 1.0
-                        idata_c['Gmax(°/s)'] = idata_c['Gyr_Y']
-                        idata_c['Gyro.X'] = idata_c['Gyr_X']
-                        idata_c['Gyro.Y'] = idata_c['Gyr_Y']
-                        idata_c['Gyro.Z'] = idata_c['Gyr_Z']
+                    if 'PacketCounter' not in idata_c.columns:
+                        print("GAIT_LOG_WARN: Paired CSV missing PacketCounter column, using row index as fallback")
+                        idata_c['PacketCounter'] = np.arange(len(idata_c), dtype=np.int64)
+
+                    rows_main_before = len(idata_full)
+                    rows_contra_before = len(idata_c)
+                    main_synced_meta = parse_bool_metadata(main_metadata, "recording_is_synced")
+                    paired_synced_meta = parse_bool_metadata(paired_metadata, "recording_is_synced")
+                    if main_synced_meta is False or paired_synced_meta is False:
+                        sample_aligned = None
+                        sample_sync_check = {
+                            "reason": "metadata_unsynced",
+                            "main_synced": main_synced_meta,
+                            "paired_synced": paired_synced_meta,
+                        }
                     else:
-                        idata_c['ACC.X'] = idata_c['freeAccX'] / GRAVITY
-                        idata_c['ACC.Y'] = idata_c['freeAccY'] / GRAVITY
-                        idata_c['ACC.Z'] = idata_c['freeAccZ'] / GRAVITY
-                        idata_c['Gmax(°/s)'] = idata_c['gyroY']
-                    
-                    fs_c = estimate_sample_rate_hz(idata_c['Timestamp'].values)
-                    _, _, _, idata_c = gait_identification(idata_c, fs=fs_c)
-                    
+                        sample_aligned, sample_sync_check = try_align_pair_by_sample_time(
+                            idata_full,
+                            idata_c,
+                            time_scale,
+                            force_synced=(main_synced_meta is True and paired_synced_meta is True),
+                        )
+                    if sample_aligned is not None:
+                        aligned_main, aligned_contra, pair_sync = sample_aligned
+                        print(
+                            "GAIT_LOG_INFO: SampleTimeFine synced pair alignment "
+                            f"{pair_sync['start']:.0f}->{pair_sync['end']:.0f}, "
+                            f"rows main {rows_main_before}->{len(aligned_main)}, "
+                            f"paired {rows_contra_before}->{len(aligned_contra)}, "
+                            f"start_delta={pair_sync['start_delta']:.0f}, "
+                            f"tolerance={pair_sync['start_tolerance']:.0f}, "
+                            f"force_synced={pair_sync['force_synced']}"
+                        )
+                    else:
+                        aligned_main, aligned_contra, pair_sync = align_pair_by_packet_counter(idata_full, idata_c, dt_ms)
+                        delta = sample_sync_check.get("start_delta")
+                        tolerance = sample_sync_check.get("start_tolerance")
+                        start_text = (
+                            f", sample_start_delta={delta:.0f}, tolerance={tolerance:.0f}"
+                            if delta is not None and tolerance is not None
+                            else ""
+                        )
+                        print(
+                            "GAIT_LOG_INFO: PacketCounter pair alignment "
+                            f"{pair_sync['start']:.0f}->{pair_sync['end']:.0f}, "
+                            f"rows main {rows_main_before}->{len(aligned_main)}, "
+                            f"paired {rows_contra_before}->{len(aligned_contra)}, "
+                            f"sample_time_check={sample_sync_check.get('reason')}{start_text}"
+                        )
+
+                    idata_pair = apply_time_window(aligned_main, start_time_s, end_time_s)
+                    idata_c_pair = apply_time_window(aligned_contra, start_time_s, end_time_s)
+                    if idata_pair.empty or idata_c_pair.empty:
+                        raise ValueError("左右脚配对后裁剪的数据为空，请检查时间范围")
+
+                    idata, HS, TO, MS, ic_fusion, fs_source, _ = prepare_idata_for_analysis(idata_pair, "primary paired")
+                    idata_c, _, _, _, ic_fusion_c, fs_c, _ = prepare_idata_for_analysis(idata_c_pair, "contra paired")
+
                     if is_triple_jump_mode:
                         # 三级跳：区分左右脚投喂三级跳清洗库
                         if '7E6E' in basename.upper():
                             idata_l, idata_r = idata, idata_c
                         else:
                             idata_l, idata_r = idata_c, idata
-                            
+
                         clean_l, clean_r = cross_leg_hop_correction(idata_l, idata_r)
-                        
+
                         # 替换为主脚结果并刷新事件矩阵
                         idata = clean_l if '7E6E' in basename.upper() else clean_r
                         idata_contra = clean_r if '7E6E' in basename.upper() else clean_l
                     else:
                         # 跳远：不执行伴飞校正，直接使用计算的事件
                         idata_contra = idata_c
-                        
+
                     is_main_left = '7E6E' in basename.upper()
-                    
+
                     HS = sorted(idata[idata['IC'].notna()]['Timestamp'].values)
                     TO = sorted(idata[idata['TC'].notna()]['Timestamp'].values)
                     MS = sorted(idata[idata['MS'].notna()]['Timestamp'].values) if 'MS' in idata.columns else sorted(idata[idata['MSW'].notna()]['Timestamp'].values)
                     print(f"GAIT_LOG_INFO: Dual leg sync complete. Filtered events - HS: {len(HS)}, TO: {len(TO)}, MS: {len(MS)}")
-                    
+
                     # 伴飞脚解析
                     HS_c = sorted(idata_contra[idata_contra['IC'].notna()]['Timestamp'].values)
                     TO_c = sorted(idata_contra[idata_contra['TC'].notna()]['Timestamp'].values)
                     MS_c = sorted(idata_contra[idata_contra['MS'].notna()]['Timestamp'].values) if 'MS' in idata_contra.columns else sorted(idata_contra[idata_contra['MSW'].notna()]['Timestamp'].values)
                     MSW_c = idata_contra[idata_contra['MSW'].notna()]['Timestamp'].values.tolist()
-                    strides_c = calculate_spatio_temporal(HS_c, TO_c, MS_c, idata_contra, is_long_jump=False)
-                    
+                    strides_c = calculate_spatio_temporal(
+                        HS_c,
+                        TO_c,
+                        MS_c,
+                        idata_contra,
+                        is_long_jump=False,
+                        contralateral_hs=HS if not is_long_jump_mode else None,
+                        contralateral_to=TO if not is_long_jump_mode else None,
+                    )
+
                     contra_data = {
                         "strides": strides_c,
-                        "signals": {
-                            "timestamps": idata_contra["Timestamp"].tolist(),
-                            "acc_x": idata_contra["ACC.X"].tolist(),
-                            "acc_y": idata_contra["ACC.Y"].tolist(),
-                            "acc_z": idata_contra["ACC.Z"].tolist(),
-                            "gyro_y": idata_contra["Gmax(°/s)"].tolist(),
-                        },
+                        "signals": build_display_signals(idata_contra),
                         "events": {
                             "hs": [int(x) for x in HS_c],
                             "to": [int(x) for x in TO_c],
                             "ms": [int(x) for x in MS_c],
-                            "msw": [int(x) for x in MSW_c]
+                            "msw": [int(x) for x in MSW_c],
+                            "ic_fusion": ic_fusion_c
                         },
                         "side_main": "L" if is_main_left else "R",
                         "side_contra": "R" if is_main_left else "L"
@@ -1359,10 +1820,16 @@ def process_gait_data(
                     print(f"GAIT_LOG_ERROR: Dual leg sync failed, falling back to single leg mode. Exception: {e}")
                     contra_data = None
             else:
-                print("GAIT_LOG_WARN: Could not find paired contralateral file. Running in single leg triple jump mode.")
+                print("GAIT_LOG_WARN: Could not find paired contralateral file. Running in single leg mode.")
                 contra_data = None
         else:
             contra_data = None
+
+        if not is_long_jump_mode and contra_data is None:
+            return json.dumps({
+                "ok": False,
+                "error": "常规步态分析需要同一次采集的左右脚配对数据，当前缺少对侧文件",
+            }, ensure_ascii=False)
 
         # 判断长跳当前处理的文件是否为起跳脚
         is_takeoff_foot = False
@@ -1374,7 +1841,7 @@ def process_gait_data(
             is_takeoff_foot = True
         elif _parse_long_jump_is_takeoff_foot(long_jump_is_takeoff_foot):
             is_takeoff_foot = True
-        
+
         takeoff_raw = _parse_long_jump_takeoff_step(long_jump_takeoff_step)
         takeoff_auto_message = ""
         takeoff_req = -1
@@ -1388,6 +1855,11 @@ def process_gait_data(
                     HS, TO
                 )
                 takeoff_req = inferred if inferred > 0 else -1
+                if takeoff_req <= 0:
+                    inferred, burst_message = infer_takeoff_step_by_signal_burst(TO, idata)
+                    if inferred > 0:
+                        takeoff_req = inferred
+                        takeoff_auto_message = burst_message
                 if takeoff_req <= 0:
                     print(
                         f"GAIT_LOG_WARN: long_jump auto takeoff failed: {takeoff_auto_message}"
@@ -1414,82 +1886,85 @@ def process_gait_data(
             if lj_hs and len(HS_for_metrics) != len(HS):
                 print(
                     f"GAIT_LOG_INFO: Long jump IC filter: after TO#{takeoff_req}, "
-                    f"keep last IC only; HS count {len(HS)} -> {len(HS_for_metrics)}"
+                    f"drop post-takeoff IC; HS count {len(HS)} -> {len(HS_for_metrics)}"
                 )
             if lj_ms and len(MS_for_metrics) != len(MS):
                 print(
                     f"GAIT_LOG_INFO: Long jump MS filter: after TO#{takeoff_req}, "
-                    f"keep last MS only; MS count {len(MS)} -> {len(MS_for_metrics)}"
+                    f"drop post-takeoff MS; MS count {len(MS)} -> {len(MS_for_metrics)}"
                 )
             if lj_msw and len(MSW_for_metrics) != len(msw_times):
                 print(
                     f"GAIT_LOG_INFO: Long jump MSW filter: after TO#{takeoff_req}, "
-                    f"keep last MSW only; MSW count {len(msw_times)} -> {len(MSW_for_metrics)}"
+                    f"drop post-takeoff MSW; MSW count {len(msw_times)} -> {len(MSW_for_metrics)}"
                 )
             if takeoff_req > 0 and len(TO) >= takeoff_req:
+                cutoff_time = float(TO_for_metrics[-1])
                 idata = sync_idata_ic_tc_to_event_lists(idata, HS_for_metrics, TO_for_metrics)
                 idata = sync_idata_msw_to_event_list(idata, MSW_for_metrics)
                 idata = sync_idata_ms_to_event_list(idata, MS_for_metrics)
-                
-                # 如果存在伴飞脚，必须同步裁切伴飞脚以防出现无用的落地后步态
+                idata = truncate_signal_at_takeoff(idata, cutoff_time)
+
+                # 如果存在伴飞脚，必须同步裁切伴飞脚以防出现起跳后的无用步态事件
                 if contra_data is not None and idata_contra is not None:
-                    cutoff_time = TO_for_metrics[-1] if len(TO_for_metrics) > 0 else float('inf')
-                    primary_landing_ic = HS_for_metrics[-1] if len(HS_for_metrics) > 0 else cutoff_time
-                    
-                    c_hs_pre = [t for t in contra_data['events']['hs'] if t <= cutoff_time]
-                    
-                    # 伴飞脚的落地 IC 必须在主脚落地 IC 附近或之后发生
-                    c_hs_post_valid = [t for t in contra_data['events']['hs'] if t >= primary_landing_ic - 300]
-                    
-                    if c_hs_post_valid:
-                        c_landing_ic = c_hs_post_valid[-1]
-                    else:
-                        # 如果由于数据中断等原因伴飞脚未检测到有效的沙坑 IC（比如只在腾空中误检了噪音），则彻底丢弃误检并强制对齐为主脚落地时间
-                        c_landing_ic = primary_landing_ic
-                        
-                    c_hs = c_hs_pre + [c_landing_ic]
-                    
-                    c_ms_pre = [t for t in contra_data['events']['ms'] if t <= cutoff_time]
-                    ms_after_landing = [m for m in contra_data['events']['ms'] if m > c_landing_ic]
-                    
-                    if ms_after_landing:
-                        c_ms = c_ms_pre + [ms_after_landing[-1]]
-                    else:
-                        c_ms = c_ms_pre + [c_landing_ic]  # 如果也没有合法的沙坑 MS，等同于沙坑 IC
-                    
+                    c_hs = [t for t in contra_data['events']['hs'] if t <= cutoff_time]
+                    c_ms = [t for t in contra_data['events']['ms'] if t <= cutoff_time]
                     c_to = [t for t in contra_data['events']['to'] if t <= cutoff_time]
                     c_msw = [t for t in contra_data['events']['msw'] if t <= cutoff_time]
-                    
+                    idata_contra = truncate_signal_at_takeoff(idata_contra, cutoff_time)
+
                     # 重新生成裁切后的伴飞脚步态参数
-                    new_strides_c = calculate_spatio_temporal(c_hs, c_to, c_ms, idata_contra, is_long_jump=False)
+                    new_strides_c = calculate_spatio_temporal(
+                        c_hs,
+                        c_to,
+                        c_ms,
+                        idata_contra,
+                        is_long_jump=False,
+                        include_terminal_contact=True,
+                    )
                     contra_data['events']['hs'] = c_hs
                     contra_data['events']['to'] = c_to
                     contra_data['events']['ms'] = c_ms
                     contra_data['events']['msw'] = c_msw
                     contra_data['strides'] = new_strides_c
+                    contra_data['signals'] = build_display_signals(idata_contra)
 
         # 获取 MSW 时间戳用于前端可视化
         MSW = idata[idata['MSW'].notna()]['Timestamp'].values.tolist()
 
-        strides = calculate_spatio_temporal(HS_for_metrics, TO_for_metrics, MS_for_metrics, idata, is_long_jump=long_jump_applied)
+        contra_events = contra_data.get('events') if contra_data is not None else None
+        strides = calculate_spatio_temporal(
+            HS_for_metrics,
+            TO_for_metrics,
+            MS_for_metrics,
+            idata,
+            is_long_jump=long_jump_applied,
+            contralateral_hs=(contra_events.get('hs') if contra_events is not None and not is_long_jump_mode else None),
+            contralateral_to=(contra_events.get('to') if contra_events is not None and not is_long_jump_mode else None),
+        )
         print(f"DEBUG: Strides calculated: {len(strides)}")
-        
+
         # 结果汇总 - 包含所有前端需要的核心指标
         def safe_mean(key):
             vals = [s[key] for s in strides if s.get(key) is not None]
             return float(np.mean(vals)) if vals else 0.0
 
         summary = {
+            "analysis_mode": "long_jump" if is_long_jump_mode else "general_gait",
             "n_strides": len(strides),
             "stride_time_s": safe_mean("stride_time_s"),
-            "contact_time_s": safe_mean("contact_time_s"),
-            "swing_time_s": safe_mean("swing_time_s"),
-            "step_frequency_hz": safe_mean("step_frequency_hz"),
-            "stride_length_m": safe_mean("stride_length_m"),
-            "stride_velocity_mps": safe_mean("stride_velocity_mps"),
-            "vGRF_peak_BW": safe_mean("vGRF_peak_BW"),
-            "double_support_time_ms": safe_mean("double_support_time_s") * 1000.0,
-            "flight_time_ms": safe_mean("flight_time_s") * 1000.0,
+            "contact_time_ms": int(round(safe_mean("contact_time_ms"))),
+            "double_support_time_ms": (
+                None
+                if is_long_jump_mode
+                else int(round(safe_mean("double_support_time_ms")))
+            ),
+            "swing_time_ms": int(round(safe_mean("swing_time_ms"))),
+            "step_frequency_spm": int(round(safe_mean("step_frequency_spm"))),
+            "stride_length_m": round(safe_mean("stride_length_m"), 2),
+            "stride_velocity_mps": round(safe_mean("stride_velocity_mps"), 2),
+            "vGRF_peak_BW": round(safe_mean("vGRF_peak_BW"), 2),
+            "flight_time_ms": int(round(safe_mean("flight_time_ms"))),
             "duration_s": float((idata['Timestamp'].iloc[-1] - idata['Timestamp'].iloc[0]) / 1000.0),
             "gait_status_last": strides[-1]["gait_status"] if strides else "Unknown",
             "source_sample_rate_hz": float(fs_source),
@@ -1505,18 +1980,10 @@ def process_gait_data(
 
         result = {
             "ok": True,
+            "analysis_mode": "long_jump" if is_long_jump_mode else "general_gait",
             "summary": summary,
             "strides": strides,
-            "signals": {
-                "timestamps": idata["Timestamp"].tolist(),
-                "acc_x": idata["ACC.X"].tolist(),
-                "acc_y": idata["ACC.Y"].tolist(),
-                "acc_z": idata["ACC.Z"].tolist(),
-                "gyro_y": idata["Gmax(°/s)"].tolist(),
-                "gyro_x": idata["Gyro.X"].tolist(),
-                "gyro_y_raw": idata["Gyro.Y"].tolist(),
-                "gyro_z": idata["Gyro.Z"].tolist(),
-            },
+            "signals": build_display_signals(idata, include_raw_gyro=True),
             "events": {
                 "hs":  [int(x) for x in HS_for_metrics],
                 "to":  [int(x) for x in TO_for_metrics],
@@ -1524,10 +1991,10 @@ def process_gait_data(
                 "msw": [int(x) for x in MSW]
             }
         }
-        
+
         if contra_data:
             result["contra_data"] = contra_data
-            
+
         return json.dumps(result)
     except Exception as e:
         import traceback

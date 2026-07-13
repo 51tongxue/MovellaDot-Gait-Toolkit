@@ -1,0 +1,55 @@
+{
+  "schema_version": "longjump-athletes/v1",
+  "generated_at": "2026-05-31T10:00:00+08:00",
+  "organization": {
+    "organization_id": "org-001",
+    "name": "国家训练中心"
+  },
+  "athletes": [
+    {
+      "athlete_id": "ath-001",
+      "athlete_code": "A001",
+      "name": "张晨宇",
+      "gender": "男",
+      "birth_date": "2002-03-15",
+      "height_cm": 186,
+      "weight_kg": 76.5,
+      "group_name": "王教练组",
+      "extra": {
+        "dominant_leg": "left",
+        "personal_best_m": 8.12,
+        "note": ""
+      }
+    },
+    {
+      "athlete_id": "ath-002",
+      "athlete_code": "A002",
+      "name": "李可",
+      "gender": "女",
+      "birth_date": "2003-07-22",
+      "height_cm": 172,
+      "weight_kg": 61.8,
+      "group_name": "王教练组",
+      "extra": {
+        "dominant_leg": "right",
+        "personal_best_m": 6.52,
+        "note": ""
+      }
+    },
+    {
+      "athlete_id": "ath-003",
+      "athlete_code": "A003",
+      "name": "王宁",
+      "gender": "男",
+      "birth_date": "2001-11-08",
+      "height_cm": 183,
+      "weight_kg": 74.2,
+      "group_name": "刘教练组",
+      "extra": {
+        "dominant_leg": "left",
+        "personal_best_m": 7.86,
+        "note": ""
+      }
+    }
+  ]
+}

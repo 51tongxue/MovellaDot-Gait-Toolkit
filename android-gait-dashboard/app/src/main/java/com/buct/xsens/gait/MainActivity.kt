@@ -1,6 +1,8 @@
 package com.buct.xsens.gait
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -8,35 +10,101 @@ import android.os.Environment
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Analytics
+import androidx.compose.material.icons.outlined.GraphicEq
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
-import com.buct.xsens.gait.ui.screens.GaitDashboardScreen
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.buct.xsens.dot.R
+import com.buct.xsens.dot.ui.screens.MainScreen
+import com.buct.xsens.dot.ui.theme.Accent
+import com.buct.xsens.dot.ui.theme.Bg
+import com.buct.xsens.dot.ui.theme.Border
+import com.buct.xsens.dot.ui.theme.Card
+import com.buct.xsens.dot.ui.theme.Green
+import com.buct.xsens.dot.ui.theme.Muted
+import com.buct.xsens.dot.ui.theme.Surface as AppSurfaceColor
+import com.buct.xsens.dot.ui.theme.XsensDotTheme
+import com.buct.xsens.dot.viewmodel.CollectionViewModel
+import com.buct.xsens.gait.ui.screens.NativeAnalysisScreen
 
 class MainActivity : ComponentActivity() {
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         window.statusBarColor = android.graphics.Color.BLACK
+        window.navigationBarColor = android.graphics.Color.BLACK
+
+        requestRuntimePermissions()
+        requestStorageManagerPermission()
 
         setContent {
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color.Black
-            ) {
-                GaitDashboardScreen()
+            XsensDotTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = Bg
+                ) {
+                    UnifiedWorkbenchScreen()
+                }
             }
         }
+    }
 
-        // Android 11+ 需要引导用户在设置页面授予「所有文件访问权限」
-        // 才能通过 File API 直接读取其他 App 的 Android/data 目录
+    private fun requestStorageManagerPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
             android.app.AlertDialog.Builder(this)
                 .setTitle("需要文件访问权限")
                 .setMessage(
-                    "步态分析仪表盘需要「所有文件访问权限」，才能直接读取 Xsens DOT 录制的离线/在线文件。\n\n" +
-                    "请在弹出的设置页面中找到本应用并开启该权限，然后返回即可。"
+                    "运动步态分析系统需要「所有文件访问权限」，以便保存采集文件并直接读取 offline_export / data_logging。\n\n请在设置页面中开启该权限后返回。"
                 )
                 .setPositiveButton("前往设置") { _, _ ->
                     val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
@@ -44,8 +112,156 @@ class MainActivity : ComponentActivity() {
                     startActivity(intent)
                 }
                 .setNegativeButton("暂时跳过", null)
-                .setCancelable(false)
                 .show()
         }
+    }
+
+    private fun requestRuntimePermissions() {
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        val needRequest = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (needRequest.isNotEmpty()) {
+            permissionLauncher.launch(needRequest.toTypedArray())
+        }
+    }
+}
+
+private enum class WorkspaceTab {
+    Capture,
+    Analysis,
+}
+
+@Composable
+private fun UnifiedWorkbenchScreen() {
+    var selectedTab by rememberSaveable { mutableStateOf(WorkspaceTab.Capture) }
+    val captureViewModel: CollectionViewModel = viewModel()
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = Bg
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+        ) {
+            WorkbenchTopBar(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .clipToBounds()
+            ) {
+                when (selectedTab) {
+                    WorkspaceTab.Capture -> {
+                        MainScreen(
+                            viewModel = captureViewModel,
+                            showBrandHeader = false,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(bottom = 12.dp)
+                        )
+                    }
+
+                    WorkspaceTab.Analysis -> {
+                        NativeAnalysisScreen(modifier = Modifier.fillMaxSize())
+                    }
+                }
+            }
+            NavigationBar(
+                containerColor = AppSurfaceColor,
+                tonalElevation = 0.dp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+            ) {
+                NavigationBarItem(
+                    selected = selectedTab == WorkspaceTab.Capture,
+                    onClick = { selectedTab = WorkspaceTab.Capture },
+                    icon = { Icon(Icons.Outlined.GraphicEq, contentDescription = null) },
+                    label = { Text(text = "采集") },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Green,
+                        selectedTextColor = Green,
+                        indicatorColor = Accent.copy(alpha = 0.16f),
+                        unselectedIconColor = Muted,
+                        unselectedTextColor = Muted
+                    )
+                )
+                NavigationBarItem(
+                    selected = selectedTab == WorkspaceTab.Analysis,
+                    onClick = { selectedTab = WorkspaceTab.Analysis },
+                    icon = { Icon(Icons.Outlined.Analytics, contentDescription = null) },
+                    label = { Text(text = "分析") },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Green,
+                        selectedTextColor = Green,
+                        indicatorColor = Accent.copy(alpha = 0.16f),
+                        unselectedIconColor = Muted,
+                        unselectedTextColor = Muted
+                    )
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkbenchTopBar(
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .background(AppSurfaceColor)
+            .border(1.dp, Border)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.weight(1f)
+        ) {
+            Box(
+                modifier = Modifier
+                    .background(Color.White, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.buct_logo),
+                    contentDescription = "北京体育大学",
+                    modifier = Modifier.height(28.dp)
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+                Text(
+                    text = stringResource(id = R.string.app_org_name),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Muted
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = stringResource(id = R.string.app_product_name),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+
     }
 }

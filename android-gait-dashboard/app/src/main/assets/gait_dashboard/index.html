@@ -4,7 +4,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>北京体育大学体育工程学院跳远步态分析系统</title>
+  <title>运动步态分析系统</title>
+  <script>
+    const APP_EMBEDDED = new URLSearchParams(window.location.search).get('embedded') === '1';
+    if (APP_EMBEDDED) {
+      document.documentElement.classList.add('embedded');
+    }
+  </script>
   <!-- 离线资源库 -->
   <script src="lib/chart.umd.js"></script>
   <script src="lib/chartjs-plugin-annotation.min.js"></script>
@@ -14,11 +20,21 @@
       --surface: #16161a;
       --card: #1c1c21;
       --border: #2a2a32;
+      --field: #131318;
       --text: #e8e8ed;
       --muted: #71717a;
       --green: #22c55e;
       --orange: #f97316;
       --accent: #3b82f6;
+      --red: #ef4444;
+      --green-soft: rgba(34, 197, 94, 0.14);
+      --green-line: rgba(34, 197, 94, 0.34);
+      --orange-soft: rgba(249, 115, 22, 0.14);
+      --radius-panel: 12px;
+      --radius-control: 8px;
+      --radius-pill: 999px;
+      --space-panel: 20px;
+      --space-section: 16px;
     }
 
     * {
@@ -177,6 +193,11 @@
       border: 1px solid var(--border);
     }
 
+    #btn-athlete-save {
+      background: var(--green);
+      color: #fff;
+    }
+
     .header-tabs span {
       padding: 0.35rem 0.5rem;
       border-radius: 4px;
@@ -193,6 +214,61 @@
     .header-tabs span.active {
       background: var(--card);
       color: var(--green);
+    }
+
+    html.embedded .header {
+      padding: 0.65rem 1rem;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      box-shadow: none;
+    }
+
+    html.embedded .header-brand {
+      display: none;
+    }
+
+    html.embedded .header-tabs {
+      width: 100%;
+      margin-left: 0;
+      gap: 0.45rem;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    html.embedded .header-tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    html.embedded .header-tabs span {
+      padding: 0.45rem 0.8rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: 0.76rem;
+      letter-spacing: 0;
+    }
+
+    html.embedded .header-tabs span.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    html.embedded .file-section,
+    html.embedded .graph-section,
+    html.embedded .metrics-section,
+    html.embedded .table-section,
+    html.embedded .splits-section,
+    html.embedded .lab-section {
+      padding-left: 1rem;
+      padding-right: 1rem;
+    }
+
+    html.embedded #view-history {
+      padding-left: 1rem;
+      padding-right: 1rem;
     }
 
     /* 全局视图切换 */
@@ -288,6 +364,229 @@
       min-width: 0;
     }
 
+    .athlete-card-row {
+      justify-content: space-between;
+      gap: 0.85rem;
+    }
+
+    .athlete-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .athlete-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .btn-athlete-primary {
+      min-height: 34px;
+      padding: 0.35rem 0.7rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s, opacity 0.15s;
+    }
+
+    .btn-athlete-primary:hover {
+      border-color: var(--green-line);
+      color: var(--green);
+    }
+
+    .btn-athlete-primary:disabled,
+    .btn-athlete-edit:disabled {
+      opacity: 0.42;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    .athlete-meta,
+    .manifest-status {
+      min-height: 42px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 0.85rem;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    .manifest-status {
+      width: 100%;
+      justify-content: space-between;
+      margin-top: 0.1rem;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .manifest-status.ok {
+      color: var(--green);
+      border-color: var(--green-line);
+      background: var(--green-soft);
+    }
+
+    .athlete-modal-content {
+      max-width: 560px;
+      width: min(92vw, 560px);
+      max-height: calc(var(--athlete-modal-vh, 100dvh) - 24px);
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+    }
+
+    .athlete-form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.75rem;
+      margin: 0.35rem 0 1rem;
+    }
+
+    .athlete-form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .athlete-form-field.wide {
+      grid-column: 1 / -1;
+    }
+
+    .athlete-form-field input,
+    .athlete-form-field select {
+      min-height: 42px;
+      padding: 0.5rem 0.75rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+    }
+
+    .athlete-form-field input:focus,
+    .athlete-form-field select:focus {
+      border-color: var(--green-line);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+    }
+
+    .custom-select {
+      position: relative;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .custom-select-trigger {
+      width: 100%;
+      min-height: 42px;
+      padding: 0.5rem 0.75rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .custom-select-trigger:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .custom-select.is-open .custom-select-trigger {
+      border-color: var(--green-line);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+    }
+
+    .custom-select-menu {
+      display: none;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 6px);
+      z-index: 40;
+      padding: 0.35rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .custom-select.is-open .custom-select-menu {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .custom-select-option {
+      min-height: 38px;
+      padding: 0.45rem 0.65rem;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      font-size: 0.86rem;
+      cursor: pointer;
+    }
+
+    .custom-select-option:active,
+    .custom-select-option.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .custom-select-arrow {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .athlete-modal-overlay {
+      align-items: flex-start;
+      justify-content: center;
+      height: var(--athlete-modal-vh, 100dvh);
+      padding: max(12px, env(safe-area-inset-top)) 12px calc(16px + env(safe-area-inset-bottom));
+      box-sizing: border-box;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .athlete-modal-content .modal-actions {
+      position: sticky;
+      bottom: -1.5rem;
+      margin: 0 -1.5rem -1.5rem;
+      padding: 0.85rem 1.5rem 1.5rem;
+      background: linear-gradient(180deg, rgba(24, 24, 27, 0), var(--surface) 24%);
+      border-radius: 0 0 16px 16px;
+    }
+
     .file-param {
       display: flex;
       align-items: center;
@@ -359,6 +658,33 @@
       font-size: 0.9rem;
     }
 
+    #athlete-select {
+      min-width: 220px;
+      max-width: 340px;
+    }
+
+    #attempt-no {
+      width: 124px;
+      flex: 0 0 auto;
+      text-align: center;
+      text-transform: uppercase;
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: 0;
+      appearance: none;
+      -webkit-appearance: none;
+      background: var(--field) !important;
+      color: var(--text) !important;
+      border: 1px solid var(--border) !important;
+    }
+
+    #attempt-no:-webkit-autofill,
+    #attempt-no:-webkit-autofill:hover,
+    #attempt-no:-webkit-autofill:focus {
+      -webkit-text-fill-color: var(--text);
+      -webkit-box-shadow: 0 0 0 1000px var(--field) inset;
+      transition: background-color 9999s ease-in-out 0s;
+    }
+
     .file-divider {
       color: var(--muted);
       font-size: 0.8rem;
@@ -383,7 +709,7 @@
       gap: 0.4rem;
       padding: 0.5rem 0.9rem;
       background: var(--card);
-      border: 1px dashed var(--border);
+      border: 1px solid var(--border);
       border-radius: 6px;
       color: var(--muted);
       font-size: 0.875rem;
@@ -451,8 +777,8 @@
       color: var(--green);
       padding: 0.4rem 0.75rem;
       margin-bottom: 0.75rem;
-      background: rgba(34, 197, 94, 0.12);
-      border: 1px solid rgba(34, 197, 94, 0.35);
+      background: var(--green-soft);
+      border: 1px solid var(--green-line);
       border-radius: 8px;
     }
 
@@ -735,8 +1061,20 @@
       color: var(--muted);
       display: flex;
       gap: 0.5rem;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       align-items: center;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+
+    .metric-chips-row::-webkit-scrollbar {
+      display: none;
+    }
+
+    .metric-chip-strip {
+      display: contents;
     }
 
     /* 自定义单选胶囊按钮 */
@@ -760,11 +1098,15 @@
     }
 
     .radio-chip-text {
-      display: inline-block;
-      padding: 0.35rem 0.8rem;
-      font-size: 0.85rem;
-      border-radius: 99px;
-      background: var(--bg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 0.45rem 0.9rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
       color: var(--muted);
       border: 1px solid var(--border);
       transition: all 0.2s ease;
@@ -785,17 +1127,20 @@
     /* LAB 控制项栅格 */
     .lab-control-row {
       display: grid;
-      grid-template-columns: 80px 1fr;
-      align-items: center;
+      grid-template-columns: 96px minmax(0, 1fr);
+      align-items: start;
       gap: 1rem;
       width: 100%;
+      padding: 0.2rem 0;
     }
 
     .lab-control-label {
-      text-align: right;
-      font-size: 0.85rem;
+      text-align: left;
+      font-size: 0.8rem;
       color: var(--muted);
       font-weight: 600;
+      letter-spacing: 0.03em;
+      padding-top: 0.7rem;
     }
 
     .lab-input {
@@ -817,6 +1162,113 @@
     .lab-input:focus {
       border-color: var(--green);
       box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.2);
+    }
+
+    .lan-upload-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      padding: 18px;
+    }
+
+    .lan-upload-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+
+    .lan-upload-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .lan-upload-field input {
+      min-width: 0;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      padding: 0.55rem 0.7rem;
+      font-size: 0.84rem;
+      outline: none;
+      box-sizing: border-box;
+    }
+
+    .lan-upload-field input:focus {
+      border-color: var(--green);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+    }
+
+    .lan-upload-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .lan-upload-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--text);
+      font-size: 0.84rem;
+      font-weight: 600;
+    }
+
+    .lan-upload-toggle input {
+      accent-color: var(--green);
+    }
+
+    .lan-upload-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .lan-upload-status {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 0.75rem;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .lan-upload-status.ok {
+      color: var(--green);
+      border-color: var(--green-line);
+      background: var(--green-soft);
+    }
+
+    .lan-upload-status.err {
+      color: var(--red);
+      border-color: rgba(239, 68, 68, 0.45);
+      background: rgba(239, 68, 68, 0.08);
+    }
+
+    @media (max-width: 860px) {
+      .lan-upload-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 620px) {
+      .lan-upload-grid {
+        grid-template-columns: 1fr;
+      }
     }
 
     /* SPLITS 视图 */
@@ -871,8 +1323,16 @@
       color: var(--muted);
       display: flex;
       gap: 0.5rem;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       align-items: center;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+
+    .splits-metric-chips::-webkit-scrollbar {
+      display: none;
     }
 
     .splits-metric-chips .chip-label {
@@ -961,6 +1421,2221 @@
     .btn-grant-perm:hover {
       background: #1d4ed8;
     }
+
+    .header-tabs {
+      gap: 0.45rem;
+    }
+
+    .header-tabs span {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 0.45rem 0.95rem;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 600;
+      white-space: nowrap;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+
+    .header-tabs span:hover {
+      border-color: rgba(34, 197, 94, 0.2);
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .header-tabs span.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    html.embedded .header-tabs span.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .file-section,
+    .graph-section,
+    .metrics-section,
+    .table-section,
+    .splits-section,
+    .lab-section,
+    .history-section {
+      padding: var(--space-section);
+      background: transparent;
+    }
+
+    .file-card,
+    .graph-wrap,
+    .summary-bar,
+    .metric-row,
+    .strides-table-wrap,
+    .split-info,
+    .lab-card,
+    .lab-time-range,
+    .history-card,
+    .history-empty-state,
+    .file-list-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      box-shadow: none;
+    }
+
+    .file-card,
+    .split-info,
+    .lab-time-range,
+    .lab-card,
+    .history-card {
+      padding: 18px;
+    }
+
+    .graph-wrap {
+      padding: 1rem;
+      border-radius: var(--radius-panel);
+      background: var(--surface);
+    }
+
+    .metrics-section h3,
+    .table-section h3,
+    .splits-section h3,
+    .lab-section h3,
+    .history-section h3 {
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 0 0 0.85rem 0;
+    }
+
+    .file-section {
+      border-bottom: none;
+    }
+
+    .file-card {
+      gap: 0.9rem;
+      max-width: none;
+    }
+
+    .analysis-workflow-card {
+      gap: 0.75rem;
+    }
+
+    .workflow-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.9rem;
+    }
+
+    .workflow-step {
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+      min-height: 100%;
+      padding: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      transition: border-color 0.15s, background 0.15s, opacity 0.15s;
+    }
+
+    .workflow-step.is-active {
+      border-color: var(--green-line);
+    }
+
+    .workflow-step.is-complete {
+      border-color: var(--green-line);
+      background: rgba(28, 28, 33, 0.92);
+    }
+
+    .workflow-step.is-locked {
+      opacity: 0.62;
+    }
+
+    .workflow-step.is-locked .workflow-step-body {
+      pointer-events: none;
+    }
+
+    .workflow-step-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.5rem;
+    }
+
+    .workflow-step-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+      min-width: 0;
+    }
+
+    .workflow-step-title {
+      color: var(--text);
+      font-size: 0.9rem;
+      font-weight: 700;
+      line-height: 1.3;
+    }
+
+    .workflow-step-desc {
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.5;
+    }
+
+    .workflow-step-body {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      min-height: 0;
+    }
+
+    .athlete-compact-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(112px, 0.7fr) auto;
+      gap: 0.6rem;
+      align-items: end;
+    }
+
+    .analysis-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 0;
+    }
+
+    .analysis-field-label {
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .analysis-field select,
+    .analysis-field input {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .analysis-attempt-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0.75rem;
+    }
+
+    .jump-config-card {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding: 0.85rem;
+      border-radius: 10px;
+      background: var(--field);
+      border: 1px solid var(--border);
+    }
+
+    .jump-config-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .jump-config-title {
+      color: var(--text);
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+
+    .jump-config-desc {
+      color: var(--muted);
+      font-size: 0.76rem;
+      line-height: 1.5;
+    }
+
+    .jump-mode-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 0.65rem;
+      border-radius: var(--radius-pill);
+      background: var(--green-soft);
+      border: 1px solid var(--green-line);
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .jump-config-card .radio-chip-text {
+      min-height: 34px;
+      padding: 0.4rem 0.8rem;
+      font-size: 0.78rem;
+    }
+
+    .jump-manual-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+
+    .jump-manual-row .lab-input {
+      min-width: 108px;
+      text-align: center;
+      border-radius: 10px;
+      background: var(--surface);
+    }
+
+    .workflow-note {
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      padding: 0.55rem 0.75rem;
+      border-radius: 10px;
+      background: var(--field);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.76rem;
+      line-height: 1.35;
+    }
+
+    .workflow-note:empty {
+      display: none;
+    }
+
+    .file-source-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.5rem;
+    }
+
+    .file-source-grid .btn-upload-wrap,
+    .file-source-grid .btn-upload,
+    .file-source-grid .data-picker-button {
+      width: 100%;
+    }
+
+    .data-picker-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      min-height: 42px;
+      padding: 0.55rem 0.8rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s, color 0.15s;
+      text-align: left;
+    }
+
+    .data-picker-button:hover {
+      border-color: var(--green-line);
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .data-picker-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .data-picker-text.is-empty {
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .data-picker-arrow {
+      flex: 0 0 auto;
+      margin-left: 0.75rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .selected-file-panel {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.45rem;
+      padding: 0.55rem 0.7rem;
+      border-radius: 10px;
+      background: var(--field);
+      border: 1px solid var(--border);
+    }
+
+    .selected-file-panel.is-empty {
+      display: none;
+    }
+
+    .selected-file-panel.is-attempt .selected-file-main {
+      display: none;
+    }
+
+    .selected-file-main {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      justify-content: center;
+      gap: 0.3rem;
+      min-width: 0;
+    }
+
+    .selected-attempt-sides {
+      display: grid;
+      grid-template-columns: 96px 96px;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .selected-attempt-sides:empty {
+      display: none;
+    }
+
+    .selected-file-source {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 26px;
+      padding: 0 0.5rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .selected-file-panel .file-name {
+      max-width: none;
+      width: 100%;
+      min-height: 0;
+      justify-content: flex-start;
+      padding: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.3;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+    }
+
+    .analysis-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      margin-top: auto;
+    }
+
+    .analysis-actions .btn-analyze {
+      width: 100%;
+      justify-content: center;
+      min-height: 42px;
+      font-size: 0.86rem;
+    }
+
+    .btn-upload.is-disabled {
+      pointer-events: none;
+      opacity: 0.45;
+      color: var(--muted);
+    }
+
+    .file-card-row {
+      gap: 0.9rem;
+    }
+
+    .file-card-row-main {
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+
+    .file-card-right {
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 0.75rem;
+    }
+
+    .device-info {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      min-height: 30px;
+      padding: 0 0.65rem;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .file-param {
+      gap: 0.45rem;
+      font-size: 0.8rem;
+    }
+
+    .file-param .param-input,
+    .file-section input[type="number"],
+    .file-section input[type="text"],
+    .file-section select,
+    .lab-input {
+      min-height: 42px;
+      padding: 0.5rem 0.75rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.88rem;
+      box-shadow: none;
+      outline: none;
+    }
+
+    .file-param .param-input:focus,
+    .file-section input[type="number"]:focus,
+    .file-section input[type="text"]:focus,
+    .file-section select:focus,
+    .lab-input:focus {
+      border-color: var(--green-line);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+    }
+
+    .btn-upload,
+    .btn-grant-perm,
+    .history-load-btn,
+    .history-delete-btn,
+    .history-clear-btn,
+    #btn-lab-reset {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 0.55rem 0.95rem;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+
+    .athlete-actions .btn-upload,
+    .athlete-actions .btn-athlete-primary {
+      min-height: 34px;
+      padding: 0.35rem 0.7rem;
+      border-radius: 10px;
+      font-size: 0.78rem;
+    }
+
+    .btn-upload {
+      border-style: solid;
+      gap: 0.35rem;
+      color: var(--text);
+    }
+
+    .btn-upload:hover,
+    .btn-grant-perm:hover,
+    .history-delete-btn:hover,
+    .history-clear-btn:hover,
+    #btn-lab-reset:hover {
+      border-color: var(--green-line);
+      color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .btn-analyze,
+    .history-load-btn {
+      min-height: 42px;
+      padding: 0.55rem 1rem;
+      border-radius: 10px;
+      background: var(--green);
+      color: #fff;
+      border: 1px solid transparent;
+      font-size: 0.85rem;
+      font-weight: 600;
+      gap: 0.4rem;
+    }
+
+    .history-clear-btn {
+      color: var(--red);
+      background: rgba(239, 68, 68, 0.08);
+      border-color: rgba(239, 68, 68, 0.25);
+    }
+
+    .history-load-btn:hover,
+    .btn-analyze:hover {
+      filter: brightness(1.08);
+    }
+
+    .history-delete-btn {
+      width: 42px;
+      padding: 0;
+      color: var(--muted);
+    }
+
+    .file-name {
+      max-width: 240px;
+      min-height: 42px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 0.85rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--muted);
+    }
+
+    .file-name.is-empty {
+      color: var(--muted);
+    }
+
+    .device-label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 600;
+    }
+
+    @media (max-width: 860px) {
+      .selected-file-panel {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
+      .selected-file-source,
+      .device-info {
+        justify-self: flex-start;
+      }
+
+      .metric-chips-row,
+      .splits-metric-chips {
+        margin-left: -0.15rem;
+        margin-right: -0.15rem;
+        padding: 0 0.15rem 0.15rem;
+      }
+    }
+
+    .metric-chips-row,
+    .splits-metric-chips {
+      margin-top: 0.9rem;
+      gap: 0.55rem;
+      align-items: center;
+    }
+
+    .chip-label {
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .metric-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      min-height: 34px;
+      padding: 0.35rem 0.8rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 600;
+      white-space: nowrap;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+
+    .metric-chip.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .summary-bars {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.75rem;
+      margin-top: 0.95rem;
+    }
+
+    .summary-bar,
+    .summary-bar.orange,
+    .summary-bar.summary-bar-metric {
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 0.9rem 1rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .summary-bar .label {
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-family: inherit;
+      font-weight: 600;
+    }
+
+    .summary-bar .value {
+      font-size: 1rem;
+      color: var(--text);
+    }
+
+    .metric-row {
+      padding: 0.85rem 1rem;
+      margin-bottom: 0.55rem;
+      border-color: var(--border);
+      background: var(--surface);
+    }
+
+    .metric-row[data-metric]:hover {
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .strides-table-wrap {
+      border-radius: var(--radius-panel);
+    }
+
+    .strides-table th {
+      background: var(--surface);
+    }
+
+    .split-info {
+      margin-bottom: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .lab-card h4 {
+      margin-bottom: 0.85rem;
+    }
+
+    .split-info-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .split-info-kicker {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 0.55rem;
+      border-radius: var(--radius-pill);
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      margin-bottom: 0.55rem;
+    }
+
+    .split-info-caption {
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.5;
+    }
+
+    .splits-five-num {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+      gap: 0.7rem;
+    }
+
+    .lab-time-range,
+    .history-toolbar {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .lab-time-inline {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      min-height: 40px;
+    }
+
+    .lab-time-divider,
+    .lab-time-unit {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .lab-highlight-group {
+      background: var(--surface);
+      border: 1px solid var(--green-line);
+      border-left: 2px solid rgba(34, 197, 94, 0.45);
+      border-radius: 10px;
+      padding: 0.85rem 0.9rem;
+      margin-top: 0.35rem;
+    }
+
+    .lab-time-range > .lab-control-row + .lab-control-row,
+    .lab-time-range > .lab-highlight-group {
+      margin-top: 0.15rem;
+    }
+
+    .lab-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      border-top: 1px solid var(--border);
+      padding-top: 1rem;
+      margin-top: 0.25rem;
+    }
+
+    .lab-hint {
+      font-size: 0.8rem;
+      color: var(--muted);
+      flex: 1;
+      max-width: 60%;
+      min-height: 40px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 0.1rem;
+    }
+
+    .lab-actions {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .lab-event-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--red);
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    #lab-start-time {
+      width: 80px;
+      text-align: center;
+    }
+
+    #lab-end-time {
+      width: 96px;
+      text-align: center;
+    }
+
+    #lab-takeoff-step {
+      width: 105px;
+      margin-left: 0.5rem;
+      text-align: center;
+    }
+
+    .history-toolbar-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .history-toolbar-copy {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      flex-wrap: wrap;
+    }
+
+    .history-athlete-select {
+      position: relative;
+      min-width: 220px;
+      max-width: min(420px, 100%);
+    }
+
+    .history-athlete-trigger {
+      width: 100%;
+      min-height: 34px;
+      padding: 0.35rem 0.7rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.82rem;
+      outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      cursor: pointer;
+    }
+
+    .history-athlete-trigger:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .history-athlete-trigger.is-open {
+      border-color: var(--green-line);
+      box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18);
+    }
+
+    .history-athlete-menu {
+      display: none;
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 6px);
+      z-index: 20;
+      padding: 0.35rem;
+      background: var(--field);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
+      max-height: 240px;
+      overflow-y: auto;
+    }
+
+    .history-athlete-select.is-open .history-athlete-menu {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .history-athlete-option {
+      min-height: 38px;
+      padding: 0.45rem 0.65rem;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+
+    .history-athlete-option:active,
+    .history-athlete-option.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .history-athlete-arrow {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .history-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+
+    .history-grid.is-hidden {
+      display: none;
+    }
+
+    .history-layout {
+      display: grid;
+      grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
+      gap: 1rem;
+      align-items: start;
+    }
+
+    .history-calendar-panel,
+    .history-day-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      padding: 18px;
+    }
+
+    .history-calendar-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 0.9rem;
+    }
+
+    .history-calendar-head,
+    .history-day-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 0.8rem;
+    }
+
+    .history-panel-title {
+      color: var(--text);
+      font-size: 0.88rem;
+      font-weight: 700;
+    }
+
+    .history-panel-sub,
+    .history-day-sub {
+      margin-top: 0.22rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+
+    .history-date-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+      gap: 0.65rem;
+    }
+
+    .history-date-btn {
+      appearance: none;
+      width: 100%;
+      min-height: 88px;
+      padding: 0.75rem;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.45rem;
+      cursor: pointer;
+      transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+    }
+
+    .history-date-btn:hover {
+      border-color: rgba(74, 222, 128, 0.24);
+      transform: translateY(-1px);
+    }
+
+    .history-date-btn.active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .history-date-top {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.5rem;
+    }
+
+    .history-date-month {
+      color: var(--muted);
+      font-size: 0.7rem;
+      letter-spacing: 0.04em;
+    }
+
+    .history-date-btn.active .history-date-month,
+    .history-date-btn.active .history-date-weekday {
+      color: rgba(220, 252, 231, 0.86);
+    }
+
+    .history-date-day {
+      font-size: 1.42rem;
+      font-weight: 700;
+      line-height: 1;
+      color: var(--text);
+    }
+
+    .history-date-btn.active .history-date-day {
+      color: var(--green);
+    }
+
+    .history-date-weekday {
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+
+    .history-date-count {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 0.5rem;
+      border-radius: var(--radius-pill);
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+
+    .history-date-btn.active .history-date-count {
+      background: rgba(34, 197, 94, 0.18);
+      color: var(--green);
+    }
+
+    .history-day-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      min-height: 220px;
+    }
+
+    .history-day-title {
+      color: var(--text);
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+
+    .history-day-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 0.75rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.76rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .history-athlete-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+
+    .history-athlete-title {
+      color: var(--text);
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .history-athlete-sub {
+      margin-top: 0.25rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+
+    .history-athlete-records {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.65rem;
+    }
+
+    .history-empty-state {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 140px;
+      text-align: center;
+      padding: 1.5rem;
+      color: var(--muted);
+      border-style: solid;
+    }
+
+    .history-card {
+      cursor: default;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.85rem 1rem;
+      background: var(--surface);
+      padding: 14px 16px;
+      align-items: center;
+    }
+
+    .history-attempt-row {
+      display: grid;
+      grid-template-columns: 82px 96px 96px auto;
+      align-items: center;
+      justify-content: start;
+      gap: 0.5rem;
+      width: 100%;
+      padding: 9px 10px;
+      border-radius: var(--radius-panel);
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .history-attempt-row:active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+    }
+
+    .history-attempt-time {
+      color: var(--text);
+      font-size: 0.86rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .history-attempt-side {
+      min-width: 0;
+    }
+
+    .history-attempt-side .file-side-tag {
+      width: 96px;
+      justify-content: flex-start;
+      padding: 0 0.62rem 0 0.5rem;
+      font-size: 0.76rem;
+      overflow: hidden;
+    }
+
+    .history-attempt-delete {
+      justify-self: end;
+      min-width: 34px;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 999px;
+    }
+
+    .history-card-header,
+    .history-card-actions,
+    .history-card-titleblock,
+    .history-meta-row {
+      display: flex;
+    }
+
+    .history-card-header {
+      grid-column: 1 / -1;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0;
+    }
+
+    .history-card-titleblock {
+      flex-direction: row;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.35rem 0.65rem;
+      min-width: 0;
+    }
+
+    .history-card-title {
+      font-weight: 600;
+      font-size: 0.92rem;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .history-card-file {
+      color: var(--muted);
+      font-size: 0.72rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    .history-meta-row {
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.72rem;
+      flex-wrap: wrap;
+    }
+
+    .history-side-tag,
+    .file-side-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.45rem;
+      min-height: 34px;
+      padding: 0 0.75rem 0 0.55rem;
+      border-radius: var(--radius-pill);
+      background: rgba(255, 255, 255, 0.065);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .file-side-tag-missing {
+      background: rgba(255, 255, 255, 0.035);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+
+    .file-side-dot {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--muted);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+    }
+
+    .file-side-main {
+      color: #ffb84d;
+      letter-spacing: 0.01em;
+    }
+
+    .file-side-sub {
+      color: var(--muted);
+      font-weight: 500;
+      margin-left: -0.25rem;
+    }
+
+    .selected-side-tags {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.45rem;
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }
+
+    .file-side-tag-left .file-side-dot {
+      background: #f8c945;
+    }
+
+    .file-side-tag-right .file-side-dot {
+      background: #58cf72;
+    }
+
+    .file-side-tag-right .file-side-main {
+      color: #ffb84d;
+    }
+
+    .file-side-tag-missing .file-side-dot {
+      background: #4b5563;
+      opacity: 0.62;
+    }
+
+    .history-side-tag {
+      min-height: 22px;
+      padding: 0 0.5rem;
+      gap: 0;
+      background: rgba(34, 197, 94, 0.82);
+      border: none;
+      color: #fff;
+      font-size: 0.72rem;
+    }
+
+    .history-record-date,
+    .history-record-time,
+    .history-card-id {
+      color: var(--muted);
+    }
+
+    .history-card-id {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      min-width: 56px;
+      padding: 0 0.45rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      flex-shrink: 0;
+    }
+
+    .history-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.45rem;
+      font-size: 0.8rem;
+      margin-bottom: 0;
+      color: var(--text);
+      grid-column: 1 / 2;
+    }
+
+    .history-metric {
+      display: flex;
+      flex-direction: column;
+      gap: 0.18rem;
+      padding: 0.55rem 0.65rem;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      min-width: 0;
+    }
+
+    .history-metric-label {
+      font-size: 0.68rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+    }
+
+    .history-metrics strong {
+      font-family: 'JetBrains Mono', monospace;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.88rem;
+    }
+
+    .history-card-actions {
+      grid-column: 2 / 3;
+      grid-row: 2 / 3;
+      align-self: stretch;
+      flex-direction: column;
+      gap: 0.45rem;
+      min-width: 96px;
+    }
+
+    .history-load-btn {
+      min-height: 36px;
+      padding: 0.45rem 0.75rem;
+      font-size: 0.78rem;
+    }
+
+    .history-delete-icon {
+      width: 14px;
+      height: 14px;
+      pointer-events: none;
+    }
+
+    .history-count-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 0 0.65rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.76rem;
+      font-weight: 600;
+    }
+
+    .lab-chart-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-control);
+      padding: 0.75rem;
+      height: 340px;
+    }
+
+    .split-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+      padding: 0.8rem 0.9rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
+    .split-stat-label {
+      font-size: 0.73rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+    }
+
+    .split-stat .val {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .file-list-box {
+      background: var(--card);
+      border: 1px solid var(--border);
+      padding: 12px;
+      border-radius: var(--radius-panel);
+      max-width: 820px;
+    }
+
+    .file-list-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.9rem;
+    }
+
+    .file-list-title {
+      color: var(--text);
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+
+    .file-list-subtitle {
+      margin-top: 0.25rem;
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1.5;
+    }
+
+    .file-list-close {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      min-width: 34px;
+      padding: 0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 1rem;
+      cursor: pointer;
+    }
+
+    .file-list-groups {
+      display: flex;
+      flex-direction: column;
+      gap: 0.85rem;
+    }
+
+    .file-picker-layout {
+      display: grid;
+      grid-template-columns: minmax(330px, 410px) minmax(0, 1fr);
+      gap: 0.85rem;
+      align-items: start;
+    }
+
+    .file-picker-date-panel,
+    .file-picker-day-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      padding: 14px;
+    }
+
+    .file-picker-panel-head,
+    .file-picker-day-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .file-picker-panel-title,
+    .file-picker-day-title {
+      color: var(--text);
+      font-size: 0.86rem;
+      font-weight: 700;
+    }
+
+    .file-picker-panel-sub,
+    .file-picker-day-sub {
+      margin-top: 0.2rem;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+
+    .file-heatmap-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+      min-width: 0;
+    }
+
+    .file-heatmap-body {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+
+    .file-heatmap-scroll {
+      min-width: 0;
+      overflow-x: auto;
+      padding: 0 1px 4px;
+      scrollbar-width: thin;
+    }
+
+    .file-heatmap-months {
+      display: grid;
+      grid-auto-flow: column;
+      grid-auto-columns: 18px;
+      gap: 5px;
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      line-height: 18px;
+      white-space: nowrap;
+      margin-bottom: 4px;
+    }
+
+    .file-heatmap-month-label {
+      overflow: visible;
+      min-width: 42px;
+      color: var(--muted);
+    }
+
+    .file-heatmap-weekdays {
+      display: grid;
+      grid-template-rows: repeat(7, 18px);
+      gap: 5px;
+      width: 24px;
+      flex: 0 0 24px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      line-height: 18px;
+      text-align: center;
+      margin-top: 22px;
+    }
+
+    .file-heatmap-grid {
+      display: grid;
+      grid-template-rows: repeat(7, 18px);
+      grid-auto-flow: column;
+      grid-auto-columns: 18px;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .file-heatmap-day {
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      padding: 0;
+      border-radius: 4px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.045);
+      cursor: pointer;
+      position: relative;
+    }
+
+    .file-heatmap-day.empty {
+      cursor: default;
+      opacity: 0.52;
+    }
+
+    .file-heatmap-day.active {
+      outline: 2px solid var(--green);
+      outline-offset: 2px;
+    }
+
+    .file-heatmap-day.level-1 {
+      background: rgba(34, 197, 94, 0.24);
+      border-color: rgba(34, 197, 94, 0.16);
+    }
+
+    .file-heatmap-day.level-2 {
+      background: rgba(34, 197, 94, 0.42);
+      border-color: rgba(34, 197, 94, 0.24);
+    }
+
+    .file-heatmap-day.level-3 {
+      background: rgba(34, 197, 94, 0.62);
+      border-color: rgba(34, 197, 94, 0.34);
+    }
+
+    .file-heatmap-day.level-4 {
+      background: rgba(34, 197, 94, 0.9);
+      border-color: rgba(34, 197, 94, 0.46);
+    }
+
+    .file-heatmap-legend {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.35rem;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+
+    .file-heatmap-legend-cell {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .file-heatmap-legend-cell.level-1 {
+      background: rgba(34, 197, 94, 0.24);
+    }
+
+    .file-heatmap-legend-cell.level-2 {
+      background: rgba(34, 197, 94, 0.42);
+    }
+
+    .file-heatmap-legend-cell.level-3 {
+      background: rgba(34, 197, 94, 0.62);
+    }
+
+    .file-heatmap-legend-cell.level-4 {
+      background: rgba(34, 197, 94, 0.9);
+    }
+
+    .file-picker-files {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      max-height: min(54vh, 520px);
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+
+    .file-picker-source-tag,
+    .file-picker-device-tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 0.5rem;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 700;
+    }
+
+    .file-picker-source-tag {
+      color: var(--green);
+      border-color: var(--green-line);
+      background: var(--green-soft);
+    }
+
+    .file-picker-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+      margin-top: 0.45rem;
+    }
+
+    .file-attempt-groups {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .file-attempt-group {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-panel);
+      padding: 9px 10px;
+      display: grid;
+      grid-template-columns: 82px 96px 96px;
+      align-items: center;
+      justify-content: start;
+      gap: 0.5rem;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .file-attempt-group:active {
+      border-color: var(--green-line);
+      background: var(--green-soft);
+    }
+
+    .file-attempt-head {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-width: 0;
+    }
+
+    .file-attempt-title {
+      color: var(--text);
+      font-size: 0.86rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .file-attempt-files {
+      display: contents;
+    }
+
+    .file-attempt-files .file-side-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      width: 96px;
+      min-width: 0;
+      min-height: 34px;
+      border-radius: var(--radius-pill);
+      padding: 0 0.62rem 0 0.5rem;
+      margin-bottom: 0;
+      font-size: 0.76rem;
+      font-weight: 700;
+      line-height: 1;
+      overflow: hidden;
+    }
+
+    .file-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+    }
+
+    .file-group-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--text);
+      font-size: 0.8rem;
+      font-weight: 700;
+    }
+
+    .file-group-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 0.5rem;
+      border-radius: var(--radius-pill);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 700;
+    }
+
+    .file-group-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .file-list-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-control);
+      padding: 10px 12px;
+      margin-bottom: 0;
+    }
+
+    .file-list-item:active {
+      background: var(--green-soft);
+      border-color: var(--green-line);
+    }
+
+    .file-list-item-name {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: #fff;
+      font-size: 0.92rem;
+      font-weight: 600;
+      flex-wrap: wrap;
+    }
+
+    .file-list-item-path {
+      color: var(--muted);
+      font-size: 0.76rem;
+      margin-top: 5px;
+    }
+
+    .file-attempt-files .file-side-dot {
+      width: 16px;
+      height: 16px;
+    }
+
+    @media (max-width: 1180px) {
+      .workflow-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      #workflow-step-analyze {
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (max-width: 1100px) {
+      .workflow-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .file-source-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .athlete-compact-grid {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .summary-bars {
+        grid-template-columns: 1fr;
+      }
+
+      .lab-control-row {
+        grid-template-columns: 1fr;
+        gap: 0.55rem;
+      }
+
+      .lab-control-label {
+        padding-top: 0;
+      }
+
+      .lab-footer,
+      .history-toolbar-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .history-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .lab-hint {
+        max-width: none;
+      }
+
+      .file-card-row-main,
+      .file-card-right {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .athlete-controls,
+      .athlete-card-row {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .athlete-actions,
+      .athlete-form-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .athlete-actions {
+        display: grid;
+        width: 100%;
+      }
+
+      .selected-file-panel {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
+      .file-picker-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .file-picker-files {
+        max-height: none;
+      }
+
+      .file-attempt-files {
+        display: contents;
+      }
+
+      .file-attempt-group {
+        align-items: center;
+        grid-template-columns: 82px 96px 96px;
+      }
+
+      .history-card {
+        grid-template-columns: 1fr;
+      }
+
+      .history-attempt-row {
+        grid-template-columns: 82px 96px 96px auto;
+      }
+
+      .history-card-actions {
+        grid-column: 1 / -1;
+        grid-row: auto;
+        flex-direction: row;
+        min-width: 0;
+      }
+
+      #athlete-select {
+        max-width: none;
+      }
+
+      .splits-five-num,
+      .history-metrics {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    #view-splits .splits-section {
+      padding-top: 0.8rem;
+    }
+
+    #view-splits .split-info {
+      gap: 0.65rem;
+      padding: 12px;
+      margin-bottom: 0.65rem;
+    }
+
+    #view-splits .split-info-header > div {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+    }
+
+    #view-splits .split-info-kicker {
+      min-height: 24px;
+      margin-bottom: 0;
+      padding: 0 0.55rem;
+      font-size: 0.7rem;
+    }
+
+    #view-splits .split-metric-name {
+      margin-bottom: 0;
+      font-size: 0.82rem;
+    }
+
+    #view-splits .split-metric-name .unit {
+      font-size: 0.74rem;
+    }
+
+    #view-splits .splits-five-num {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 0.45rem;
+    }
+
+    #view-splits .split-stat {
+      min-height: 50px;
+      padding: 0.5rem 0.6rem;
+      gap: 0.2rem;
+      border-radius: 8px;
+    }
+
+    #view-splits .split-stat-label {
+      font-size: 0.68rem;
+      letter-spacing: 0;
+    }
+
+    #view-splits .split-stat .val {
+      font-size: 0.92rem;
+      line-height: 1.2;
+    }
+
+    #view-splits .splits-graph-wrap {
+      margin: 0.65rem 0;
+    }
+
+    #view-splits .splits-graph-wrap.is-empty {
+      display: none;
+    }
+
+    #view-splits .splits-graph-wrap .graph-wrap {
+      min-height: 260px;
+    }
+
+    #view-splits .lab-section {
+      padding-top: 0.15rem;
+    }
+
+    #view-splits .lab-section h3 {
+      margin-bottom: 0.55rem;
+      font-size: 0.82rem;
+    }
+
+    #view-splits .lab-time-range {
+      padding: 12px;
+      gap: 0.55rem;
+    }
+
+    #view-splits .lab-time-range .lab-control-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0;
+    }
+
+    #view-splits .lab-time-range .lab-control-label {
+      flex: 0 0 auto;
+      width: auto;
+      padding-top: 0;
+      font-size: 0.76rem;
+    }
+
+    #view-splits .lab-time-inline {
+      min-height: 0;
+      gap: 0.4rem;
+      flex-wrap: nowrap;
+    }
+
+    #view-splits .lab-time-unit,
+    #view-splits .lab-time-divider {
+      font-size: 0.76rem;
+      white-space: nowrap;
+    }
+
+    #view-splits .lab-input {
+      width: 112px;
+      min-height: 38px;
+      height: 38px;
+      padding: 0 0.65rem;
+      border-radius: 10px;
+    }
+
+    #view-splits #lab-end-time {
+      width: 132px;
+    }
+
+    #view-splits .lab-footer {
+      justify-content: flex-end;
+      gap: 0.6rem;
+      border-top: 0;
+      padding-top: 0;
+      margin-top: 0;
+    }
+
+    #view-splits .lab-hint {
+      min-height: 0;
+      max-width: none;
+      padding: 0;
+      font-size: 0.72rem;
+    }
+
+    #view-splits .lab-actions {
+      gap: 0.5rem;
+      flex-wrap: nowrap;
+    }
+
+    #view-splits .lab-actions button {
+      min-height: 38px;
+      padding: 0 0.9rem;
+      border-radius: 10px;
+      font-size: 0.78rem;
+    }
+
+    #view-splits .lab-grid.is-empty {
+      display: none;
+    }
+
+    #view-splits .lab-grid {
+      margin-top: 0.65rem;
+    }
+
+    #view-splits .lab-card {
+      padding: 12px;
+    }
+
+    #view-splits .lab-card h4 {
+      margin-bottom: 0.55rem;
+      font-size: 0.82rem;
+    }
+
+    #view-splits .lab-chart-wrap {
+      height: 260px;
+      padding: 0.6rem;
+    }
+
+    @media (max-width: 720px) {
+      #view-splits .splits-five-num {
+        grid-template-columns: repeat(5, minmax(64px, 1fr));
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      #view-splits .splits-five-num::-webkit-scrollbar {
+        display: none;
+      }
+
+      #view-splits .lab-time-range .lab-control-row,
+      #view-splits .lab-footer {
+        align-items: stretch;
+      }
+
+      #view-splits .lab-time-range .lab-control-row {
+        flex-direction: column;
+        gap: 0.45rem;
+      }
+
+      #view-splits .lab-time-inline {
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      #view-splits .lab-time-inline::-webkit-scrollbar {
+        display: none;
+      }
+    }
+
+    #workflow-step-athlete {
+      padding: 12px;
+      gap: 0.55rem;
+    }
+
+    #workflow-step-athlete .workflow-step-head {
+      margin-bottom: -0.1rem;
+    }
+
+    #workflow-step-athlete .workflow-step-body {
+      gap: 0.45rem;
+    }
+
+    #workflow-step-athlete .athlete-compact-grid {
+      grid-template-columns: minmax(0, 1fr) 112px auto;
+      align-items: end;
+      gap: 0.55rem;
+    }
+
+    #workflow-step-athlete .analysis-field-label {
+      font-size: 0.72rem;
+    }
+
+    #workflow-step-athlete .custom-select-trigger,
+    #workflow-step-athlete #attempt-no {
+      min-height: 38px;
+      height: 38px;
+    }
+
+    #workflow-step-athlete #attempt-no {
+      width: 112px;
+      padding-top: 0.35rem;
+      padding-bottom: 0.35rem;
+    }
+
+    #workflow-step-athlete .athlete-actions {
+      display: inline-flex;
+      width: auto;
+      align-items: end;
+      justify-content: flex-end;
+      gap: 0.4rem;
+      flex-wrap: nowrap;
+    }
+
+    #workflow-step-athlete .athlete-actions .btn-upload,
+    #workflow-step-athlete .athlete-actions .btn-athlete-primary {
+      min-height: 38px;
+      height: 38px;
+      min-width: 46px;
+      padding: 0 0.55rem;
+      border-radius: 10px;
+      font-size: 0.74rem;
+    }
+
+    #workflow-step-athlete .btn-upload-wrap {
+      display: inline-flex;
+    }
+
+    #workflow-step-athlete .workflow-note {
+      min-height: 0;
+      padding: 0 0.1rem;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.72rem;
+      line-height: 1.3;
+    }
+
+    @media (max-width: 520px) {
+      #workflow-step-athlete .athlete-compact-grid {
+        grid-template-columns: minmax(0, 1fr) 96px;
+      }
+
+      #workflow-step-athlete .athlete-actions {
+        grid-column: 1 / -1;
+        justify-content: flex-start;
+      }
+
+      #workflow-step-athlete #attempt-no {
+        width: 96px;
+      }
+    }
   </style>
 </head>
 
@@ -971,45 +3646,121 @@
         <img src="lib/logo.png" alt="BSU Logo" class="header-logo" onerror="this.parentElement.style.display='none'">
       </div>
       <div class="header-text">
-        <span class="header-title">北京体育大学体育工程学院跳远分析系统</span>
+        <span class="header-title">运动步态分析系统</span>
       </div>
     </div>
     <div class="header-tabs" id="header-tabs">
-      <span data-view="main" class="active">RUN</span>
-      <span data-view="splits">SPLITS</span>
-      <span data-view="lab">LAB</span>
-      <span data-view="history">HISTORY</span>
+      <span data-view="main" class="active">分析结果</span>
+      <span data-view="splits">进阶分析</span>
+      <span data-view="history">历史记录</span>
     </div>
   </header>
 
   <div id="view-main" class="view-content active">
     <section class="file-section">
-      <div class="file-card">
-        <div class="file-card-row file-card-row-main">
-          <div class="file-source">
-            <div class="btn-upload-wrap">
-              <input type="file" id="file-upload" accept=".csv">
-              <label for="file-upload" class="btn-upload" id="btn-upload-generic">上传 CSV</label>
+      <div class="file-card analysis-workflow-card">
+        <div class="workflow-grid">
+          <article class="workflow-step is-active" id="workflow-step-athlete">
+            <div class="workflow-step-head">
+              <div class="workflow-step-copy">
+                <div class="workflow-step-title">运动员信息</div>
+              </div>
             </div>
-            <button type="button" class="btn-upload" id="btn-offline-files" style="margin-left:0.4rem;"
-              title="离线导出文件夹（offline_export，120Hz）">离线文件</button>
-            <button type="button" class="btn-upload" id="btn-online-files" style="margin-left:0.4rem;"
-              title="实时采集文件夹（data_logging，60Hz）">在线文件</button>
-            <span id="file-name" class="file-name">未选择文件</span>
-          </div>
-          <div class="file-card-right">
-            <div class="device-info">
-              <span>设备 ID:</span>
-              <span id="device-id-val">—</span>
-              <span class="foot-side" id="foot-side-val">—</span>
+            <div class="workflow-step-body">
+              <div class="athlete-compact-grid">
+                <label class="analysis-field">
+                  <span class="analysis-field-label">运动员</span>
+                  <div id="athlete-select" class="custom-select athlete-main-select" data-value="">
+                    <button type="button" id="athlete-select-trigger" class="custom-select-trigger">
+                      <span id="athlete-select-text">未建运动员</span>
+                      <span class="custom-select-arrow">▾</span>
+                    </button>
+                    <div id="athlete-select-menu" class="custom-select-menu"></div>
+                  </div>
+                </label>
+                <div class="analysis-attempt-row">
+                  <label class="analysis-field">
+                    <span class="analysis-field-label">试跳编号</span>
+                    <input type="text" id="attempt-no" value="R001" class="param-input">
+                  </label>
+                </div>
+                <div class="athlete-actions">
+                  <button type="button" class="btn-athlete-primary" id="btn-athlete-new">新建</button>
+                  <button type="button" class="btn-upload btn-athlete-edit" id="btn-athlete-edit">编辑</button>
+                  <div class="btn-upload-wrap">
+                    <input type="file" id="athlete-json-upload" accept=".json">
+                    <label for="athlete-json-upload" class="btn-upload" id="btn-athlete-import">导入</label>
+                  </div>
+                </div>
+              </div>
+              <div id="athlete-meta" class="workflow-note"></div>
             </div>
-            <label class="file-param">身高 (cm) <input type="number" id="height" value="170" min="100" max="220" step="1"
-                class="param-input"></label>
-            <label class="file-param">体重 (kg) <input type="number" id="mass" value="75" min="30" max="200" step="1"
-                class="param-input"></label>
-            <button type="button" class="btn-analyze" id="btn-analyze">计算</button>
-          </div>
+          </article>
+
+          <article class="workflow-step is-locked" id="workflow-step-data">
+            <div class="workflow-step-head">
+              <div class="workflow-step-copy">
+                <div class="workflow-step-title">数据</div>
+              </div>
+            </div>
+            <div class="workflow-step-body">
+              <label class="analysis-field">
+                <input type="file" id="file-upload" accept=".csv">
+                <button type="button" class="data-picker-button" id="btn-select-data"
+                  title="选择用于分析的数据">
+                  <span id="data-picker-text" class="data-picker-text is-empty">选择数据</span>
+                  <span class="data-picker-arrow">▾</span>
+                </button>
+              </label>
+              <div class="selected-file-panel is-empty" id="selected-file-panel">
+                <div class="selected-file-main">
+                  <span id="file-name" class="file-name is-empty">未选择文件</span>
+                </div>
+                <div class="selected-attempt-sides" id="selected-attempt-sides"></div>
+                <span class="selected-file-source" id="selected-file-source">未选择</span>
+                <div class="device-info">
+                  <span class="device-label">设备</span>
+                  <span id="device-id-val">—</span>
+                  <span class="foot-side" id="foot-side-val">—</span>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="workflow-step is-locked" id="workflow-step-analyze">
+            <div class="workflow-step-head">
+              <div class="workflow-step-copy">
+                <div class="workflow-step-title">分析</div>
+              </div>
+            </div>
+            <div class="workflow-step-body">
+              <label class="analysis-field">
+                <span class="analysis-field-label">起跳识别</span>
+              </label>
+              <div class="radio-chip-group">
+                <label class="radio-chip-label">
+                  <input type="radio" name="main-takeoff-mode" value="auto" checked>
+                  <span class="radio-chip-text">自动识别</span>
+                </label>
+                <label class="radio-chip-label">
+                  <input type="radio" name="main-takeoff-mode" value="manual">
+                  <span class="radio-chip-text">手动指定</span>
+                </label>
+              </div>
+              <div class="jump-manual-row">
+                <input type="number" id="main-takeoff-step" placeholder="第几步" min="1" step="1" class="lab-input" style="display:none;" disabled>
+                <span id="main-takeoff-hint" class="jump-config-desc"></span>
+              </div>
+              <div class="workflow-note" id="analysis-ready-note"></div>
+              <div class="analysis-actions">
+                <button type="button" class="btn-analyze" id="btn-analyze">开始分析</button>
+                <div id="manifest-status" class="manifest-status" style="display:none;"></div>
+              </div>
+            </div>
+          </article>
         </div>
+        <input type="hidden" id="height" value="170">
+        <input type="hidden" id="mass" value="75">
       </div>
       <div id="status-msg" class="status-msg"></div>
     </section>
@@ -1020,38 +3771,25 @@
         <canvas id="chart-main"></canvas>
       </div>
       <div class="metric-chips-row">
-        <span>图表指标：</span>
-        <span id="metric-chip-cadence" class="metric-chip active">步频</span>
-        <span id="metric-chip-speed" class="metric-chip">步速</span>
+        <span id="metric-chip-speed" class="metric-chip active">步速</span>
         <span id="metric-chip-stride-length" class="metric-chip">步幅</span>
-        <span id="metric-chip-stride-time" class="metric-chip">步态周期时间</span>
+        <span id="metric-chip-cadence" class="metric-chip">步频</span>
         <span id="metric-chip-contact" class="metric-chip">触地时间</span>
-        <span id="metric-chip-double-support" class="metric-chip">双足支撑时间</span>
         <span id="metric-chip-flight-time" class="metric-chip">腾空时间</span>
         <span id="metric-chip-swing" class="metric-chip">摆动时间</span>
-        <span id="metric-chip-vgrf" class="metric-chip">vGRF 峰值</span>
+        <span id="metric-chip-vgrf" class="metric-chip">峰值垂直地面反作用力</span>
       </div>
       <div class="summary-bars">
-        <div class="summary-bar orange">
-          <span class="label">时长</span>
-          <span id="summary-duration" class="value">—</span>
-        </div>
         <div id="summary-bar-metric" class="summary-bar summary-bar-metric">
-          <span id="summary-metric-label" class="label">步频 (平均)</span>
-          <span id="summary-metric-value" class="value">— steps/min</span>
+          <span id="summary-metric-label" class="label">步速 (平均)</span>
+          <span id="summary-metric-value" class="value">— m/s</span>
         </div>
       </div>
     </section>
 
     <section class="metrics-section">
       <h3>步态参数（汇总）</h3>
-      <!-- 顺序：步频 → 步速 → 步幅 → 步态周期时间 → 触地时间 → 双足支撑时间 → 腾空时间 → 摆动时间 → vGRF峰值 -->
-      <div class="metric-row" data-metric="cadence">
-        <div class="metric-left"><span class="metric-dot metric-dot-cadence"></span><span class="metric-name">步频</span>
-        </div>
-        <span><span id="m-cadence" class="metric-value empty">—</span><span class="metric-unit">steps/min</span><span
-            class="metric-arrow">›</span></span>
-      </div>
+      <!-- 顺序：步速 → 步幅 → 步频 → 触地时间 → 腾空时间 → 摆动时间 → 峰值垂直地面反作用力 -->
       <div class="metric-row" data-metric="speed">
         <div class="metric-left"><span class="metric-dot metric-dot-speed"></span><span class="metric-name">步速</span>
         </div>
@@ -1064,22 +3802,16 @@
         <span><span id="m-stride-length" class="metric-value empty">—</span><span class="metric-unit">m</span><span
             class="metric-arrow">›</span></span>
       </div>
-      <div class="metric-row" data-metric="stride_time">
-        <div class="metric-left"><span class="metric-dot metric-dot-stride-time"></span><span
-            class="metric-name">步态周期时间</span></div>
-        <span><span id="m-stride-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span
+      <div class="metric-row" data-metric="cadence">
+        <div class="metric-left"><span class="metric-dot metric-dot-cadence"></span><span class="metric-name">步频</span>
+        </div>
+        <span><span id="m-cadence" class="metric-value empty">—</span><span class="metric-unit">steps/min</span><span
             class="metric-arrow">›</span></span>
       </div>
       <div class="metric-row" data-metric="contact">
         <div class="metric-left"><span class="metric-dot metric-dot-contact"></span><span
             class="metric-name">触地时间</span></div>
         <span><span id="m-contact-time" class="metric-value empty">—</span><span class="metric-unit">s</span><span
-            class="metric-arrow">›</span></span>
-      </div>
-      <div class="metric-row" data-metric="double_support">
-        <div class="metric-left"><span class="metric-dot metric-dot-double-support"></span><span
-            class="metric-name">双足支撑时间</span></div>
-        <span><span id="m-double-support" class="metric-value empty">—</span><span class="metric-unit">s</span><span
             class="metric-arrow">›</span></span>
       </div>
       <div class="metric-row" data-metric="flight_time">
@@ -1095,13 +3827,8 @@
             class="metric-arrow">›</span></span>
       </div>
       <div class="metric-row" data-metric="vgrf">
-        <div class="metric-left"><span class="metric-dot metric-dot-vgrf"></span><span class="metric-name">vGRF
-            峰值</span></div>
+        <div class="metric-left"><span class="metric-dot metric-dot-vgrf"></span><span class="metric-name">峰值垂直地面反作用力</span></div>
         <span><span id="m-vgrf" class="metric-value empty">—</span><span class="metric-unit">BW</span></span>
-      </div>
-      <div class="metric-row">
-        <div class="metric-left"><span class="metric-dot green"></span><span class="metric-name">已识别步数</span></div>
-        <span id="m-n-strides" class="metric-value empty">0</span>
       </div>
     </section>
 
@@ -1115,12 +3842,10 @@
               <th>步速 (m/s)</th>
               <th>步幅 (m)</th>
               <th>步频 (steps/min)</th>
-              <th>步态周期时间 (s)</th>
               <th>触地时间 (s)</th>
-              <th>双足支撑时间 (s)</th>
               <th>腾空时间 (s)</th>
               <th>摆动时间 (s)</th>
-              <th>vGRF 峰值 (BW)</th>
+              <th>峰值垂直地面反作用力 (BW)</th>
               <th>步态状态</th>
             </tr>
           </thead>
@@ -1133,16 +3858,21 @@
   <!-- SPLITS 视图：箱线图 + 趋势线 -->
   <div id="view-splits" class="view-content">
     <section class="splits-section">
-      <h3>SPLITS</h3>
+      <h3>进阶分析</h3>
       <div id="splits-range-hint" class="range-hint" style="display:none;"></div>
       <div class="split-info">
-        <div class="split-metric-name" id="splits-metric-label">步频: <span class="unit">steps/min</span></div>
+        <div class="split-info-header">
+          <div>
+            <div class="split-info-kicker">分段统计</div>
+            <div class="split-metric-name" id="splits-metric-label">步频: <span class="unit">steps/min</span></div>
+          </div>
+        </div>
         <div class="splits-five-num">
-          <span>Minimum: <span id="splits-min" class="val">—</span></span>
-          <span>Q1: <span id="splits-q1" class="val">—</span></span>
-          <span>Median: <span id="splits-median" class="val">—</span></span>
-          <span>Q3: <span id="splits-q3" class="val">—</span></span>
-          <span>Maximum: <span id="splits-max" class="val">—</span></span>
+          <div class="split-stat"><span class="split-stat-label">最小值</span><span id="splits-min" class="val">—</span></div>
+          <div class="split-stat"><span class="split-stat-label">下四分位</span><span id="splits-q1" class="val">—</span></div>
+          <div class="split-stat"><span class="split-stat-label">中位数</span><span id="splits-median" class="val">—</span></div>
+          <div class="split-stat"><span class="split-stat-label">上四分位</span><span id="splits-q3" class="val">—</span></div>
+          <div class="split-stat"><span class="split-stat-label">最大值</span><span id="splits-max" class="val">—</span></div>
         </div>
       </div>
       <div class="splits-graph-wrap">
@@ -1151,133 +3881,106 @@
         </div>
       </div>
       <div class="splits-metric-chips">
-        <span class="chip-label">图表指标：</span>
-        <span id="splits-metric-chip-cadence" class="metric-chip active" data-metric="cadence">步频</span>
-        <span id="splits-metric-chip-speed" class="metric-chip" data-metric="speed">步速</span>
+        <span id="splits-metric-chip-speed" class="metric-chip active" data-metric="speed">步速</span>
         <span id="splits-metric-chip-stride-length" class="metric-chip" data-metric="stride_length">步幅</span>
-        <span id="splits-metric-chip-stride-time" class="metric-chip" data-metric="stride_time">步态周期时间</span>
+        <span id="splits-metric-chip-cadence" class="metric-chip" data-metric="cadence">步频</span>
         <span id="splits-metric-chip-contact" class="metric-chip" data-metric="contact">触地时间</span>
-        <span id="splits-metric-chip-double-support" class="metric-chip" data-metric="double_support">双足支撑时间</span>
         <span id="splits-metric-chip-flight-time" class="metric-chip" data-metric="flight_time">腾空时间</span>
         <span id="splits-metric-chip-swing" class="metric-chip" data-metric="swing">摆动时间</span>
-        <span id="splits-metric-chip-vgrf" class="metric-chip" data-metric="vgrf">vGRF 峰值</span>
+        <span id="splits-metric-chip-vgrf" class="metric-chip" data-metric="vgrf">峰值垂直地面反作用力</span>
       </div>
     </section>
-  </div>
-
-  <!-- 实验室视图 -->
-  <div id="view-lab" class="view-content">
     <section class="lab-section">
-      <h3>LAB 实验室</h3>
-      <div class="lab-time-range"
-        style="display:flex;flex-direction:column;gap:1.25rem;margin-bottom:1.25rem;padding:1.5rem;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,0.1);">
-
+      <h3>时间范围与步态事件检测</h3>
+      <div class="lab-time-range">
         <div class="lab-control-row">
           <div class="lab-control-label">时间范围</div>
-          <div style="display:flex;align-items:center;gap:0.5rem;">
-            <span style="color:var(--muted);font-size:0.85rem;">开始</span>
-            <input type="number" id="lab-start-time" placeholder="0.0" min="0" step="0.1" class="lab-input"
-              style="width:80px;text-align:center;">
-            <span style="color:var(--muted);">-</span>
-            <span style="color:var(--muted);font-size:0.85rem;">结束</span>
-            <input type="number" id="lab-end-time" placeholder="默认全长" min="0" step="0.1" class="lab-input"
-              style="width:96px;text-align:center;">
-            <span style="color:var(--muted);font-size:0.8rem;"> 秒</span>
+          <div class="lab-time-inline">
+            <span class="lab-time-unit">开始</span>
+            <input type="number" id="lab-start-time" placeholder="0.0" min="0" step="0.1" class="lab-input">
+            <span class="lab-time-divider">-</span>
+            <span class="lab-time-unit">结束</span>
+            <input type="number" id="lab-end-time" placeholder="默认全长" min="0" step="0.1" class="lab-input">
+            <span class="lab-time-unit">秒</span>
           </div>
         </div>
 
-        <div class="lab-control-row" title="分析目标运动模式">
-          <div class="lab-control-label">运动专项</div>
-          <div class="radio-chip-group">
-            <label class="radio-chip-label">
-              <input type="radio" name="lab-sport-mode" value="normal" checked>
-              <span class="radio-chip-text">常规步态</span>
-            </label>
-            <label class="radio-chip-label" title="执行跳远腾空期切步逻辑">
-              <input type="radio" name="lab-sport-mode" value="long_jump">
-              <span class="radio-chip-text">跳远</span>
-            </label>
-            <label class="radio-chip-label" title="需设备佩戴正确且同目录下存在对侧脚数据">
-              <input type="radio" name="lab-sport-mode" value="triple_jump">
-              <span class="radio-chip-text">三级跳</span>
-            </label>
-          </div>
-        </div>
-
-        <div id="jump-takeoff-foot-controls" style="display: none; border-left: 2px solid var(--primary); padding-left: 0.75rem; margin-top: 0.5rem;">
-          <div class="lab-control-row" title="跳远/三级跳请选择起跳发力脚">
-            <div class="lab-control-label">起跳发力脚</div>
-            <div class="radio-chip-group">
-              <label class="radio-chip-label">
-                <input type="radio" name="lab-jump-takeoff" value="L" checked>
-                <span class="radio-chip-text">左脚</span>
-              </label>
-              <label class="radio-chip-label">
-                <input type="radio" name="lab-jump-takeoff" value="R">
-                <span class="radio-chip-text">右脚</span>
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <div id="long-jump-controls" style="display: none; border-left: 2px solid var(--primary); padding-left: 0.75rem; margin-top: 0.5rem;">
-          <div class="lab-control-row" title="跳远：从起跳步之后按规则裁剪自动识别起跳动作">
-            <div class="lab-control-label">起跳步</div>
-            <div class="radio-chip-group">
-              <label class="radio-chip-label">
-                <input type="radio" name="lab-takeoff-mode" value="off" checked>
-                <span class="radio-chip-text">关闭</span>
-              </label>
-              <label class="radio-chip-label" id="lab-takeoff-mode-auto-label">
-                <input type="radio" name="lab-takeoff-mode" value="auto" id="lab-takeoff-mode-auto">
-                <span class="radio-chip-text">自动识别</span>
-              </label>
-              <label class="radio-chip-label">
-                <input type="radio" name="lab-takeoff-mode" value="manual">
-                <span class="radio-chip-text">手动</span>
-              </label>
-              <input type="number" id="lab-takeoff-step" placeholder="第几步" min="1" step="1" class="lab-input"
-                style="width:105px;display:none;margin-left:0.5rem;text-align:center;" disabled>
-            </div>
-          </div>
-        </div>
-
-        <div
-          style="display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--border);padding-top:1rem;margin-top:0.25rem;">
-          <span id="lab-takeoff-hint" style="font-size:0.8rem;color:var(--muted);flex:1;max-width:60%;"></span>
-          <div style="display:flex;gap:0.75rem;">
-            <button type="button" id="btn-lab-reset" title="重置时间范围和起跳选项"
-              style="padding:0.6rem 1.2rem;font-size:0.95rem;border-radius:8px;background:var(--surface);color:var(--muted);border:1px solid var(--border);cursor:pointer;font-weight:600;">重置参数</button>
-            <button type="button" class="btn-analyze" id="btn-lab-analyze"
-              style="padding:0.6rem 1.5rem;font-size:0.95rem;border-radius:8px;">重新计算</button>
+        <div class="lab-footer">
+          <span id="lab-takeoff-hint" class="lab-hint"></span>
+          <div class="lab-actions">
+            <button type="button" id="btn-lab-reset" title="重置时间范围">重置范围</button>
+            <button type="button" class="btn-analyze" id="btn-lab-analyze">应用范围</button>
           </div>
         </div>
       </div>
-      <div class="lab-grid">
+      <div class="lab-grid is-empty">
         <div class="lab-card">
-          <h4><span style="width:8px;height:8px;background:#ef4444;border-radius:50%"></span> 步态事件检测</h4>
+          <h4><span class="lab-event-dot"></span> 信号特征与步态事件检测</h4>
           <div class="lab-chart-wrap">
             <canvas id="chart-lab-gyro"></canvas>
           </div>
         </div>
+      </div>
+      <div class="lan-upload-panel">
+        <div class="lan-upload-row">
+          <label class="lan-upload-toggle">
+            <input type="checkbox" id="lan-upload-enabled">
+            <span>分析完成后上传到局域网共享文件夹</span>
+          </label>
+          <div class="lan-upload-actions">
+            <button type="button" id="btn-lan-save" class="btn-athlete-primary">保存配置</button>
+            <button type="button" id="btn-lan-test" class="btn-athlete-primary">测试连接</button>
+            <button type="button" id="btn-lan-upload-last" class="btn-athlete-primary">上传本次结果</button>
+          </div>
+        </div>
+        <div class="lan-upload-grid">
+          <label class="lan-upload-field">设备 IP / 主机名
+            <input type="text" id="lan-host" autocomplete="off" placeholder="192.168.1.20">
+          </label>
+          <label class="lan-upload-field">共享文件夹
+            <input type="text" id="lan-share" autocomplete="off" placeholder="LongJumpData">
+          </label>
+          <label class="lan-upload-field">目录
+            <input type="text" id="lan-dir" autocomplete="off" placeholder="imu">
+          </label>
+          <label class="lan-upload-field">用户名
+            <input type="text" id="lan-user" autocomplete="off" placeholder="可留空">
+          </label>
+          <label class="lan-upload-field">密码
+            <input type="password" id="lan-pass" autocomplete="off" placeholder="可留空">
+          </label>
+          <label class="lan-upload-field">域
+            <input type="text" id="lan-domain" autocomplete="off" placeholder="可留空">
+          </label>
+        </div>
+        <label class="lan-upload-toggle">
+          <input type="checkbox" id="lan-upload-source" checked>
+          <span>同时上传原始 CSV</span>
+        </label>
+        <div id="lan-upload-status" class="lan-upload-status">未配置</div>
       </div>
     </section>
   </div>
 
   <!-- 历史记录视图 -->
   <div id="view-history" class="view-content">
-    <section class="history-section" style="padding:1.5rem;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;">
-        <h3 style="margin:0;">分析历史 (最近 20 条)</h3>
-        <button onclick="clearAllHistory()"
-          style="margin-left:auto;padding:0.4rem 0.8rem;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:0.8rem;cursor:pointer;">清除全部分析历史</button>
-      </div>
-      <div id="history-list" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:1rem;">
-        <!-- 历史条目由 JS 动态生成 -->
-        <div
-          style="grid-column:1/-1;text-align:center;padding:4rem;color:var(--muted);background:var(--card);border-radius:12px;border:1px dashed var(--border);">
-          暂无计算历史记录
+    <section class="history-section">
+      <div class="history-toolbar-row">
+        <div class="history-toolbar-copy">
+          <h3>历史记录</h3>
+          <div id="history-athlete-select" class="history-athlete-select">
+            <button type="button" id="history-athlete-trigger" class="history-athlete-trigger" disabled>
+              <span id="history-athlete-trigger-text">暂无运动员记录</span>
+              <span class="history-athlete-arrow">▾</span>
+            </button>
+            <div id="history-athlete-menu" class="history-athlete-menu"></div>
+          </div>
+          <span id="history-summary" class="history-count-badge">0 条记录</span>
         </div>
+        <button class="history-clear-btn" onclick="clearAllHistory()">清除全部分析历史</button>
+      </div>
+      <div id="history-list" class="history-grid">
+        <div class="history-empty-state">请选择运动员后查看历史记录</div>
       </div>
     </section>
   </div>
@@ -1294,9 +3997,74 @@
     </div>
   </div>
 
+  <div id="athlete-modal-overlay" class="modal-overlay athlete-modal-overlay">
+    <div class="modal-content athlete-modal-content">
+      <div id="athlete-modal-title" class="modal-title">新建运动员</div>
+      <div class="athlete-form-grid">
+        <label class="athlete-form-field">姓名
+          <input id="athlete-form-name" type="text" autocomplete="off">
+        </label>
+        <label class="athlete-form-field">编号
+          <input id="athlete-form-code" type="text" autocomplete="off">
+        </label>
+        <div class="athlete-form-field">性别
+          <input type="hidden" id="athlete-form-gender" value="">
+          <div class="custom-select form-custom-select" data-input="athlete-form-gender">
+            <button type="button" class="custom-select-trigger" data-custom-select-trigger>
+              <span data-custom-select-text>未填</span>
+              <span class="custom-select-arrow">▾</span>
+            </button>
+            <div class="custom-select-menu">
+              <button type="button" class="custom-select-option active" data-value="">未填</button>
+              <button type="button" class="custom-select-option" data-value="男">男</button>
+              <button type="button" class="custom-select-option" data-value="女">女</button>
+              <button type="button" class="custom-select-option" data-value="其他">其他</button>
+            </div>
+          </div>
+        </div>
+        <label class="athlete-form-field">出生日期
+          <input id="athlete-form-birth" type="date">
+        </label>
+        <label class="athlete-form-field">身高 cm
+          <input id="athlete-form-height" type="number" min="100" max="230" step="0.1">
+        </label>
+        <label class="athlete-form-field">体重 kg
+          <input id="athlete-form-weight" type="number" min="30" max="200" step="0.1">
+        </label>
+        <label class="athlete-form-field">组别
+          <input id="athlete-form-group" type="text" autocomplete="off">
+        </label>
+        <div class="athlete-form-field">惯用腿
+          <input type="hidden" id="athlete-form-leg" value="">
+          <div class="custom-select form-custom-select" data-input="athlete-form-leg">
+            <button type="button" class="custom-select-trigger" data-custom-select-trigger>
+              <span data-custom-select-text>未填</span>
+              <span class="custom-select-arrow">▾</span>
+            </button>
+            <div class="custom-select-menu">
+              <button type="button" class="custom-select-option active" data-value="">未填</button>
+              <button type="button" class="custom-select-option" data-value="left">左腿</button>
+              <button type="button" class="custom-select-option" data-value="right">右腿</button>
+            </div>
+          </div>
+        </div>
+        <label class="athlete-form-field">最好成绩 m
+          <input id="athlete-form-best" type="number" min="0" max="10" step="0.01">
+        </label>
+        <label class="athlete-form-field">备注
+          <input id="athlete-form-note" type="text" autocomplete="off">
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button id="btn-athlete-cancel" class="btn-modal btn-cancel">取消</button>
+        <button id="btn-athlete-save" class="btn-modal btn-confirm">保存</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     // 当前图表显示的指标
-    let currentMetricKey = 'cadence';
+    let currentMetricKey = 'speed';
     let chart = null;
     let chartSplits = null;
     let chartLabGyro = null;
@@ -1309,6 +4077,278 @@
     const btnAnalyze = document.getElementById('btn-analyze');
     const massInput = document.getElementById('mass');
     const heightInput = document.getElementById('height');
+    const athleteUpload = document.getElementById('athlete-json-upload');
+    const athleteSelect = document.getElementById('athlete-select');
+    const athleteSelectTrigger = document.getElementById('athlete-select-trigger');
+    const athleteSelectText = document.getElementById('athlete-select-text');
+    const athleteSelectMenu = document.getElementById('athlete-select-menu');
+    const attemptInput = document.getElementById('attempt-no');
+    const athleteMeta = document.getElementById('athlete-meta');
+    const manifestStatus = document.getElementById('manifest-status');
+    const analysisReadyNote = document.getElementById('analysis-ready-note');
+    const selectedFileSourceEl = document.getElementById('selected-file-source');
+    const selectedFilePanel = document.getElementById('selected-file-panel');
+    const selectedAttemptSidesEl = document.getElementById('selected-attempt-sides');
+    const dataPickerText = document.getElementById('data-picker-text');
+    const workflowStepAthlete = document.getElementById('workflow-step-athlete');
+    const workflowStepData = document.getElementById('workflow-step-data');
+    const workflowStepAnalyze = document.getElementById('workflow-step-analyze');
+    const btnSelectData = document.getElementById('btn-select-data');
+    const deviceIdEl = document.getElementById('device-id-val');
+    const footSideEl = document.getElementById('foot-side-val');
+    const selectedDeviceInfoEl = deviceIdEl ? deviceIdEl.closest('.device-info') : null;
+    const btnAthleteNew = document.getElementById('btn-athlete-new');
+    const btnAthleteEdit = document.getElementById('btn-athlete-edit');
+    const btnAthleteImport = document.getElementById('btn-athlete-import');
+    const lanUploadEnabled = document.getElementById('lan-upload-enabled');
+    const lanHostInput = document.getElementById('lan-host');
+    const lanShareInput = document.getElementById('lan-share');
+    const lanDirInput = document.getElementById('lan-dir');
+    const lanUserInput = document.getElementById('lan-user');
+    const lanPassInput = document.getElementById('lan-pass');
+    const lanDomainInput = document.getElementById('lan-domain');
+    const lanUploadSourceInput = document.getElementById('lan-upload-source');
+    const lanStatusEl = document.getElementById('lan-upload-status');
+    const btnLanSave = document.getElementById('btn-lan-save');
+    const btnLanTest = document.getElementById('btn-lan-test');
+    const btnLanUploadLast = document.getElementById('btn-lan-upload-last');
+    const athleteModal = document.getElementById('athlete-modal-overlay');
+    const athleteModalTitle = document.getElementById('athlete-modal-title');
+    const btnAthleteCancel = document.getElementById('btn-athlete-cancel');
+    const btnAthleteSave = document.getElementById('btn-athlete-save');
+    const athleteForm = {
+      name: document.getElementById('athlete-form-name'),
+      code: document.getElementById('athlete-form-code'),
+      gender: document.getElementById('athlete-form-gender'),
+      birth: document.getElementById('athlete-form-birth'),
+      height: document.getElementById('athlete-form-height'),
+      weight: document.getElementById('athlete-form-weight'),
+      group: document.getElementById('athlete-form-group'),
+      leg: document.getElementById('athlete-form-leg'),
+      best: document.getElementById('athlete-form-best'),
+      note: document.getElementById('athlete-form-note')
+    };
+    let athletes = [];
+    let selectedAthlete = null;
+    let attemptTouched = false;
+    let editingAthleteId = '';
+    let selectedHistoryAthleteKey = '';
+    let selectedHistoryDateKey = '';
+    let selectedFilePath = null;
+    let selectedFileSource = '';
+    let selectedAttemptPaths = null;
+    let lastManifestPath = '';
+    let lastAnalysisSourcePath = '';
+    let lastAnalysisSourcePathsJson = '[]';
+    const PREVIEW_ATHLETES = [
+      {
+        athlete_id: 'ath-001',
+        athlete_code: 'A001',
+        name: '张晨宇',
+        gender: '男',
+        birth_date: '2002-03-15',
+        height_cm: 186,
+        weight_kg: 76.5,
+        group_name: '王教练组',
+        extra: { dominant_leg: 'left', personal_best_m: 8.12, note: '' }
+      },
+      {
+        athlete_id: 'ath-002',
+        athlete_code: 'A002',
+        name: '李可',
+        gender: '女',
+        birth_date: '2003-07-22',
+        height_cm: 172,
+        weight_kg: 61.8,
+        group_name: '王教练组',
+        extra: { dominant_leg: 'right', personal_best_m: 6.52, note: '' }
+      },
+      {
+        athlete_id: 'ath-003',
+        athlete_code: 'A003',
+        name: '王宁',
+        gender: '男',
+        birth_date: '2001-11-08',
+        height_cm: 183,
+        weight_kg: 74.2,
+        group_name: '刘教练组',
+        extra: { dominant_leg: 'left', personal_best_m: 7.86, note: '' }
+      }
+    ];
+
+    function hasAndroidBridge() {
+      return typeof AndroidInterface !== 'undefined';
+    }
+
+    function setLanUploadStatus(message, mode) {
+      if (!lanStatusEl) return;
+      lanStatusEl.textContent = message || '';
+      lanStatusEl.classList.remove('ok', 'err');
+      if (mode === 'ok') lanStatusEl.classList.add('ok');
+      if (mode === 'err') lanStatusEl.classList.add('err');
+    }
+
+    function setLanUploadControlsEnabled(enabled) {
+      [
+        lanUploadEnabled, lanHostInput, lanShareInput, lanDirInput,
+        lanUserInput, lanPassInput, lanDomainInput, lanUploadSourceInput,
+        btnLanSave, btnLanTest, btnLanUploadLast
+      ].forEach(el => {
+        if (el) el.disabled = !enabled;
+      });
+      if (btnLanUploadLast) {
+        btnLanUploadLast.disabled = !enabled || !lastManifestPath;
+      }
+    }
+
+    function readLanUploadForm() {
+      return {
+        enabled: !!lanUploadEnabled?.checked,
+        host: lanHostInput?.value?.trim() || '',
+        share_name: lanShareInput?.value?.trim() || '',
+        remote_dir: lanDirInput?.value?.trim() || '',
+        username: lanUserInput?.value?.trim() || '',
+        password: lanPassInput?.value || '',
+        domain: lanDomainInput?.value?.trim() || '',
+        upload_source_csv: lanUploadSourceInput ? lanUploadSourceInput.checked : true
+      };
+    }
+
+    function applyLanUploadConfig(config) {
+      if (!config) return;
+      if (lanUploadEnabled) lanUploadEnabled.checked = !!config.enabled;
+      if (lanHostInput) lanHostInput.value = config.host || '';
+      if (lanShareInput) lanShareInput.value = config.share_name || '';
+      if (lanDirInput) lanDirInput.value = config.remote_dir || '';
+      if (lanUserInput) lanUserInput.value = config.username || '';
+      if (lanPassInput) lanPassInput.value = config.password || '';
+      if (lanDomainInput) lanDomainInput.value = config.domain || '';
+      if (lanUploadSourceInput) lanUploadSourceInput.checked = config.upload_source_csv !== false;
+    }
+
+    function loadLanUploadConfig() {
+      if (!hasAndroidBridge() || !AndroidInterface.getLanUploadConfigJson) {
+        setLanUploadControlsEnabled(false);
+        setLanUploadStatus('仅 APK 内可配置局域网上传', '');
+        return;
+      }
+      try {
+        const result = JSON.parse(AndroidInterface.getLanUploadConfigJson() || '{}');
+        if (!result.ok) throw new Error(result.error || '读取配置失败');
+        applyLanUploadConfig(result.config || {});
+        const target = result.target_url || '';
+        setLanUploadStatus((result.config && result.config.enabled) ? `已启用：${target}` : '未启用局域网上传', result.config?.enabled ? 'ok' : '');
+        setLanUploadControlsEnabled(true);
+      } catch (e) {
+        setLanUploadStatus(e.message || '读取局域网上传配置失败', 'err');
+      }
+    }
+
+    function saveLanUploadConfig(showOk = true) {
+      if (!hasAndroidBridge() || !AndroidInterface.saveLanUploadConfigJson) return null;
+      const result = JSON.parse(AndroidInterface.saveLanUploadConfigJson(JSON.stringify(readLanUploadForm())) || '{}');
+      if (!result.ok) throw new Error(result.error || '保存配置失败');
+      applyLanUploadConfig(result.config || {});
+      if (showOk) setLanUploadStatus(`局域网上传配置已保存：${result.target_url || ''}`, 'ok');
+      return result.config || {};
+    }
+
+    function describeLanUploadResult(result) {
+      if (!result) return '未上传';
+      if (result.skipped) return '未启用局域网上传';
+      if (!result.ok) return result.error || '上传失败';
+      const count = Array.isArray(result.files) ? result.files.length : (result.files?.length || 0);
+      const target = result.remote_dir || result.target_url || '';
+      return target ? `已上传 ${count} 个文件到 ${target}` : `已上传 ${count} 个文件`;
+    }
+
+    function handleLanUploadResult(result, target = 'panel') {
+      const ok = !!result?.ok && !result?.skipped;
+      const message = describeLanUploadResult(result);
+      if (target === 'manifest') {
+        if (result?.skipped) {
+          setManifestStatus('manifest 已保存', true);
+        } else if (result?.ok) {
+          setManifestStatus(message, true);
+        } else {
+          setManifestStatus('manifest 已保存，本次未上传到共享文件夹', true);
+        }
+      }
+      setLanUploadStatus(message, ok ? 'ok' : (result?.ok ? '' : 'err'));
+    }
+
+    function syncAthleteActionAvailability() {
+      const editable = hasAndroidBridge();
+      btnAthleteNew.disabled = !editable;
+      btnAthleteEdit.disabled = !editable || !selectedAthlete;
+      athleteUpload.disabled = !editable;
+      if (btnAthleteImport) {
+        btnAthleteImport.classList.toggle('is-disabled', !editable);
+        btnAthleteImport.title = '';
+      }
+    }
+
+    function setWorkflowStep(stepEl, mode) {
+      if (!stepEl) return;
+      stepEl.classList.remove('is-active', 'is-complete', 'is-locked');
+      if (mode === 'locked') {
+        stepEl.classList.add('is-locked');
+      } else if (mode === 'complete') {
+        stepEl.classList.add('is-complete');
+      } else if (mode === 'alert') {
+        stepEl.classList.add('is-active');
+      } else {
+        stepEl.classList.add('is-active');
+      }
+    }
+
+    function hasSelectedData() {
+      return !!(fileUpload && fileUpload.files && fileUpload.files.length) || !!selectedFilePath || !!(fileSelect && fileSelect.value);
+    }
+
+    function setFileActionEnabled(enabled) {
+      if (fileUpload) fileUpload.disabled = !enabled;
+      [btnSelectData].forEach(el => {
+        if (!el) return;
+        el.classList.toggle('is-disabled', !enabled);
+        if (el.tagName === 'BUTTON') {
+          el.disabled = !enabled;
+        }
+      });
+    }
+
+    function updateWorkflowState() {
+      const hasAthlete = !!selectedAthlete;
+      const hasAttempt = !!attemptInput.value.trim();
+      const athleteReady = hasAthlete && hasAttempt;
+      const hasData = hasSelectedData();
+      const dataReady = athleteReady && hasData;
+
+      if (!hasAthlete) {
+        setWorkflowStep(workflowStepAthlete, 'active');
+      } else if (!hasAttempt) {
+        setWorkflowStep(workflowStepAthlete, 'alert');
+      } else {
+        setWorkflowStep(workflowStepAthlete, 'complete');
+      }
+
+      if (!hasData) {
+        setWorkflowStep(workflowStepData, 'active');
+        setWorkflowStep(workflowStepAnalyze, 'locked');
+      } else {
+        setWorkflowStep(workflowStepData, 'complete');
+        if (athleteReady) {
+          setWorkflowStep(workflowStepAnalyze, 'active');
+        } else {
+          setWorkflowStep(workflowStepAnalyze, 'alert');
+        }
+      }
+
+      setFileActionEnabled(true);
+      btnAnalyze.disabled = !dataReady;
+
+      analysisReadyNote.textContent = '';
+    }
 
     function setStatus(msg, isErr) {
       statusEl.textContent = msg;
@@ -1316,14 +4356,445 @@
       statusEl.style.display = msg ? 'block' : 'none';
     }
 
+    function setManifestStatus(msg, ok) {
+      if (!manifestStatus) return;
+      manifestStatus.textContent = msg || '';
+      manifestStatus.className = 'manifest-status' + (ok ? ' ok' : '');
+      manifestStatus.style.display = msg ? 'inline-flex' : 'none';
+    }
+
+    function getAthleteSelectValue() {
+      return athleteSelect ? (athleteSelect.dataset.value || '') : '';
+    }
+
+    function setAthleteSelectValue(value, label) {
+      if (!athleteSelect) return;
+      athleteSelect.dataset.value = value || '';
+      if (athleteSelectText) {
+        athleteSelectText.textContent = label || '未建运动员';
+      }
+      if (athleteSelectMenu) {
+        athleteSelectMenu.querySelectorAll('.custom-select-option').forEach(option => {
+          option.classList.toggle('active', (option.dataset.value || '') === (value || ''));
+        });
+      }
+    }
+
+    function closeAthleteSelect() {
+      if (!athleteSelect) return;
+      athleteSelect.classList.remove('is-open');
+      if (athleteSelectTrigger) athleteSelectTrigger.classList.remove('is-open');
+    }
+
+    function syncCustomSelect(inputId) {
+      const input = document.getElementById(inputId);
+      const selector = document.querySelector(`.custom-select[data-input="${inputId}"]`);
+      if (!input || !selector) return;
+      const value = input.value || '';
+      const options = selector.querySelectorAll('.custom-select-option');
+      let selectedOption = null;
+      options.forEach(option => {
+        const isActive = (option.dataset.value || '') === value;
+        option.classList.toggle('active', isActive);
+        if (isActive) selectedOption = option;
+      });
+      const textEl = selector.querySelector('[data-custom-select-text]');
+      if (textEl) textEl.textContent = selectedOption ? selectedOption.textContent : '未填';
+    }
+
+    function closeFormCustomSelects(exceptSelector) {
+      document.querySelectorAll('.form-custom-select.is-open').forEach(selector => {
+        if (selector === exceptSelector) return;
+        selector.classList.remove('is-open');
+        const trigger = selector.querySelector('[data-custom-select-trigger]');
+        if (trigger) trigger.classList.remove('is-open');
+      });
+    }
+
+    function setupFormCustomSelects() {
+      document.querySelectorAll('.form-custom-select').forEach(selector => {
+        const inputId = selector.dataset.input;
+        const input = inputId ? document.getElementById(inputId) : null;
+        const trigger = selector.querySelector('[data-custom-select-trigger]');
+        const textEl = selector.querySelector('[data-custom-select-text]');
+        if (!input || !trigger) return;
+
+        trigger.addEventListener('click', () => {
+          const willOpen = !selector.classList.contains('is-open');
+          closeAthleteSelect();
+          closeFormCustomSelects(selector);
+          selector.classList.toggle('is-open', willOpen);
+          trigger.classList.toggle('is-open', willOpen);
+        });
+
+        selector.querySelectorAll('.custom-select-option').forEach(option => {
+          option.addEventListener('click', () => {
+            input.value = option.dataset.value || '';
+            if (textEl) textEl.textContent = option.textContent;
+            selector.querySelectorAll('.custom-select-option').forEach(item => {
+              item.classList.toggle('active', item === option);
+            });
+            selector.classList.remove('is-open');
+            trigger.classList.remove('is-open');
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+        });
+
+        syncCustomSelect(inputId);
+      });
+    }
+
+    function renderAthletes(selectedId) {
+      if (!athleteSelect || !athleteSelectMenu) return;
+      athleteSelectMenu.innerHTML = '';
+      if (!athletes.length) {
+        setAthleteSelectValue('', '未建运动员');
+        if (athleteSelectTrigger) athleteSelectTrigger.disabled = true;
+        selectedAthlete = null;
+        athleteMeta.textContent = '请先新建运动员';
+        syncAthleteActionAvailability();
+        updateWorkflowState();
+        return;
+      }
+      if (athleteSelectTrigger) athleteSelectTrigger.disabled = false;
+      athletes.forEach(a => {
+        const opt = document.createElement('button');
+        opt.type = 'button';
+        opt.className = 'custom-select-option';
+        opt.dataset.value = a.athlete_id || '';
+        opt.textContent = `${a.athlete_code || a.athlete_id} · ${a.name || '未命名'}`;
+        opt.addEventListener('click', () => {
+          setAthleteSelectValue(a.athlete_id || '', opt.textContent);
+          closeAthleteSelect();
+          applySelectedAthlete(false);
+        });
+        athleteSelectMenu.appendChild(opt);
+      });
+      const nextId = selectedId && athletes.some(a => a.athlete_id === selectedId)
+        ? selectedId
+        : athletes[0].athlete_id;
+      const nextAthlete = athletes.find(a => a.athlete_id === nextId);
+      const nextLabel = nextAthlete
+        ? `${nextAthlete.athlete_code || nextAthlete.athlete_id} · ${nextAthlete.name || '未命名'}`
+        : '未建运动员';
+      setAthleteSelectValue(nextId, nextLabel);
+      applySelectedAthlete(false);
+    }
+
+    function loadAthletes(selectedId) {
+      if (!hasAndroidBridge()) {
+        athletes = PREVIEW_ATHLETES.slice();
+        renderAthletes(selectedId || getAthleteSelectValue());
+        syncAthleteActionAvailability();
+        return;
+      }
+      try {
+        const data = JSON.parse(AndroidInterface.getAthletesJson() || '{}');
+        if (!data.ok) throw new Error(data.error || '读取运动员失败');
+        athletes = Array.isArray(data.athletes) ? data.athletes : [];
+        renderAthletes(selectedId || getAthleteSelectValue());
+        syncAthleteActionAvailability();
+      } catch (e) {
+        athletes = [];
+        renderAthletes('');
+        athleteMeta.textContent = e.message || '读取运动员失败';
+        syncAthleteActionAvailability();
+        updateWorkflowState();
+      }
+    }
+
+    function applySelectedAthlete(markTouched) {
+      selectedAthlete = athletes.find(a => a.athlete_id === getAthleteSelectValue()) || null;
+      if (!selectedAthlete) {
+        athleteMeta.textContent = '';
+        syncAthleteActionAvailability();
+        updateWorkflowState();
+        return;
+      }
+      syncAthleteActionAvailability();
+      if (Number.isFinite(Number(selectedAthlete.height_cm)) && Number(selectedAthlete.height_cm) > 0) {
+        heightInput.value = Math.round(Number(selectedAthlete.height_cm));
+      }
+      if (Number.isFinite(Number(selectedAthlete.weight_kg)) && Number(selectedAthlete.weight_kg) > 0) {
+        massInput.value = Number(selectedAthlete.weight_kg).toFixed(1).replace(/\.0$/, '');
+      }
+      const dominantLeg = selectedAthlete.extra?.dominant_leg === 'right'
+        ? '右腿'
+        : (selectedAthlete.extra?.dominant_leg === 'left' ? '左腿' : '未填惯用腿');
+      athleteMeta.textContent = `${selectedAthlete.group_name || '未分组'} · ${selectedAthlete.gender || '未知'} · ${dominantLeg} · ${selectedAthlete.height_cm || '--'}cm / ${selectedAthlete.weight_kg || '--'}kg`;
+      attemptTouched = !!markTouched;
+      refreshAttemptNo(false);
+      updateWorkflowState();
+    }
+
+    function refreshAttemptNo(force) {
+      if (!selectedAthlete || !hasAndroidBridge()) return;
+      if (attemptTouched && !force) return;
+      try {
+        const next = AndroidInterface.getNextAttemptNo(selectedAthlete.athlete_id);
+        if (next) attemptInput.value = next;
+      } catch (e) {
+        console.warn('getNextAttemptNo failed', e);
+      }
+      updateWorkflowState();
+    }
+
+    function ensureAthleteReady() {
+      if (!hasAndroidBridge()) return true;
+      if (!athletes.length) {
+        setStatus('请先新建运动员', true);
+        return false;
+      }
+      if (!selectedAthlete) {
+        setStatus('请先选择运动员', true);
+        return false;
+      }
+      if (!attemptInput.value.trim()) {
+        setStatus('请填写试跳编号', true);
+        return false;
+      }
+      return true;
+    }
+
+    function getAnalysisSourcePaths(primaryPath) {
+      const paths = [];
+      if (selectedAttemptPaths) {
+        if (selectedAttemptPaths.left) paths.push(selectedAttemptPaths.left);
+        if (selectedAttemptPaths.right) paths.push(selectedAttemptPaths.right);
+      }
+      if (primaryPath) paths.push(primaryPath);
+      return Array.from(new Set(paths.filter(Boolean)));
+    }
+
+    function buildManifestPayload(data, sourcePaths) {
+      const payload = {
+        ok: !!data.ok,
+        strides: Array.isArray(data.strides) ? data.strides : [],
+        source_file_paths: Array.isArray(sourcePaths) ? sourcePaths : []
+      };
+      if (data.timeRange) {
+        payload.timeRange = data.timeRange;
+      }
+      if (data.summary) {
+        payload.summary = {
+          duration_s: data.summary.duration_s,
+          source_sample_rate_hz: data.summary.source_sample_rate_hz,
+          long_jump_takeoff_step: data.summary.long_jump_takeoff_step,
+          long_jump_to_filter_applied: data.summary.long_jump_to_filter_applied
+        };
+      }
+      if (data.contra_data) {
+        payload.contra_data = {
+          side_main: data.contra_data.side_main || '',
+          side_contra: data.contra_data.side_contra || '',
+          strides: Array.isArray(data.contra_data.strides) ? data.contra_data.strides : []
+        };
+      }
+      return JSON.stringify(payload);
+    }
+
+    function formNumber(input) {
+      const n = Number(input.value);
+      return Number.isFinite(n) && input.value !== '' ? n : 0;
+    }
+
+    function fillAthleteForm(athlete) {
+      const extra = athlete && athlete.extra && typeof athlete.extra === 'object' ? athlete.extra : {};
+      editingAthleteId = athlete ? athlete.athlete_id : '';
+      athleteModalTitle.textContent = athlete ? '编辑运动员' : '新建运动员';
+      athleteForm.name.value = athlete ? (athlete.name || '') : '';
+      athleteForm.code.value = athlete ? (athlete.athlete_code || '') : '';
+      athleteForm.gender.value = athlete ? (athlete.gender || '') : '';
+      athleteForm.birth.value = athlete ? (athlete.birth_date || '') : '';
+      athleteForm.height.value = athlete && Number(athlete.height_cm) > 0 ? athlete.height_cm : '';
+      athleteForm.weight.value = athlete && Number(athlete.weight_kg) > 0 ? athlete.weight_kg : '';
+      athleteForm.group.value = athlete ? (athlete.group_name || '') : '';
+      athleteForm.leg.value = extra.dominant_leg || '';
+      athleteForm.best.value = extra.personal_best_m || '';
+      athleteForm.note.value = extra.note || '';
+      syncCustomSelect('athlete-form-gender');
+      syncCustomSelect('athlete-form-leg');
+    }
+
+    function openAthleteModal(athlete) {
+      fillAthleteForm(athlete);
+      updateAthleteModalViewport();
+      athleteModal.style.display = 'flex';
+      setTimeout(() => athleteForm.name.focus(), 0);
+    }
+
+    function closeAthleteModal() {
+      athleteModal.style.display = 'none';
+      editingAthleteId = '';
+    }
+
+    function buildAthleteFormPayload() {
+      return {
+        athlete_id: editingAthleteId,
+        athlete_code: athleteForm.code.value.trim(),
+        name: athleteForm.name.value.trim(),
+        gender: athleteForm.gender.value,
+        birth_date: athleteForm.birth.value,
+        height_cm: formNumber(athleteForm.height),
+        weight_kg: formNumber(athleteForm.weight),
+        group_name: athleteForm.group.value.trim(),
+        extra: {
+          dominant_leg: athleteForm.leg.value,
+          personal_best_m: formNumber(athleteForm.best),
+          note: athleteForm.note.value.trim()
+        }
+      };
+    }
+
+    function updateAthleteModalViewport() {
+      const vv = window.visualViewport;
+      const height = vv ? vv.height : window.innerHeight;
+      athleteModal.style.setProperty('--athlete-modal-vh', `${Math.max(320, Math.floor(height))}px`);
+    }
+
+    function scrollFocusedAthleteFieldIntoView(event) {
+      const target = event.target;
+      if (!target || !target.closest || !target.closest('#athlete-modal-overlay')) return;
+      setTimeout(() => {
+        target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+      }, 180);
+    }
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', updateAthleteModalViewport);
+      window.visualViewport.addEventListener('scroll', updateAthleteModalViewport);
+    }
+    Object.values(athleteForm).forEach(el => {
+      el.addEventListener('focus', scrollFocusedAthleteFieldIntoView);
+    });
+
+    function saveAthleteFromForm() {
+      if (typeof AndroidInterface === 'undefined') {
+        setStatus('仅 Android 端支持保存运动员', true);
+        return;
+      }
+      const payload = buildAthleteFormPayload();
+      if (!payload.name) {
+        setStatus('请填写运动员姓名', true);
+        athleteForm.name.focus();
+        return;
+      }
+      try {
+        const wasEditing = !!editingAthleteId;
+        const result = JSON.parse(AndroidInterface.saveAthleteJson(JSON.stringify(payload)) || '{}');
+        if (!result.ok) throw new Error(result.error || '保存运动员失败');
+        closeAthleteModal();
+        setStatus(wasEditing ? '运动员信息已更新' : '运动员已新建', false);
+        loadAthletes(result.athlete_id);
+      } catch (e) {
+        setStatus(e.message || '保存运动员失败', true);
+      }
+    }
+
+    btnAthleteNew.addEventListener('click', () => openAthleteModal(null));
+    btnAthleteEdit.addEventListener('click', () => {
+      if (selectedAthlete) openAthleteModal(selectedAthlete);
+    });
+    btnAthleteCancel.addEventListener('click', closeAthleteModal);
+    btnAthleteSave.addEventListener('click', saveAthleteFromForm);
+    athleteModal.addEventListener('click', (event) => {
+      if (event.target === athleteModal) closeAthleteModal();
+    });
+
+    if (athleteSelectTrigger) {
+      athleteSelectTrigger.addEventListener('click', () => {
+        if (athleteSelectTrigger.disabled) return;
+        const willOpen = !athleteSelect.classList.contains('is-open');
+        closeFormCustomSelects();
+        athleteSelect.classList.toggle('is-open', willOpen);
+        athleteSelectTrigger.classList.toggle('is-open', willOpen);
+      });
+    }
+    document.addEventListener('click', function (event) {
+      if (athleteSelect && athleteSelect.contains(event.target)) return;
+      closeAthleteSelect();
+    });
+    setupFormCustomSelects();
+    attemptInput.addEventListener('input', () => {
+      attemptTouched = true;
+      updateWorkflowState();
+    });
+    athleteUpload.addEventListener('change', async () => {
+      const file = athleteUpload.files[0];
+      if (!file) return;
+      if (typeof AndroidInterface === 'undefined') {
+        setStatus('仅 Android 端支持导入运动员 JSON', true);
+        return;
+      }
+      try {
+        const content = await file.text();
+        const result = JSON.parse(AndroidInterface.importAthletesJson(content) || '{}');
+        if (!result.ok) throw new Error(result.error || '导入失败');
+        setStatus(`已导入 ${result.count || 0} 名运动员`, false);
+        loadAthletes();
+      } catch (e) {
+        setStatus(e.message || '导入运动员失败', true);
+      } finally {
+        athleteUpload.value = '';
+      }
+    });
+
+    if (btnLanSave) {
+      btnLanSave.addEventListener('click', () => {
+        try {
+          saveLanUploadConfig(true);
+        } catch (e) {
+          setLanUploadStatus(e.message || '保存配置失败', 'err');
+        }
+      });
+    }
+    if (btnLanTest) {
+      btnLanTest.addEventListener('click', () => {
+        try {
+          saveLanUploadConfig(false);
+          setLanUploadStatus('正在测试连接…', '');
+          const result = JSON.parse(AndroidInterface.testLanUploadConnection() || '{}');
+          if (!result.ok) throw new Error(result.error || '连接失败');
+          setLanUploadStatus(`连接成功：${result.remote_dir || result.target_url || ''}`, 'ok');
+        } catch (e) {
+          setLanUploadStatus(e.message || '连接失败', 'err');
+        }
+      });
+    }
+    if (btnLanUploadLast) {
+      btnLanUploadLast.addEventListener('click', () => {
+        if (!lastManifestPath) {
+          setLanUploadStatus('还没有可上传的分析结果', 'err');
+          return;
+        }
+        try {
+          saveLanUploadConfig(false);
+          setLanUploadStatus('正在上传本次结果…', '');
+          const sourceArg = lastAnalysisSourcePathsJson && lastAnalysisSourcePathsJson !== '[]'
+            ? lastAnalysisSourcePathsJson
+            : (lastAnalysisSourcePath || '');
+          const result = JSON.parse(AndroidInterface.uploadAnalysisToLan(lastManifestPath, sourceArg) || '{}');
+          handleLanUploadResult(result, 'manifest');
+        } catch (e) {
+          setLanUploadStatus(e.message || '上传失败', 'err');
+          setManifestStatus(e.message || '上传失败', false);
+        } finally {
+          setLanUploadControlsEnabled(hasAndroidBridge());
+        }
+      });
+    }
+    const fileNameEl = document.getElementById('file-name');
+
+    loadAthletes();
+    loadLanUploadConfig();
+    updateFileNameDisplay();
+
     function fmt(v, d) { return (v != null && Number.isFinite(v) ? Number(v).toFixed(d) : '—'); }
     function setMetric(id, v, decimals) {
       const el = document.getElementById(id);
       el.textContent = fmt(v, decimals);
       el.classList.toggle('empty', v == null || !Number.isFinite(v));
     }
-
-    const fileNameEl = document.getElementById('file-name');
 
     /**
      * 从文件名中提取设备 MAC ID（12位十六进制）。
@@ -1350,22 +4821,55 @@
       return '—';
     }
 
+    function isLongJumpDeviceId(did) {
+      if (!did) return false;
+      const u = did.toUpperCase();
+      return u === 'D422CD007E6E' || u === 'D422CD00937F';
+    }
+
+    function isLongJumpDeviceFile(path) {
+      return isLongJumpDeviceId(extractDeviceId(String(path || '').split('/').pop()));
+    }
+
     function updateFileNameDisplay() {
       const file = fileUpload.files[0];
-      const deviceIdVal = document.getElementById('device-id-val');
 
       if (file) {
-        fileNameEl.textContent = file.name;
+        if (selectedDeviceInfoEl) selectedDeviceInfoEl.style.display = '';
+        if (footSideEl) footSideEl.style.display = '';
+        selectedFileSourceEl.style.display = '';
+        if (selectedAttemptSidesEl) selectedAttemptSidesEl.innerHTML = '';
+        selectedFilePanel.classList.remove('is-attempt');
+        const displayName = formatFileName(file.name) || file.name;
+        selectedFileSource = '本地文件';
+        selectedFileSourceEl.textContent = selectedFileSource;
+        fileNameEl.textContent = displayName;
         fileNameEl.classList.add('has-file');
+        fileNameEl.classList.remove('is-empty');
+        dataPickerText.textContent = displayName;
+        dataPickerText.classList.remove('is-empty');
+        selectedFilePanel.classList.remove('is-empty');
         const did = extractDeviceId(file.name);
-        deviceIdVal.textContent = did || '未知';
-        document.getElementById('foot-side-val').textContent = footSideFromId(did);
+        deviceIdEl.textContent = did || '未知';
+        footSideEl.textContent = footSideFromId(did);
       } else {
+        if (selectedDeviceInfoEl) selectedDeviceInfoEl.style.display = '';
+        if (footSideEl) footSideEl.style.display = '';
+        selectedFileSourceEl.style.display = '';
+        if (selectedAttemptSidesEl) selectedAttemptSidesEl.innerHTML = '';
+        selectedFilePanel.classList.remove('is-attempt');
+        selectedFileSource = '';
+        selectedFileSourceEl.textContent = '未选择';
         fileNameEl.textContent = '未选择文件';
         fileNameEl.classList.remove('has-file');
-        deviceIdVal.textContent = '—';
-        document.getElementById('foot-side-val').textContent = '—';
+        fileNameEl.classList.add('is-empty');
+        dataPickerText.textContent = '选择数据';
+        dataPickerText.classList.add('is-empty');
+        selectedFilePanel.classList.add('is-empty');
+        deviceIdEl.textContent = '—';
+        footSideEl.textContent = '—';
       }
+      updateWorkflowState();
     }
     function formatFileName(f) {
       // 在线格式：DOT_XXXXXXXXXXXX_YYYYMMDD_HHMMSS
@@ -1382,26 +4886,386 @@
       }
       return f;
     }
-    // 通过文件列表选中的绝对路径（离线/在线按钮专用）
-    let selectedFilePath = null;
 
-    function updateSelectedPath(path) {
-      selectedFilePath = path;
-      const name = path.split('/').pop();
-      fileNameEl.textContent = name;
-      fileNameEl.classList.add('has-file');
-      const did = extractDeviceId(name);
-      document.getElementById('device-id-val').textContent = did || '未知';
-      document.getElementById('foot-side-val').textContent = footSideFromId(did);
-      // 清空 fileUpload 选中，避免与路径模式冲突
-      fileUpload.value = '';
+    let selectedFileDateKey = '';
+
+    function parseFileDateKey(path) {
+      const name = String(path || '').split('/').pop();
+      const match = name.match(/(20\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+      if (match) {
+        return `${match[1]}-${match[2]}-${match[3]}`;
+      }
+      const dateOnly = name.match(/(20\d{2})(\d{2})(\d{2})/);
+      if (dateOnly) {
+        return `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]}`;
+      }
+      return 'unknown';
     }
 
-    function showFileListModal(title, paths) {
+    function formatPickerDateLabel(dateKey) {
+      if (!dateKey || dateKey === 'unknown') return '未识别日期';
+      const [year, month, day] = dateKey.split('-');
+      return `${year}年${month}月${day}日`;
+    }
+
+    function formatPickerDateChip(dateKey) {
+      if (!dateKey || dateKey === 'unknown') return { month: '--', day: '--', weekday: '未识别' };
+      const parsed = new Date(`${dateKey}T00:00:00`);
+      const weekday = Number.isNaN(parsed.getTime())
+        ? '未识别'
+        : ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][parsed.getDay()];
+      return {
+        month: `${dateKey.slice(5, 7)}月`,
+        day: dateKey.slice(8, 10),
+        weekday
+      };
+    }
+
+    function buildFileDateGroups(offlinePaths, onlinePaths) {
+      const files = []
+        .concat((offlinePaths || []).map(path => ({ path, source: '离线文件' })))
+        .concat((onlinePaths || []).map(path => ({ path, source: '在线文件' })))
+        .filter(file => isLongJumpDeviceFile(file.path));
+      const groups = new Map();
+      files.forEach(file => {
+        const key = parseFileDateKey(file.path);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(file);
+      });
+      return Array.from(groups.entries())
+        .map(([dateKey, items]) => ({
+          dateKey,
+          label: formatPickerDateLabel(dateKey),
+          items: items.sort((a, b) => String(b.path).localeCompare(String(a.path)))
+        }))
+        .sort((a, b) => {
+          if (a.dateKey === 'unknown') return 1;
+          if (b.dateKey === 'unknown') return -1;
+          return b.dateKey.localeCompare(a.dateKey);
+        });
+    }
+
+    function addDaysToDateKey(dateKey, days) {
+      const parsed = new Date(`${dateKey}T00:00:00`);
+      parsed.setDate(parsed.getDate() + days);
+      const y = parsed.getFullYear();
+      const m = String(parsed.getMonth() + 1).padStart(2, '0');
+      const d = String(parsed.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    function daysBetweenDateKeys(startKey, endKey) {
+      const start = new Date(`${startKey}T00:00:00`).getTime();
+      const end = new Date(`${endKey}T00:00:00`).getTime();
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+      return Math.round((end - start) / 86400000);
+    }
+
+    function heatmapLevel(count, maxCount) {
+      if (!count || count <= 0) return 0;
+      if (maxCount <= 1) return 2;
+      return Math.max(1, Math.min(4, Math.ceil((count / maxCount) * 4)));
+    }
+
+    function monthLabelFromDateKey(dateKey) {
+      if (!dateKey || dateKey === 'unknown') return '';
+      return `${Number(dateKey.slice(5, 7))}月`;
+    }
+
+    function renderFileHeatmap(groups, activeDateKey) {
+      const knownGroups = groups.filter(group => group.dateKey !== 'unknown');
+      if (!knownGroups.length) {
+        return '<div class="file-list-empty">未识别采集日期</div>';
+      }
+      const byDate = new Map(knownGroups.map(group => [group.dateKey, group]));
+      const newest = knownGroups[0].dateKey;
+      const oldest = knownGroups[knownGroups.length - 1].dateKey;
+      const spanDays = Math.max(34, daysBetweenDateKeys(oldest, newest));
+      const startKey = addDaysToDateKey(newest, -spanDays);
+      const maxCount = Math.max(1, ...knownGroups.map(group => group.items.length));
+      const cells = [];
+      const monthLabels = [];
+      let lastMonth = '';
+      for (let i = 0; i <= spanDays; i += 1) {
+        const dateKey = addDaysToDateKey(startKey, i);
+        const col = Math.floor(i / 7);
+        const group = byDate.get(dateKey);
+        const count = group ? group.items.length : 0;
+        const level = heatmapLevel(count, maxCount);
+        const active = dateKey === activeDateKey ? ' active' : '';
+        const disabled = count === 0 ? ' empty' : '';
+        const label = group ? `${group.label}，${count} 个 CSV` : `${formatPickerDateLabel(dateKey)}，无数据`;
+        const click = count > 0 ? ` onclick="selectFileDate('${dateKey}')"` : '';
+        cells.push(`<button type="button" class="file-heatmap-day level-${level}${active}${disabled}" title="${label}" aria-label="${label}"${click}></button>`);
+        if (i % 7 === 0) {
+          const month = monthLabelFromDateKey(dateKey);
+          const showMonth = month && month !== lastMonth;
+          monthLabels[col] = showMonth ? month : '';
+          if (showMonth) lastMonth = month;
+        }
+      }
+      return `
+        <div class="file-heatmap-wrap">
+          <div class="file-heatmap-body">
+            <div class="file-heatmap-weekdays">
+              <span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span>
+            </div>
+            <div class="file-heatmap-scroll">
+              <div class="file-heatmap-months">
+                ${monthLabels.map(label => `<span class="file-heatmap-month-label">${label}</span>`).join('')}
+              </div>
+              <div class="file-heatmap-grid">${cells.join('')}</div>
+            </div>
+          </div>
+          <div class="file-heatmap-legend">
+            <span>少</span>
+            <span class="file-heatmap-legend-cell"></span>
+            <span class="file-heatmap-legend-cell level-1"></span>
+            <span class="file-heatmap-legend-cell level-2"></span>
+            <span class="file-heatmap-legend-cell level-3"></span>
+            <span class="file-heatmap-legend-cell level-4"></span>
+            <span>多</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function parseFileAttemptKey(path) {
+      const name = String(path || '').split('/').pop();
+      const match = name.match(/(20\d{6})_(\d{6})/);
+      if (match) return `${match[1]}_${match[2]}`;
+      const fallback = name.match(/(20\d{6})/);
+      if (fallback) return fallback[1];
+      return name.replace(/\.(csv|CSV)$/, '');
+    }
+
+    function formatAttemptTitle(attemptKey, fallbackIndex) {
+      const match = String(attemptKey || '').match(/20\d{6}_(\d{2})(\d{2})(\d{2})/);
+      if (match) return `${match[1]}:${match[2]}:${match[3]}`;
+      return `试跳 ${String(fallbackIndex + 1).padStart(2, '0')}`;
+    }
+
+    function formatAttemptSelectedTitle(attemptKey, fallbackLabel) {
+      const match = String(attemptKey || '').match(/(20\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+      if (match) return `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}:${match[6]}`;
+      return fallbackLabel || '';
+    }
+
+    function fileSideOrder(file) {
+      const did = extractDeviceId(String(file.path || '').split('/').pop());
+      const foot = file.displaySide || footSideFromId(did);
+      if (foot === '左脚') return 0;
+      if (foot === '右脚') return 1;
+      return 2;
+    }
+
+    function sourcePriority(file) {
+      return file.source === '离线文件' ? 0 : 1;
+    }
+
+    function compactAttemptFiles(items) {
+      const slots = new Map();
+      items
+        .slice()
+        .sort((a, b) => sourcePriority(a) - sourcePriority(b) || String(a.path).localeCompare(String(b.path)))
+        .forEach(file => {
+          const did = extractDeviceId(String(file.path || '').split('/').pop());
+          const foot = footSideFromId(did);
+          const key = foot === '—' ? `unknown:${file.path}` : foot;
+          if (!slots.has(key)) slots.set(key, { ...file, displaySide: foot });
+        });
+      return Array.from(slots.values())
+        .sort((a, b) => fileSideOrder(a) - fileSideOrder(b) || String(a.path).localeCompare(String(b.path)));
+    }
+
+    function attemptPathsFromItems(items) {
+      const paths = { left: '', right: '', fallback: '' };
+      (items || []).forEach(file => {
+        const foot = file.displaySide || footSideFromId(extractDeviceId(String(file.path || '').split('/').pop()));
+        if (foot === '左脚' && !paths.left) paths.left = file.path;
+        if (foot === '右脚' && !paths.right) paths.right = file.path;
+        if (!paths.fallback) paths.fallback = file.path;
+      });
+      return paths;
+    }
+
+    function preferredAttemptPath(paths) {
+      const dominantLeg = selectedAthlete?.extra?.dominant_leg;
+      if (dominantLeg === 'right' && paths.right) return paths.right;
+      if (dominantLeg === 'left' && paths.left) return paths.left;
+      return paths.left || paths.right || paths.fallback || '';
+    }
+
+    function renderAttemptSideTag(label, present, showMissing = false) {
+      if (!present && !showMissing) return '';
+      const sideClass = present
+        ? (label === '左脚' ? 'file-side-tag-left' : 'file-side-tag-right')
+        : 'file-side-tag-missing';
+      const main = label === '左脚' ? 'LEFT' : 'RIGHT';
+      const sub = label === '左脚' ? '左脚' : '右脚';
+      return `<span class="file-side-tag ${sideClass}"><span class="file-side-dot"></span><span class="file-side-main">${main}</span><span class="file-side-sub">${sub}</span></span>`;
+    }
+
+    function buildFileAttemptGroups(files) {
+      const map = new Map();
+      files.forEach(file => {
+        const key = parseFileAttemptKey(file.path);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(file);
+      });
+      return Array.from(map.entries())
+        .map(([attemptKey, items], index) => ({
+          attemptKey,
+          title: formatAttemptTitle(attemptKey, index),
+          selectedTitle: formatAttemptSelectedTitle(attemptKey, formatAttemptTitle(attemptKey, index)),
+          items: compactAttemptFiles(items)
+        }))
+        .sort((a, b) => String(b.attemptKey).localeCompare(String(a.attemptKey)));
+    }
+
+    function renderAttemptFileGroup(group) {
+      const paths = attemptPathsFromItems(group.items);
+      const source = paths.left && paths.right ? '配对数据' : (group.items[0]?.source || '本地文件');
+      return `
+        <section class="file-attempt-group file-list-item" data-source="${source}" data-title="${group.selectedTitle || group.title}" data-left-path="${encodeURIComponent(paths.left)}" data-right-path="${encodeURIComponent(paths.right)}" data-path="${encodeURIComponent(preferredAttemptPath(paths))}">
+          <div class="file-attempt-head">
+            <div class="file-attempt-title">${group.title}</div>
+          </div>
+          <div class="file-attempt-files">
+            ${renderAttemptSideTag('左脚', !!paths.left, true)}
+            ${renderAttemptSideTag('右脚', !!paths.right, true)}
+          </div>
+        </section>
+      `;
+    }
+
+    function renderFilePicker(groups, activeDateKey) {
+      const activeGroup = groups.find(group => group.dateKey === activeDateKey) || groups[0];
+      if (!activeGroup) return '<div class="file-list-empty">该目录下暂无 CSV 文件</div>';
+      const attemptGroups = buildFileAttemptGroups(activeGroup.items);
+      return `
+        <div class="file-picker-layout">
+          <section class="file-picker-date-panel">
+            <div class="file-picker-panel-head">
+              <span class="file-group-badge">${groups.length} 天</span>
+            </div>
+            ${renderFileHeatmap(groups, activeGroup.dateKey)}
+          </section>
+          <section class="file-picker-day-panel">
+            <div class="file-picker-day-head">
+              <div>
+                <div class="file-picker-day-title">${activeGroup.label}</div>
+                <div class="file-picker-day-sub">共 ${attemptGroups.length} 跳</div>
+              </div>
+              <span class="file-group-badge">${attemptGroups.length}</span>
+            </div>
+            <div class="file-picker-files">
+              <div class="file-attempt-groups">
+                ${attemptGroups.map(renderAttemptFileGroup).join('')}
+              </div>
+            </div>
+          </section>
+        </div>
+      `;
+    }
+
+    // 通过文件列表选中的绝对路径（离线/在线按钮专用）
+    function updateSelectedPath(path, sourceLabel) {
+      selectedFilePath = path;
+      selectedAttemptPaths = null;
+      if (selectedDeviceInfoEl) selectedDeviceInfoEl.style.display = '';
+      if (footSideEl) footSideEl.style.display = '';
+      selectedFileSourceEl.style.display = '';
+      if (selectedAttemptSidesEl) selectedAttemptSidesEl.innerHTML = '';
+      selectedFilePanel.classList.remove('is-attempt');
+      selectedFileSource = sourceLabel || '本地文件';
+      selectedFileSourceEl.textContent = selectedFileSource;
+      const name = path.split('/').pop();
+      const displayName = formatFileName(name) || name;
+      fileNameEl.textContent = displayName;
+      fileNameEl.classList.add('has-file');
+      fileNameEl.classList.remove('is-empty');
+      dataPickerText.textContent = displayName;
+      dataPickerText.classList.remove('is-empty');
+      selectedFilePanel.classList.remove('is-empty');
+      const did = extractDeviceId(name);
+      deviceIdEl.textContent = did || '未知';
+      footSideEl.textContent = footSideFromId(did);
+      // 清空 fileUpload 选中，避免与路径模式冲突
+      fileUpload.value = '';
+      updateWorkflowState();
+    }
+
+    function updateSelectedAttempt(paths, sourceLabel, titleLabel) {
+      const selectedPath = preferredAttemptPath(paths);
+      if (!selectedPath) return;
+      selectedFilePath = selectedPath;
+      selectedAttemptPaths = {
+        left: paths.left || '',
+        right: paths.right || '',
+        primary: selectedPath
+      };
+      selectedFileSource = sourceLabel || '配对数据';
+      selectedFileSourceEl.textContent = selectedFileSource;
+      selectedFileSourceEl.style.display = 'none';
+      const displayName = titleLabel || (formatFileName(selectedPath.split('/').pop()) || selectedPath.split('/').pop());
+      fileNameEl.textContent = displayName;
+      fileNameEl.classList.add('has-file');
+      fileNameEl.classList.remove('is-empty');
+      dataPickerText.textContent = displayName;
+      dataPickerText.classList.remove('is-empty');
+      selectedFilePanel.classList.remove('is-empty');
+      selectedFilePanel.classList.add('is-attempt');
+      if (selectedAttemptSidesEl) {
+        selectedAttemptSidesEl.innerHTML = `
+          ${renderAttemptSideTag('左脚', !!paths.left, true)}
+          ${renderAttemptSideTag('右脚', !!paths.right, true)}
+        `;
+      }
+      if (selectedDeviceInfoEl) selectedDeviceInfoEl.style.display = 'none';
+      fileUpload.value = '';
+      updateWorkflowState();
+    }
+
+    function renderFileGroup(title, sourceLabel, paths) {
+      if (!paths || paths.length === 0) {
+        return `
+          <section class="file-group">
+            <div class="file-group-title">${title}<span class="file-group-badge">0</span></div>
+            <div class="file-list-empty">暂无文件</div>
+          </section>
+        `;
+      }
+      const items = paths.map(function (p) {
+        const name = p.split('/').pop();
+        const displayName = formatFileName(name) || name;
+        const did = extractDeviceId(name);
+        const foot = footSideFromId(did);
+        const footTag = foot !== '—'
+          ? '<span class="file-side-tag ' + (foot === '左脚' ? 'file-side-tag-left' : 'file-side-tag-right') + '">' + foot + '</span>'
+          : '';
+        return (
+          '<div class="file-list-item" data-source="' + sourceLabel + '" data-path="' + encodeURIComponent(p) + '">' +
+          '<div class="file-list-item-name">' + displayName + footTag + '</div>' +
+          '<div class="file-list-item-path">' + name + '</div>' +
+          '</div>'
+        );
+      }).join('');
+      return `
+        <section class="file-group">
+          <div class="file-group-title">${title}<span class="file-group-badge">${paths.length}</span></div>
+          <div class="file-group-list">${items}</div>
+        </section>
+      `;
+    }
+
+    function showFileListModal(title, offlinePaths, onlinePaths) {
       const modal = document.getElementById('file-list-modal');
       const container = document.getElementById('file-list-container');
       container.innerHTML = '';
-      if (!paths || paths.length === 0) {
+      const hasOffline = Array.isArray(offlinePaths) && offlinePaths.length > 0;
+      const hasOnline = Array.isArray(onlinePaths) && onlinePaths.length > 0;
+      if (!hasOffline && !hasOnline) {
         // 检查是否有权限，给出不同提示
         var hasPermission = true;
         if (typeof AndroidInterface !== 'undefined') {
@@ -1419,21 +5283,35 @@
             '<div class="file-list-empty">该目录下暂无 CSV 文件</div>';
         }
       } else {
-        paths.forEach(function (p) {
-          const name = p.split('/').pop();
-          const item = document.createElement('div');
-          item.className = 'file-list-item';
-          const displayName = formatFileName(name) || name;
-          const did = extractDeviceId(name);
-          const foot = footSideFromId(did);
-          const footTag = foot !== '—'
-            ? '<span style="display:inline-block;margin-left:8px;padding:1px 8px;border-radius:4px;font-size:12px;font-weight:700;background:' + (foot === '左脚' ? '#1a5fa8' : '#8a2020') + ';color:#fff;">' + foot + '</span>'
-            : '';
-          item.innerHTML =
-            '<div class="file-list-item-name">' + displayName + footTag + '</div>' +
-            '<div class="file-list-item-path">' + name + '</div>';
-          item.onclick = function () { updateSelectedPath(p); closeFileListModal(); };
-          container.appendChild(item);
+        const groups = buildFileDateGroups(offlinePaths || [], onlinePaths || []);
+        const hasSelectedDate = selectedFileDateKey && groups.some(group => group.dateKey === selectedFileDateKey);
+        selectedFileDateKey = hasSelectedDate ? selectedFileDateKey : (groups[0]?.dateKey || '');
+        container.innerHTML = `
+          <div class="file-list-header">
+            <div>
+              <div class="file-list-title">${title}</div>
+            </div>
+            <button type="button" class="file-list-close" onclick="closeFileListModal()">×</button>
+          </div>
+          ${renderFilePicker(groups, selectedFileDateKey)}
+        `;
+        container.querySelectorAll('.file-list-item').forEach(item => {
+          item.addEventListener('click', function () {
+            if (item.dataset.leftPath !== undefined || item.dataset.rightPath !== undefined) {
+              updateSelectedAttempt(
+                {
+                  left: decodeURIComponent(item.dataset.leftPath || ''),
+                  right: decodeURIComponent(item.dataset.rightPath || ''),
+                  fallback: decodeURIComponent(item.dataset.path || '')
+                },
+                item.dataset.source || '配对数据',
+                item.dataset.title || ''
+              );
+            } else {
+              updateSelectedPath(decodeURIComponent(item.dataset.path || ''), item.dataset.source || '本地文件');
+            }
+            closeFileListModal();
+          });
         });
       }
       // 用 absolute 定位，高度覆盖整个页面内容
@@ -1444,119 +5322,100 @@
       modal.classList.add('open');
     }
 
+    function selectFileDate(dateKey) {
+      selectedFileDateKey = dateKey;
+      if (typeof AndroidInterface !== 'undefined') {
+        var offlinePaths = [];
+        var onlinePaths = [];
+        try { offlinePaths = JSON.parse(AndroidInterface.getOfflineFileList() || '[]'); } catch (e) { }
+        try { onlinePaths = JSON.parse(AndroidInterface.getOnlineFileList() || '[]'); } catch (e) { }
+        showFileListModal('选择数据', offlinePaths, onlinePaths);
+      }
+    }
+
     function closeFileListModal() {
       document.getElementById('file-list-modal').classList.remove('open');
     }
 
-    document.getElementById('btn-offline-files').addEventListener('click', function () {
+    document.getElementById('btn-select-data').addEventListener('click', function () {
       if (typeof AndroidInterface !== 'undefined') {
-        var paths = [];
-        try { paths = JSON.parse(AndroidInterface.getOfflineFileList() || '[]'); } catch (e) { }
-        showFileListModal('离线文件（120Hz）', paths);
+        var offlinePaths = [];
+        var onlinePaths = [];
+        try { offlinePaths = JSON.parse(AndroidInterface.getOfflineFileList() || '[]'); } catch (e) { }
+        try { onlinePaths = JSON.parse(AndroidInterface.getOnlineFileList() || '[]'); } catch (e) { }
+        showFileListModal('选择数据', offlinePaths, onlinePaths);
       } else {
-        setStatus('仅在 Android 端支持文件列表功能', true);
+        fileUpload.click();
       }
     });
 
-    document.getElementById('btn-online-files').addEventListener('click', function () {
-      if (typeof AndroidInterface !== 'undefined') {
-        var paths = [];
-        try { paths = JSON.parse(AndroidInterface.getOnlineFileList() || '[]'); } catch (e) { }
-        showFileListModal('在线文件（60Hz）', paths);
-      } else {
-        setStatus('仅在 Android 端支持文件列表功能', true);
-      }
-    });
-
-    function syncTakeoffManualVisibility() {
-      const manual = document.querySelector('input[name="lab-takeoff-mode"]:checked')?.value === 'manual';
-      const inp = document.getElementById('lab-takeoff-step');
+    function syncMainTakeoffManualVisibility() {
+      const manual = document.querySelector('input[name="main-takeoff-mode"]:checked')?.value === 'manual';
+      const inp = document.getElementById('main-takeoff-step');
       if (inp) {
         inp.style.display = manual ? 'inline-block' : 'none';
         inp.disabled = !manual;
       }
     }
 
-    /** 不管怎样，跳远时「自动识别」总是可用 */
-    function syncTakeoffFootAndMode() {
-      const autoLabel = document.getElementById('lab-takeoff-mode-auto-label');
-      if (autoLabel) {
-        autoLabel.style.display = 'inline-flex';
-      }
-      syncTakeoffManualVisibility();
+    function syncMainTakeoffHint() {
+      const hint = document.getElementById('main-takeoff-hint');
+      if (!hint) return;
+      hint.textContent = '';
+      hint.style.display = 'none';
     }
 
-    document.querySelectorAll('input[name="lab-takeoff-mode"], input[name="lab-jump-takeoff"]').forEach(r => {
-      r.addEventListener('change', () => { syncTakeoffManualVisibility(); });
+    document.querySelectorAll('input[name="main-takeoff-mode"]').forEach(r => {
+      r.addEventListener('change', () => {
+        syncMainTakeoffManualVisibility();
+        syncMainTakeoffHint();
+      });
     });
-    
-    function syncSportModeVisibility() {
-      const mode = document.querySelector('input[name="lab-sport-mode"]:checked')?.value;
-      const controls = document.getElementById('long-jump-controls');
-      const jumpFootControls = document.getElementById('jump-takeoff-foot-controls');
-      if (controls) {
-        controls.style.display = (mode === 'long_jump') ? 'block' : 'none';
-      }
-      if (jumpFootControls) {
-        jumpFootControls.style.display = (mode === 'long_jump' || mode === 'triple_jump') ? 'block' : 'none';
-      }
-    }
-    document.querySelectorAll('input[name="lab-sport-mode"]').forEach(r => {
-      r.addEventListener('change', syncSportModeVisibility);
-    });
-    
-    syncTakeoffFootAndMode();
-    syncSportModeVisibility();
+
+    syncMainTakeoffManualVisibility();
+    syncMainTakeoffHint();
 
     function resolveTakeoffFootStr() {
-      const sportModeOpt = document.querySelector('input[name="lab-sport-mode"]:checked');
-      if (sportModeOpt && (sportModeOpt.value === 'triple_jump' || sportModeOpt.value === 'long_jump')) {
-        const jumpFoot = document.querySelector('input[name="lab-jump-takeoff"]:checked');
-        return jumpFoot ? jumpFoot.value : 'L'; // backend will map L/R
-      }
-      return '1';
+      const dominantLeg = selectedAthlete?.extra?.dominant_leg;
+      if (dominantLeg === 'left') return 'L';
+      if (dominantLeg === 'right') return 'R';
+      return '';
     }
 
     function resolveTakeoffStepStr(takeoffStepOverride) {
-      const sportModeOpt = document.querySelector('input[name="lab-sport-mode"]:checked');
-      if (!sportModeOpt || (sportModeOpt.value !== 'long_jump' && sportModeOpt.value !== 'triple_jump')) return '-1';
-
       if (takeoffStepOverride !== undefined && takeoffStepOverride !== null && takeoffStepOverride !== '') {
         const n = parseInt(String(takeoffStepOverride), 10);
         if (n === 0) return '0';
         if (isFinite(n) && n >= 1) return String(n);
-        return '-1';
+        return '0';
       }
-      const mode = document.querySelector('input[name="lab-takeoff-mode"]:checked');
-      const m = mode ? mode.value : 'off';
-      if (m === 'off') return '-1';
+      const mode = document.querySelector('input[name="main-takeoff-mode"]:checked');
+      const m = mode ? mode.value : 'auto';
       if (m === 'auto') {
         return '0';
       }
-      const tel = document.getElementById('lab-takeoff-step');
+      const tel = document.getElementById('main-takeoff-step');
       if (tel && tel.value.trim() !== '') {
         const n = parseInt(tel.value.trim(), 10);
         if (isFinite(n) && n >= 1) return String(n);
       }
-      return '-1';
+      return '0';
     }
 
     function resolveTripleJumpStr() {
-      const sportModeOpt = document.querySelector('input[name="lab-sport-mode"]:checked');
-      if (!sportModeOpt) return 'NONE';
-      if (sportModeOpt.value === 'triple_jump') {
-        const jumpFoot = document.querySelector('input[name="lab-jump-takeoff"]:checked');
-        return jumpFoot ? jumpFoot.value : 'L';
-      }
       return '0';
     }
 
       async function runAnalyze(filename, formData, startTimeS, endTimeS, takeoffStepOverride) {
+      if (!ensureAthleteReady()) return false;
       statusEl.textContent = '';
       btnAnalyze.disabled = true;
       const labBtn = document.getElementById('btn-lab-analyze');
       if (labBtn) labBtn.disabled = true;
+      setFileActionEnabled(false);
+      setManifestStatus('', false);
       setStatus('计算中…', false);
+      setWorkflowStep(workflowStepAnalyze, 'active');
       let ok = false;
       try {
         const mass = parseFloat(massInput.value) || 75;
@@ -1564,6 +5423,9 @@
         const takeoffStr = resolveTakeoffStepStr(takeoffStepOverride);
         const takeoffFootStr = resolveTakeoffFootStr();
         const isTripleJumpStr = resolveTripleJumpStr();
+        if (takeoffFootStr === '' || isTripleJumpStr === '') {
+          throw new Error('请先在运动员信息里填写惯用腿');
+        }
         let data;
 
         if (typeof AndroidInterface !== 'undefined' && !formData) {
@@ -1591,7 +5453,7 @@
             const body = { filename, mass, height };
             if (startTimeS != null && startTimeS !== '') body.start_time_s = Number(startTimeS);
             if (endTimeS != null && endTimeS !== '') body.end_time_s = Number(endTimeS);
-            if (takeoffStr !== '-1') body.long_jump_takeoff_step = parseInt(takeoffStr, 10); // -1 关；0 自动；≥1 手动
+            body.long_jump_takeoff_step = parseInt(takeoffStr, 10); // 0 自动；≥1 手动
             body.long_jump_is_takeoff_foot = (takeoffFootStr === 'L' || takeoffFootStr === 'R') ? takeoffFootStr : (takeoffFootStr === '1');
             body.is_triple_jump = (isTripleJumpStr === '1' || isTripleJumpStr === 'L' || isTripleJumpStr === 'R') ? isTripleJumpStr : false;
             res = await fetch('/api/analyze', {
@@ -1626,13 +5488,39 @@
         }
         const actualName = filename || (fileUpload.files[0] ? fileUpload.files[0].name : '手动上传文件');
         updateUI(data);
-        saveToHistory(actualName, data);
+        let manifestPath = '';
+        if (typeof AndroidInterface !== 'undefined') {
+          const sourcePath = filename || actualName;
+          const sourcePaths = getAnalysisSourcePaths(sourcePath);
+          const manifestResult = JSON.parse(AndroidInterface.saveImuManifest(
+            selectedAthlete.athlete_id,
+            attemptInput.value.trim(),
+            sourcePath,
+            buildManifestPayload(data, sourcePaths)
+          ) || '{}');
+          if (!manifestResult.ok) {
+            throw new Error(manifestResult.error || 'manifest 保存失败');
+          }
+          manifestPath = manifestResult.path || '';
+          lastManifestPath = manifestPath;
+          lastAnalysisSourcePath = sourcePath || '';
+          lastAnalysisSourcePathsJson = JSON.stringify(sourcePaths);
+          if (manifestResult.lan_upload) {
+            handleLanUploadResult(manifestResult.lan_upload, 'manifest');
+          } else {
+            setManifestStatus('manifest 已保存', true);
+          }
+          if (!attemptTouched) {
+            refreshAttemptNo(true);
+          }
+        }
+        saveToHistory(actualName, data, manifestPath);
         ok = true;
       } catch (e) {
         setStatus(e.message || '系统错误', true);
         console.error('Analysis error:', e);
       } finally {
-        btnAnalyze.disabled = false;
+        updateWorkflowState();
         const labBtn = document.getElementById('btn-lab-analyze');
         if (labBtn) labBtn.disabled = false;
       }
@@ -1653,7 +5541,7 @@
       }
       const filename = fileSelect ? fileSelect.value : null;
       if (!filename) {
-        setStatus('请选择录制文件或上传 CSV', true);
+        setStatus('请选择数据文件', true);
         return;
       }
       await runAnalyze(filename, null, null, null);
@@ -1662,6 +5550,7 @@
     fileUpload.onchange = () => {
       // 上传新文件时，清空通过列表选中的路径
       selectedFilePath = null;
+      selectedAttemptPaths = null;
       updateFileNameDisplay();
     };
 
@@ -1670,17 +5559,9 @@
     document.getElementById('btn-lab-reset').onclick = () => {
       document.getElementById('lab-start-time').value = '';
       document.getElementById('lab-end-time').value = '';
-      const footRadios = document.getElementsByName('lab-takeoff-foot');
-      for (const r of footRadios) if (r.value === '1') r.checked = true;
-      const modeRadios = document.getElementsByName('lab-takeoff-mode');
-      for (const r of modeRadios) if (r.value === 'off') r.checked = true;
-      const stepInput = document.getElementById('lab-takeoff-step');
-      stepInput.value = '';
-      stepInput.style.display = 'none';
-      stepInput.disabled = true;
       const hint = document.getElementById('lab-takeoff-hint');
       if (hint) hint.textContent = '';
-      setStatus('分析参数已重置。请重新点击计算。', false);
+      setStatus('时间范围已重置。', false);
     };
 
     document.getElementById('btn-lab-analyze').onclick = async () => {
@@ -1732,12 +5613,9 @@
       const targetView = document.getElementById('view-' + viewId);
       if (targetView) targetView.classList.add('active');
 
-      // 如果进入实验室视图且有残留数据，刷新图表
-      if (viewId === 'lab') {
-        renderLabCharts();
-      }
       if (viewId === 'splits') {
         updateSplitsChart();
+        renderLabCharts();
       }
       if (viewId === 'history') {
         renderHistoryList();
@@ -1746,6 +5624,8 @@
 
     // --- 历史记录核心逻辑 ---
     const MAX_HISTORY = 20;
+    const HISTORY_PREFIX = 'gait_history_by_athlete_';
+    const LEGACY_HISTORY_KEY = 'gait_history';
 
     function parseMetadata(filename) {
       let dateShow = "";
@@ -1782,18 +5662,90 @@
       return { date: dateShow, side: side };
     }
 
-    function saveToHistory(filename, data) {
-      try {
-        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
+    function historyStorageKey(athleteId) {
+      return HISTORY_PREFIX + (athleteId || 'unbound');
+    }
 
-        // --- 去重逻辑：如果相同文件名已存在，先移除旧记录，保留最新的 ---
-        history = history.filter(item => item.filename !== filename);
+    function athleteSnapshot() {
+      if (!selectedAthlete) {
+        return {
+          athlete_id: 'unbound',
+          athlete_code: '',
+          name: '未绑定运动员',
+          group_name: '',
+          gender: '',
+          extra: {}
+        };
+      }
+      return {
+        athlete_id: selectedAthlete.athlete_id,
+        athlete_code: selectedAthlete.athlete_code || '',
+        name: selectedAthlete.name || '未命名',
+        group_name: selectedAthlete.group_name || '',
+        gender: selectedAthlete.gender || '',
+        extra: selectedAthlete.extra || {}
+      };
+    }
+
+    function readHistoryBuckets() {
+      const buckets = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith(HISTORY_PREFIX)) continue;
+        try {
+          const items = JSON.parse(localStorage.getItem(key) || '[]');
+          if (Array.isArray(items) && items.length) buckets.push({ key, items });
+        } catch (e) { console.warn('History bucket read failed', key, e); }
+      }
+
+      try {
+        const legacy = JSON.parse(localStorage.getItem(LEGACY_HISTORY_KEY) || '[]');
+        if (Array.isArray(legacy) && legacy.length) {
+          buckets.push({
+            key: LEGACY_HISTORY_KEY,
+            items: legacy.map(item => ({
+              ...item,
+              athlete: item.athlete || {
+                athlete_id: 'unbound',
+                athlete_code: '',
+                name: '未绑定运动员',
+                group_name: '',
+                gender: '',
+                extra: {}
+              }
+            }))
+          });
+        }
+      } catch (e) { console.warn('Legacy history read failed', e); }
+      return buckets;
+    }
+
+    function flattenHistory() {
+      return readHistoryBuckets()
+        .flatMap(bucket => bucket.items.map(item => ({ ...item, storageKey: bucket.key })))
+        .sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+    }
+
+    function saveToHistory(filename, data, manifestPath) {
+      try {
+        const athlete = athleteSnapshot();
+        const storageKey = historyStorageKey(athlete.athlete_id);
+        let history = JSON.parse(localStorage.getItem(storageKey) || '[]');
+
+        const attemptNo = normalizeAttemptNoForHistory(attemptInput.value || 'R001');
+        history = history.filter(item => !(item.filename === filename && item.attemptNo === attemptNo));
 
         const meta = parseMetadata(filename);
         const entry = {
           id: Date.now(),
           timestamp: new Date().toLocaleString(),
           filename: filename,
+          athlete: athlete,
+          athleteId: athlete.athlete_id,
+          athleteName: athlete.name,
+          athleteCode: athlete.athlete_code,
+          attemptNo: attemptNo,
+          manifestPath: manifestPath || '',
           recordDate: meta.date || new Date().toLocaleDateString(),
           side: meta.side,
           summary: data.summary,
@@ -1801,61 +5753,288 @@
         };
         history.unshift(entry);
         if (history.length > MAX_HISTORY) history = history.slice(0, MAX_HISTORY);
-        localStorage.setItem('gait_history', JSON.stringify(history));
+        localStorage.setItem(storageKey, JSON.stringify(history));
       } catch (e) { console.error('History save error:', e); }
+    }
+
+    function normalizeAttemptNoForHistory(raw) {
+      const digits = String(raw || '').replace(/\D/g, '');
+      return digits ? `R${digits.padStart(3, '0')}` : 'R001';
+    }
+
+    function toHistoryDateKey(raw) {
+      const text = String(raw || '');
+      const fullMatch = text.match(/(20\d{2})[\/\-](\d{2})[\/\-](\d{2})/);
+      if (fullMatch) return `${fullMatch[1]}-${fullMatch[2]}-${fullMatch[3]}`;
+      const compactMatch = text.match(/(20\d{2})(\d{2})(\d{2})/);
+      if (compactMatch) return `${compactMatch[1]}-${compactMatch[2]}-${compactMatch[3]}`;
+      const parsed = new Date(text);
+      if (!Number.isNaN(parsed.getTime())) {
+        const y = parsed.getFullYear();
+        const m = String(parsed.getMonth() + 1).padStart(2, '0');
+        const d = String(parsed.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+      }
+      return '';
+    }
+
+    function formatHistoryDateLabel(dateKey) {
+      if (!dateKey) return '未识别日期';
+      const [year, month, day] = dateKey.split('-');
+      return `${year}年${month}月${day}日`;
+    }
+
+    function formatHistoryDateChip(dateKey) {
+      if (!dateKey) return { month: '--', day: '--', weekday: '未识别' };
+      const parsed = new Date(`${dateKey}T00:00:00`);
+      const weekday = Number.isNaN(parsed.getTime())
+        ? '未识别'
+        : ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][parsed.getDay()];
+      return {
+        month: `${dateKey.slice(5, 7)}月`,
+        day: dateKey.slice(8, 10),
+        weekday
+      };
+    }
+
+    function buildHistoryDateGroups(items) {
+      const map = new Map();
+      items.forEach(item => {
+        const dateKey = toHistoryDateKey(item.recordDate || item.timestamp || item.filename || '');
+        const resolvedKey = dateKey || 'unknown';
+        if (!map.has(resolvedKey)) map.set(resolvedKey, []);
+        map.get(resolvedKey).push(item);
+      });
+      return Array.from(map.entries())
+        .map(([dateKey, records]) => ({
+          dateKey,
+          label: dateKey === 'unknown' ? '未识别日期' : formatHistoryDateLabel(dateKey),
+          records: records.sort((a, b) => Number(b.id || 0) - Number(a.id || 0))
+        }))
+        .sort((a, b) => {
+          if (a.dateKey === 'unknown') return 1;
+          if (b.dateKey === 'unknown') return -1;
+          return b.dateKey.localeCompare(a.dateKey);
+        });
     }
 
     function renderHistoryList() {
       const container = document.getElementById('history-list');
-      let history = [];
-      try { history = JSON.parse(localStorage.getItem('gait_history') || '[]'); } catch (e) { }
+      const summary = document.getElementById('history-summary');
+      const selector = document.getElementById('history-athlete-select');
+      const trigger = document.getElementById('history-athlete-trigger');
+      const triggerText = document.getElementById('history-athlete-trigger-text');
+      const menu = document.getElementById('history-athlete-menu');
+      const buckets = readHistoryBuckets()
+        .sort((a, b) => Number((b.items[0] || {}).id || 0) - Number((a.items[0] || {}).id || 0));
+      const total = buckets.reduce((sum, bucket) => sum + bucket.items.length, 0);
 
-      if (history.length === 0) {
-        container.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:4rem;color:var(--muted);background:var(--card);border-radius:12px;border:1px dashed var(--border);">暂无计算历史记录</div>';
+      if (total === 0) {
+        if (summary) summary.textContent = '0 条记录';
+        if (trigger) trigger.disabled = true;
+        if (triggerText) triggerText.textContent = '暂无运动员记录';
+        if (menu) menu.innerHTML = '';
+        if (selector) selector.classList.remove('is-open');
+        container.classList.remove('is-hidden');
+        container.innerHTML = '<div class="history-empty-state">暂无计算历史记录</div>';
         return;
       }
 
-      container.innerHTML = history.map(item => {
-        const s = item.summary || {};
-        return `
-        <div class="card" style="padding:1.25rem;cursor:default;">
-          <div style="display:flex;justify-content:space-between;margin-bottom:0.75rem;">
-            <div style="display:flex;flex-direction:column;gap:4px;">
-              <div style="font-weight:600;font-size:0.85rem;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" title="${item.filename}">${item.filename}</div>
-              <div style="display:flex;gap:8px;font-size:0.75rem;">
-                <span style="background:rgba(0,184,148,0.15);color:var(--green);padding:1px 6px;border-radius:4px;font-weight:600;">${item.side || '未知'}</span>
-                <span style="color:var(--muted);">${item.recordDate || item.timestamp.split(' ')[0]}</span>
+      const hasSelectedHistory = selectedHistoryAthleteKey && buckets.some(bucket => bucket.key === selectedHistoryAthleteKey);
+      const activeKey = hasSelectedHistory ? selectedHistoryAthleteKey : '';
+      selectedHistoryAthleteKey = activeKey;
+      const optionHtml = buckets.map(bucket => {
+        const first = bucket.items[0] || {};
+        const athlete = first.athlete || {};
+        const title = `${athlete.athlete_code || athlete.athlete_id || '未绑定'} · ${athlete.name || '未绑定运动员'}`;
+        const activeClass = bucket.key === activeKey ? ' active' : '';
+        return `<button type="button" class="history-athlete-option${activeClass}" data-key="${bucket.key}">${title}</button>`;
+      }).join('');
+      if (trigger) trigger.disabled = false;
+      if (menu) menu.innerHTML = optionHtml;
+
+      if (!activeKey) {
+        if (summary) summary.textContent = '请选择运动员';
+        if (triggerText) triggerText.textContent = '选择运动员';
+        container.classList.remove('is-hidden');
+        container.innerHTML = '<div class="history-empty-state">请选择运动员后查看历史记录</div>';
+        return;
+      }
+
+      const activeBucket = buckets.find(bucket => bucket.key === activeKey) || buckets[0];
+      const sortedItems = [...activeBucket.items].sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+      const first = sortedItems[0] || {};
+      const athlete = first.athlete || {};
+      const athleteSub = formatAthleteHistorySub(athlete);
+      if (triggerText) triggerText.textContent = `${athlete.athlete_code || athlete.athlete_id || '未绑定'} · ${athlete.name || '未绑定运动员'}`;
+      const dateGroups = buildHistoryDateGroups(sortedItems);
+      const hasSelectedDate = selectedHistoryDateKey && dateGroups.some(group => group.dateKey === selectedHistoryDateKey);
+      const activeDateKey = hasSelectedDate ? selectedHistoryDateKey : (dateGroups[0]?.dateKey || '');
+      selectedHistoryDateKey = activeDateKey;
+      const activeDateGroup = dateGroups.find(group => group.dateKey === activeDateKey) || dateGroups[0];
+
+      if (summary) summary.textContent = `${sortedItems.length} 条记录`;
+
+      container.innerHTML = `
+        <div class="history-athlete-header">
+          <div>
+            <div class="history-athlete-title">${athlete.athlete_code || athlete.athlete_id || '未绑定'} · ${athlete.name || '未绑定运动员'}</div>
+            <div class="history-athlete-sub">${athleteSub}</div>
+          </div>
+        </div>
+        <div class="history-layout">
+          <div class="history-calendar-panel">
+            <div class="history-calendar-head">
+              <div>
+                <div class="history-panel-title">训练日期</div>
+                <div class="history-panel-sub">按日期查看该运动员的分析记录</div>
               </div>
+              <span class="history-count-badge">${dateGroups.length} 天</span>
             </div>
-            <div style="font-size:0.7rem;color:var(--muted);opacity:0.6;">#${item.id.toString().slice(-4)}</div>
+            <div class="history-date-grid">
+              ${dateGroups.map(group => renderHistoryDateButton(group, activeDateKey)).join('')}
+            </div>
           </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;font-size:0.8rem;margin-bottom:1rem;color:var(--text); opacity: 0.9;">
-            <div>步频: <span style="font-family:monospace;color:#fff;">${s.step_frequency_hz ? (s.step_frequency_hz * 60).toFixed(1) : '--'}</span></div>
-            <div>步速: <span style="font-family:monospace;color:#fff;">${s.stride_velocity_mps ? s.stride_velocity_mps.toFixed(2) : '--'}</span></div>
-            <div>步幅: <span style="font-family:monospace;color:#fff;">${s.stride_length_m ? s.stride_length_m.toFixed(2) : '--'}</span></div>
-            <div>vGRF: <span style="font-family:monospace;color:#fff;">${s.vGRF_peak_BW ? s.vGRF_peak_BW.toFixed(2) : '--'}</span></div>
-          </div>
-          <div style="display:flex;gap:0.5rem;">
-            <button onclick="loadFromHistory(${item.id})" style="flex:1;padding:0.4rem;background:var(--green);color:white;border:none;border-radius:4px;font-size:0.8rem;cursor:pointer;font-weight:600;">查看详情</button>
-            <button onclick="deleteHistoryItem(${item.id})" style="padding:0.4rem 0.6rem;background:rgba(255,255,255,0.05);color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;"><svg style="width:14px;height:14px;pointer-events:none;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg></button>
+          <div class="history-day-panel">
+            ${renderHistoryDayPanel(activeDateGroup)}
           </div>
         </div>
       `;
-      }).join('');
+      container.classList.remove('is-hidden');
+    }
+
+    function formatAthleteHistorySub(athlete) {
+      const extra = athlete.extra || {};
+      const leg = extra.dominant_leg === 'right'
+        ? '右腿'
+        : (extra.dominant_leg === 'left' ? '左腿' : '惯用腿未填');
+      const parts = [
+        athlete.gender || '性别未填',
+        athlete.group_name || '未分组',
+        leg
+      ];
+      if (extra.personal_best_m) {
+        parts.push(`PB ${Number(extra.personal_best_m).toFixed(2)}m`);
+      }
+      return parts.join(' · ');
+    }
+
+    function formatHistoryAttemptTitle(item) {
+      return item.attemptNo || 'R001';
+    }
+
+    function formatHistoryRecordTime(item) {
+      const text = String(item.recordDate || item.timestamp || '');
+      const match = text.match(/(\d{2}):(\d{2})(?::(\d{2}))?/);
+      if (match) {
+        return `${match[1]}:${match[2]}${match[3] ? `:${match[3]}` : ''}`;
+      }
+      const filename = String(item.filename || '');
+      const fileMatch = filename.match(/20\d{6}_(\d{2})(\d{2})(\d{2})/);
+      if (fileMatch) {
+        return `${fileMatch[1]}:${fileMatch[2]}:${fileMatch[3]}`;
+      }
+      return '';
+    }
+
+    function formatHistoryRecordDateTime(item) {
+      const text = String(item.recordDate || item.timestamp || item.filename || '');
+      const fullMatch = text.match(/(20\d{2})[\/\-](\d{2})[\/\-](\d{2}).*?(\d{2}):(\d{2})(?::(\d{2}))?/);
+      if (fullMatch) {
+        return `${fullMatch[1]}-${fullMatch[2]}-${fullMatch[3]} ${fullMatch[4]}:${fullMatch[5]}:${fullMatch[6] || '00'}`;
+      }
+      const filename = String(item.filename || '');
+      const fileMatch = filename.match(/(20\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+      if (fileMatch) {
+        return `${fileMatch[1]}-${fileMatch[2]}-${fileMatch[3]} ${fileMatch[4]}:${fileMatch[5]}:${fileMatch[6]}`;
+      }
+      return formatHistoryRecordTime(item) || formatHistoryAttemptTitle(item);
+    }
+
+    function renderHistoryDateButton(group, activeDateKey) {
+      const meta = formatHistoryDateChip(group.dateKey === 'unknown' ? '' : group.dateKey);
+      const activeClass = group.dateKey === activeDateKey ? ' active' : '';
+      return `
+        <button type="button" class="history-date-btn${activeClass}" onclick="selectHistoryDate('${group.dateKey}')">
+          <div class="history-date-top">
+            <span class="history-date-month">${meta.month}</span>
+            <span class="history-date-count">${group.records.length} 跳</span>
+          </div>
+          <div class="history-date-day">${meta.day}</div>
+          <div class="history-date-weekday">${meta.weekday}</div>
+        </button>
+      `;
+    }
+
+    function renderHistoryDayPanel(group) {
+      if (!group) {
+        return '<div class="history-empty-state">暂无当日记录</div>';
+      }
+      return `
+        <div class="history-day-header">
+          <div>
+            <div class="history-day-title">${group.label}</div>
+            <div class="history-day-sub">共 ${group.records.length} 跳</div>
+          </div>
+          <span class="history-day-badge">${group.records.length} 跳</span>
+        </div>
+        <div class="history-athlete-records">${group.records.map(item => renderHistoryCard(item)).join('')}</div>
+      `;
+    }
+
+    function selectHistoryDate(dateKey) {
+      selectedHistoryDateKey = dateKey;
+      renderHistoryList();
+    }
+
+    function renderHistoryCard(item) {
+      const recordTime = formatHistoryRecordTime(item);
+      const hasContra = !!(item.fullData && item.fullData.contra_data);
+      const side = item.side || footSideFromId(extractDeviceId(item.filename || ''));
+      const leftPresent = hasContra || side === '左脚';
+      const rightPresent = hasContra || side === '右脚';
+      return `
+        <div class="history-attempt-row" onclick="loadFromHistory(${item.id})">
+          <div class="history-attempt-time">${recordTime || formatHistoryAttemptTitle(item)}</div>
+          <div class="history-attempt-side">${renderAttemptSideTag('左脚', leftPresent, true)}</div>
+          <div class="history-attempt-side">${renderAttemptSideTag('右脚', rightPresent, true)}</div>
+          <button class="history-delete-btn history-attempt-delete" onclick="event.stopPropagation(); deleteHistoryItem(${item.id})"><svg class="history-delete-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg></button>
+        </div>
+      `;
+    }
+
+    function selectedAttemptSidesFromHistory(item) {
+      const hasContra = !!(item && item.fullData && item.fullData.contra_data);
+      const side = item?.side || footSideFromId(extractDeviceId(item?.filename || ''));
+      return {
+        left: hasContra || side === '左脚',
+        right: hasContra || side === '右脚'
+      };
     }
 
     function loadFromHistory(id) {
       try {
-        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
+        const history = flattenHistory();
         const item = history.find(x => x.id === id);
         if (item) {
           updateUI(item.fullData);
-          // 从历史记录恢复设备 ID 和左脚/右脚显示
-          const did = extractDeviceId(item.filename || '');
-          document.getElementById('device-id-val').textContent = did || '未知';
-          document.getElementById('foot-side-val').textContent = item.side || footSideFromId(did);
-          fileNameEl.textContent = item.filename || '历史记录';
-          fileNameEl.classList.toggle('has-file', !!item.filename);
+          const recordTime = formatHistoryRecordDateTime(item);
+          const sides = selectedAttemptSidesFromHistory(item);
+          selectedFileSourceEl.style.display = 'none';
+          fileNameEl.textContent = recordTime;
+          fileNameEl.classList.add('has-file');
+          fileNameEl.classList.remove('is-empty');
+          dataPickerText.textContent = recordTime;
+          dataPickerText.classList.remove('is-empty');
+          selectedFilePanel.classList.remove('is-empty');
+          selectedFilePanel.classList.add('is-attempt');
+          if (selectedAttemptSidesEl) {
+            selectedAttemptSidesEl.innerHTML = `
+              ${renderAttemptSideTag('左脚', sides.left, true)}
+              ${renderAttemptSideTag('右脚', sides.right, true)}
+            `;
+          }
+          if (selectedDeviceInfoEl) selectedDeviceInfoEl.style.display = 'none';
           // 自动跳转到 RUN 视图查看结果
           const runTab = headerTabs.querySelector('span[data-view="main"]');
           if (runTab) runTab.click();
@@ -1903,11 +6082,16 @@
     document.getElementById('btn-modal-confirm').onclick = function () {
       console.log("DEBUG: Final Modal Confirm Clicked", modalActionType, modalTargetId);
       if (modalActionType === 'delete' && modalTargetId) {
-        let history = JSON.parse(localStorage.getItem('gait_history') || '[]');
-        history = history.filter(x => x.id !== modalTargetId);
-        localStorage.setItem('gait_history', JSON.stringify(history));
+        readHistoryBuckets().forEach(bucket => {
+          const history = bucket.items.filter(x => x.id !== modalTargetId);
+          if (history.length) {
+            localStorage.setItem(bucket.key, JSON.stringify(history));
+          } else {
+            localStorage.removeItem(bucket.key);
+          }
+        });
       } else if (modalActionType === 'clear') {
-        localStorage.removeItem('gait_history');
+        readHistoryBuckets().forEach(bucket => localStorage.removeItem(bucket.key));
       }
       renderHistoryList();
       closeModal();
@@ -1916,6 +6100,31 @@
     document.getElementById('btn-modal-cancel').onclick = function () {
       closeModal();
     };
+
+    document.getElementById('history-athlete-trigger').addEventListener('click', function () {
+      const selector = document.getElementById('history-athlete-select');
+      if (!selector || this.disabled) return;
+      selector.classList.toggle('is-open');
+      this.classList.toggle('is-open', selector.classList.contains('is-open'));
+    });
+
+    document.getElementById('history-athlete-menu').addEventListener('click', function (event) {
+      const option = event.target.closest('.history-athlete-option');
+      if (!option) return;
+      selectedHistoryAthleteKey = option.dataset.key || '';
+      selectedHistoryDateKey = '';
+      document.getElementById('history-athlete-select').classList.remove('is-open');
+      document.getElementById('history-athlete-trigger').classList.remove('is-open');
+      renderHistoryList();
+    });
+
+    document.addEventListener('click', function (event) {
+      const selector = document.getElementById('history-athlete-select');
+      if (!selector || selector.contains(event.target)) return;
+      selector.classList.remove('is-open');
+      const trigger = document.getElementById('history-athlete-trigger');
+      if (trigger) trigger.classList.remove('is-open');
+    });
 
     function deleteHistoryItem(id) {
       openConfirmModal('delete', id);
@@ -1928,7 +6137,7 @@
     // 存储全局信号数据
     window.labData = { signals: null, events: null };
 
-    const CHART_METRIC_KEYS = ['cadence', 'speed', 'stride_length', 'stride_time', 'contact', 'double_support', 'flight_time', 'swing', 'vgrf'];
+    const CHART_METRIC_KEYS = ['cadence', 'speed', 'stride_length', 'contact', 'flight_time', 'swing', 'vgrf'];
     // 各指标颜色：与下方列表圆点、图表折线一致
     const METRIC_COLORS = {
       cadence: '#22c55e',
@@ -1936,8 +6145,6 @@
       stride_length: '#06b6d4',
       contact: '#84cc16',
       swing: '#f97316',
-      stride_time: '#16a34a',
-      double_support: '#10b981',
       flight_time: '#f59e0b',
       vgrf: '#a855f7'
     };
@@ -1948,14 +6155,14 @@
         data: {
           labels: [],
           datasets: [{
-            label: '步频',
+            label: '步速',
             data: [],
-            borderColor: '#22c55e',
-            backgroundColor: 'rgba(34,197,94,0.15)',
-            pointBackgroundColor: '#22c55e',
-            pointBorderColor: '#22c55e',
-            pointHoverBackgroundColor: '#22c55e',
-            pointHoverBorderColor: '#22c55e',
+            borderColor: '#3b82f6',
+            backgroundColor: 'rgba(59,130,246,0.15)',
+            pointBackgroundColor: '#3b82f6',
+            pointBorderColor: '#3b82f6',
+            pointHoverBackgroundColor: '#3b82f6',
+            pointHoverBorderColor: '#3b82f6',
             fill: true,
             tension: 0.2,
             pointRadius: 2,
@@ -1978,7 +6185,7 @@
               display: true,
               grid: { color: 'rgba(255,255,255,0.06)' },
               ticks: { color: '#71717a' },
-              title: { display: true, text: '步频 (steps/min)', color: '#71717a' }
+              title: { display: true, text: '步速 (m/s)', color: '#71717a' }
             }
           },
           plugins: {
@@ -2029,18 +6236,6 @@
             unitLabel: '摆动时间 (s)',
             data: strides.map(s => s.swing_time_s != null ? s.swing_time_s : null),
           };
-        case 'stride_time':
-          return {
-            label: '步态周期时间',
-            unitLabel: '步态周期时间 (s)',
-            data: strides.map(s => s.stride_time_s != null ? s.stride_time_s : null),
-          };
-        case 'double_support':
-          return {
-            label: '双足支撑时间',
-            unitLabel: '双足支撑时间 (s)',
-            data: strides.map(s => s.double_support_time_s != null ? s.double_support_time_s : (s.double_support_time_ms != null ? s.double_support_time_ms / 1000 : null)),
-          };
         case 'flight_time':
           return {
             label: '腾空时间',
@@ -2049,8 +6244,8 @@
           };
         case 'vgrf':
           return {
-            label: 'vGRF 峰值',
-            unitLabel: 'vGRF 峰值 (BW)',
+            label: '峰值垂直地面反作用力',
+            unitLabel: '峰值垂直地面反作用力 (BW)',
             data: strides.map(s => s.vGRF_peak_BW != null ? s.vGRF_peak_BW : null),
           };
         case 'cadence':
@@ -2174,15 +6369,14 @@
       const valueEl = document.getElementById('summary-metric-value');
       const barEl = document.getElementById('summary-bar-metric');
       const color = METRIC_COLORS[currentMetricKey] || '#22c55e';
-      const [r, g, b] = [parseInt(color.slice(1, 3), 16), parseInt(color.slice(3, 5), 16), parseInt(color.slice(5, 7), 16)];
       if (barEl) {
-        barEl.style.background = `linear-gradient(90deg, rgba(${r},${g},${b},0.25) 0%, rgba(${r},${g},${b},0.08) 100%)`;
-        barEl.style.borderColor = `rgba(${r},${g},${b},0.35)`;
+        barEl.style.background = hexToRgba(color, 0.08);
+        barEl.style.borderColor = hexToRgba(color, 0.35);
         barEl.style.color = color;
       }
       if (!strides || !Array.isArray(strides) || strides.length === 0) {
-        labelEl.textContent = '步频 (平均)';
-        valueEl.textContent = '— steps/min';
+        labelEl.textContent = '步速 (平均)';
+        valueEl.textContent = '— m/s';
         return;
       }
       const series = buildSeries(strides);
@@ -2236,26 +6430,25 @@
       window.lastStrides = strides;
       window.lastTimeRange = data && data.timeRange ? data.timeRange : null;
 
-      const emptyIds = ['m-cadence', 'm-stride-time', 'm-contact-time', 'm-swing-time', 'm-stride-length', 'm-velocity', 'm-vgrf', 'm-double-support', 'm-flight-time', 'm-gait-status'];
+      const emptyIds = ['m-cadence', 'm-contact-time', 'm-swing-time', 'm-stride-length', 'm-velocity', 'm-vgrf', 'm-flight-time'];
       if (!summary) {
-        const takeoffHintEmpty = document.getElementById('lab-takeoff-hint');
-        if (takeoffHintEmpty) takeoffHintEmpty.textContent = '';
-        document.getElementById('summary-duration').textContent = '—';
-        document.getElementById('summary-metric-label').textContent = '步频 (平均)';
-        document.getElementById('summary-metric-value').textContent = '— steps/min';
+        const takeoffHintEmpty = document.getElementById('main-takeoff-hint');
+        if (takeoffHintEmpty) {
+          syncMainTakeoffHint();
+        }
+        document.getElementById('summary-metric-label').textContent = '步速 (平均)';
+        document.getElementById('summary-metric-value').textContent = '— m/s';
         emptyIds.forEach(id => {
           const el = document.getElementById(id);
           if (el) { el.textContent = '—'; el.classList.add('empty'); }
         });
-        document.getElementById('m-n-strides').textContent = '0';
-        document.getElementById('m-n-strides').classList.add('empty');
         document.getElementById('strides-tbody').innerHTML = '';
         if (chart) {
           chart.data.labels = [];
           chart.data.datasets[0].data = [];
           chart.update('none');
         }
-        currentMetricKey = 'cadence';
+        currentMetricKey = 'speed';
         document.querySelectorAll('.metric-row[data-metric]').forEach(row => {
           row.classList.remove('active-chart');
           row.style.borderColor = '';
@@ -2266,7 +6459,7 @@
         CHART_METRIC_KEYS.forEach(k => {
           const chip = document.getElementById(`metric-chip-${k.replace(/_/g, '-')}`);
           if (chip) {
-            chip.classList.toggle('active', k === 'cadence');
+            chip.classList.toggle('active', k === 'speed');
             chip.style.borderColor = '';
             chip.style.color = '';
             chip.style.background = '';
@@ -2277,14 +6470,9 @@
         updateRangeIndicator();
         return;
       }
-      const dur = summary.duration_s;
-      const m = dur != null ? Math.floor(dur / 60) : 0;
-      const s = dur != null ? Math.floor(dur % 60) : 0;
-      document.getElementById('summary-duration').textContent = m + ':' + (s < 10 ? '0' : '') + s;
       updateSummaryBar();
 
       setMetric('m-cadence', summary.step_frequency_hz != null ? summary.step_frequency_hz * 60 : null, 1);
-      setMetric('m-stride-time', summary.stride_time_s, 3);
       setMetric('m-contact-time', summary.contact_time_s, 3);
       setMetric('m-swing-time', summary.swing_time_s, 3);
       setMetric('m-stride-length', summary.stride_length_m, 3);
@@ -2298,25 +6486,16 @@
         vgrfEl.textContent = '—';
         vgrfEl.classList.add('empty');
       }
-      setMetric('m-double-support', summary.double_support_time_ms != null ? summary.double_support_time_ms / 1000 : null, 3);
       setMetric('m-flight-time', summary.flight_time_ms != null ? summary.flight_time_ms / 1000 : null, 3);
-      const statusEl = document.getElementById('m-gait-status');
-      if (statusEl) {
-        const v = summary.gait_status_last || summary.last_stride?.gait_status;
-        statusEl.textContent = v || '—';
-        statusEl.classList.toggle('empty', !v);
-      }
-      document.getElementById('m-n-strides').textContent = summary.n_strides != null ? summary.n_strides : '0';
-      document.getElementById('m-n-strides').classList.toggle('empty', !summary.n_strides);
-
-      const takeoffHint = document.getElementById('lab-takeoff-hint');
+      const takeoffHint = document.getElementById('main-takeoff-hint');
       if (takeoffHint) {
         if (summary.long_jump_takeoff_auto) {
           if (summary.long_jump_takeoff_auto_applied && summary.long_jump_takeoff_step > 0) {
             takeoffHint.textContent = '自动识别：第 ' + summary.long_jump_takeoff_step + ' 步为起跳';
             takeoffHint.style.color = 'var(--green)';
           } else {
-            takeoffHint.textContent = '自动识别未应用';
+            const reason = summary.long_jump_takeoff_auto_message;
+            takeoffHint.textContent = reason ? ('自动识别未应用：' + reason) : '自动识别未应用';
             takeoffHint.style.color = '#f59e0b';
           }
         } else if (summary.long_jump_takeoff_step > 0) {
@@ -2341,7 +6520,6 @@
       const tbody = document.getElementById('strides-tbody');
       tbody.innerHTML = (strides || []).map((row, i) => {
         const stepFreq = row.step_frequency_hz != null ? (row.step_frequency_hz * 60).toFixed(1) : '—';
-        const ds = row.double_support_time_s != null ? row.double_support_time_s.toFixed(3) : (row.double_support_time_ms != null ? (row.double_support_time_ms / 1000).toFixed(3) : '—');
         const fl = row.flight_time_s != null ? row.flight_time_s.toFixed(3) : (row.flight_time_ms != null ? (row.flight_time_ms / 1000).toFixed(3) : '—');
         const status = row.gait_status || '—';
         const statusClass = status === 'walk' ? 'walk' : status === 'run' ? 'run' : '';
@@ -2352,9 +6530,7 @@
           <td>${fmt(row.stride_velocity_mps, 3)}</td>
           <td>${fmt(row.stride_length_m, 3)}</td>
           <td>${stepFreq}</td>
-          <td>${fmt(row.stride_time_s, 3)}</td>
           <td>${fmt(row.contact_time_s, 3)}</td>
-          <td>${ds}</td>
           <td>${fl}</td>
           <td>${fmt(row.swing_time_s, 3)}</td>
           <td>${fmt(row.vGRF_peak_BW, 2)}</td>
@@ -2371,7 +6547,7 @@
         labEndEl.setAttribute('title', '留空则使用全长 ' + summary.duration_s.toFixed(1) + ' s');
       }
 
-      if (document.getElementById('view-lab').classList.contains('active')) {
+      if (document.getElementById('view-splits').classList.contains('active')) {
         renderLabCharts();
       }
     }
@@ -2422,6 +6598,7 @@
     }
     function updateSplitsChart() {
       const strides = window.lastStrides;
+      const splitsGraphWrap = document.querySelector('#view-splits .splits-graph-wrap');
       // 强制销毁旧图表以彻底清除残留状态（解决颜色切换不彻底问题）
       if (chartSplits) {
         chartSplits.destroy();
@@ -2429,6 +6606,7 @@
       }
 
       if (!strides || !Array.isArray(strides) || strides.length === 0) {
+        if (splitsGraphWrap) splitsGraphWrap.classList.add('is-empty');
         document.getElementById('splits-min').textContent = '—';
         document.getElementById('splits-q1').textContent = '—';
         document.getElementById('splits-median').textContent = '—';
@@ -2436,6 +6614,7 @@
         document.getElementById('splits-max').textContent = '—';
         return;
       }
+      if (splitsGraphWrap) splitsGraphWrap.classList.remove('is-empty');
 
       const series = buildSeries(strides);
       const data = series.data;
@@ -2555,15 +6734,19 @@
     // LAB 绘图逻辑
 
     function renderLabCharts() {
+      const labGrid = document.querySelector('#view-splits .lab-grid');
       if (!window.labData || !window.labData.signals) {
+        if (labGrid) labGrid.classList.add('is-empty');
         console.warn('LAB 数据未准备好');
         return;
       }
       const sig = window.labData.signals;
       if (!sig.timestamps || !sig.gyro_y) {
+        if (labGrid) labGrid.classList.add('is-empty');
         console.error('信号数据不完整');
         return;
       }
+      if (labGrid) labGrid.classList.remove('is-empty');
       const eve = window.labData.events;
       const ts = sig.timestamps.map(t => (t / 1000).toFixed(3));
 

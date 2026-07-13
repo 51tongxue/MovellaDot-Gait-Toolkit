@@ -1,0 +1,77 @@
+{
+  "schema_version": "longjump-data-manifest/v1",
+  "system": {
+    "system_code": "imu",
+    "system_name": "IMU系统"
+  },
+  "session": {
+    "session_code": "S20260531-AM",
+    "training_date": "2026-05-31",
+    "venue": "国家训练中心"
+  },
+  "records": [
+    {
+      "record_id": "imu_20260531_100832_ath-001_R001_raw",
+      "athlete_id": "ath-001",
+      "attempt_no": "R001",
+      "athlete_attempt_no": 1,
+      "captured_at": "2026-05-31T10:08:32+08:00",
+      "data_type": "imu_raw_timeseries",
+      "data_class": "type_1_csv",
+      "device_code": "D422CD007E6E",
+      "file": {
+        "file_name": "20260531_100832_imu_raw_ath-001_R001.csv",
+        "uri": "https://data-server/imu/20260531_100832_imu_raw_ath-001_R001.csv",
+        "format": "csv"
+      }
+    },
+    {
+      "record_id": "imu_20260531_100832_ath-001_R001_gait_L",
+      "athlete_id": "ath-001",
+      "attempt_no": "R001",
+      "athlete_attempt_no": 1,
+      "captured_at": "2026-05-31T10:08:32+08:00",
+      "data_type": "gait_metrics_left",
+      "data_class": "type_2_json",
+      "side": "L",
+      "metrics": [
+        {
+          "to_timestamp": 11316,
+          "average_velocity_mps": 4.1,
+          "stride_length_m": 2.36,
+          "step_frequency_spm": 208.7,
+          "stride_time_s": 0.575,
+          "contact_time_s": 0.192,
+          "double_support_time_s": 0,
+          "flight_time_s": 0.0955,
+          "swing_time_s": 0.383,
+          "vgrf_peak_bw": 2.35
+        }
+      ]
+    },
+    {
+      "record_id": "imu_20260531_100832_ath-001_R001_gait_R",
+      "athlete_id": "ath-001",
+      "attempt_no": "R001",
+      "athlete_attempt_no": 1,
+      "captured_at": "2026-05-31T10:08:32+08:00",
+      "data_type": "gait_metrics_right",
+      "data_class": "type_2_json",
+      "side": "R",
+      "metrics": [
+        {
+          "to_timestamp": 11516,
+          "average_velocity_mps": 4.8,
+          "stride_length_m": 2.44,
+          "step_frequency_spm": 236.22,
+          "stride_time_s": 0.508,
+          "contact_time_s": 0.15,
+          "double_support_time_s": 0,
+          "flight_time_s": 0.104,
+          "swing_time_s": 0.358,
+          "vgrf_peak_bw": 2.66
+        }
+      ]
+    }
+  ]
+}

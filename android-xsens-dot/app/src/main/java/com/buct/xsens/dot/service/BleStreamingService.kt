@@ -10,7 +10,6 @@ import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import com.buct.xsens.dot.MainActivity
 import com.buct.xsens.dot.R
 
 class BleStreamingService : Service() {
@@ -53,7 +52,7 @@ class BleStreamingService : Service() {
     private fun buildNotification(text: String): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this, 0,
-            Intent(this, MainActivity::class.java),
+            packageManager.getLaunchIntentForPackage(packageName) ?: Intent(),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)

@@ -9,7 +9,8 @@ import java.io.File
 
 class GaitAnalysisManager(private val context: Context) {
 
-    init {
+    @Synchronized
+    fun warmUp() {
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(context))
         }
@@ -77,6 +78,7 @@ class GaitAnalysisManager(private val context: Context) {
                 "takeoffStep: $takeoffStep, isTakeoffFoot: $isTakeoffFoot, isTripleJump: $isTripleJump",
         )
         return try {
+            warmUp()
             val py = Python.getInstance()
             val module = py.getModule("gait_analyzer")
             val result = module.callAttr(

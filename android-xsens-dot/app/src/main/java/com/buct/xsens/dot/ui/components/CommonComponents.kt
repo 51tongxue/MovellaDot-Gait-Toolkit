@@ -8,6 +8,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.buct.xsens.dot.ui.theme.*
 
@@ -26,7 +27,7 @@ fun Panel(
     ) {
         Text(
             text = title,
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.labelLarge,
             color = Muted
         )
         Spacer(modifier = Modifier.height(12.dp))
@@ -47,15 +48,16 @@ fun Badge(
         BadgeType.Info -> Accent
     }
     Surface(
-        modifier = modifier.border(1.dp, Border, RoundedCornerShape(6.dp)),
-        shape = RoundedCornerShape(6.dp),
+        modifier = modifier.border(1.dp, Border, RoundedCornerShape(999.dp)),
+        shape = RoundedCornerShape(999.dp),
         color = Surface
     ) {
         Text(
             text = text,
             color = color,
             style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
         )
     }
 }
@@ -69,14 +71,21 @@ fun PrimaryButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
+    val controlShape = RoundedCornerShape(8.dp)
     Button(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.heightIn(min = 42.dp),
         enabled = enabled,
-        colors = ButtonDefaults.buttonColors(containerColor = Accent),
-        shape = RoundedCornerShape(6.dp)
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Accent,
+            contentColor = Color.White,
+            disabledContainerColor = Accent.copy(alpha = 0.42f),
+            disabledContentColor = Color.White.copy(alpha = 0.72f)
+        ),
+        shape = controlShape,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
     ) {
-        Text(text)
+        Text(text = text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -87,14 +96,21 @@ fun SuccessButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
+    val controlShape = RoundedCornerShape(8.dp)
     Button(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.heightIn(min = 42.dp),
         enabled = enabled,
-        colors = ButtonDefaults.buttonColors(containerColor = Green),
-        shape = RoundedCornerShape(6.dp)
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Green,
+            contentColor = Color.White,
+            disabledContainerColor = Green.copy(alpha = 0.42f),
+            disabledContentColor = Color.White.copy(alpha = 0.72f)
+        ),
+        shape = controlShape,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
     ) {
-        Text(text)
+        Text(text = text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -105,14 +121,21 @@ fun DangerButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
+    val controlShape = RoundedCornerShape(8.dp)
     Button(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.heightIn(min = 42.dp),
         enabled = enabled,
-        colors = ButtonDefaults.buttonColors(containerColor = Red),
-        shape = RoundedCornerShape(6.dp)
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Red,
+            contentColor = Color.White,
+            disabledContainerColor = Red.copy(alpha = 0.42f),
+            disabledContentColor = Color.White.copy(alpha = 0.72f)
+        ),
+        shape = controlShape,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
     ) {
-        Text(text)
+        Text(text = text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -123,13 +146,23 @@ fun NeutralButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
+    val controlShape = RoundedCornerShape(8.dp)
     OutlinedButton(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.heightIn(min = 42.dp),
         enabled = enabled,
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = Text),
-        shape = RoundedCornerShape(6.dp)
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = Surface,
+            contentColor = Text,
+            disabledContainerColor = Surface.copy(alpha = 0.42f),
+            disabledContentColor = Text.copy(alpha = 0.55f)
+        ),
+        border = ButtonDefaults.outlinedButtonBorder.copy(
+            brush = androidx.compose.ui.graphics.SolidColor(Border)
+        ),
+        shape = controlShape,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
     ) {
-        Text(text)
+        Text(text = text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium)
     }
 }
