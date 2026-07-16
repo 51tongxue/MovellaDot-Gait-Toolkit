@@ -1,5 +1,6 @@
 package com.buct.xsens.gait.analysis
 
+import com.buct.xsens.dot.data.LongJumpDeviceRoles
 import com.buct.xsens.gait.data.AnalysisRecordEntity
 import com.buct.xsens.gait.data.AthleteEntity
 import org.json.JSONArray
@@ -75,6 +76,7 @@ data class CapturedAttempt(
     val capturedAt: Date,
     val leftPath: String?,
     val rightPath: String?,
+    val athleteId: String? = null,
 ) {
     val dateKey: String
         get() = DATE_FORMAT.format(capturedAt)
@@ -180,6 +182,16 @@ data class AnalysisHistoryItem(
             val mainFile = File(entity.sourceFilePath)
             val directory = mainFile.parentFile
             val stamp = captureStamp(mainFile.name)
+            val metadata = readCsvMetadata(mainFile)
+            val sourceDeviceId = extractDeviceId(mainFile.name)
+            val configuredParticipant = sourceDeviceId
+                ?.let(LongJumpDeviceRoles::participantForDevice)
+            val leftDeviceId = metadata["left_device_id"]
+                ?.takeIf(String::isNotBlank)
+                ?: configuredParticipant?.leftDeviceId
+            val rightDeviceId = metadata["right_device_id"]
+                ?.takeIf(String::isNotBlank)
+                ?: configuredParticipant?.rightDeviceId
             val relatedNames = directory
                 ?.listFiles { file -> file.isFile && file.name.endsWith(".csv", ignoreCase = true) }
                 ?.filter { captureStamp(it.name) == stamp }
@@ -196,10 +208,38 @@ data class AnalysisHistoryItem(
                 trainingDate = entity.trainingDate,
                 createdAt = entity.createdAt,
                 capturedAt = parseCaptureDate(mainFile.name),
-                hasLeft = allNames.any { it.contains("D422CD007E6E") },
-                hasRight = allNames.any { it.contains("D422CD00937F") },
+                hasLeft = leftDeviceId != null && allNames.any { it.contains(leftDeviceId) },
+                hasRight = rightDeviceId != null && allNames.any { it.contains(rightDeviceId) },
                 mode = AnalysisMode.fromCode(entity.analysisMode),
             )
+        }
+
+        private fun extractDeviceId(name: String): String? {
+            Regex("DOT_([0-9A-Fa-f]{12})").find(name)?.let {
+                return it.groupValues[1].uppercase(Locale.US)
+            }
+            Regex("^([0-9A-Fa-f]{12})_20\\d{6}").find(name)?.let {
+                return it.groupValues[1].uppercase(Locale.US)
+            }
+            return null
+        }
+
+        private fun readCsvMetadata(file: File): Map<String, String> {
+            if (!file.isFile) return emptyMap()
+            val metadata = linkedMapOf<String, String>()
+            runCatching {
+                file.useLines(Charsets.UTF_8) { lines ->
+                    lines.take(40).forEach { line ->
+                        val columns = line.split(',')
+                        if (columns.any { it.trim() == "PacketCounter" }) return@useLines
+                        if (columns.size >= 2 && columns[0].isNotBlank()) {
+                            metadata[columns[0].trim().lowercase(Locale.US)] =
+                                columns.drop(1).joinToString(",").trim()
+                        }
+                    }
+                }
+            }
+            return metadata
         }
     }
 }
@@ -242,7 +282,12 @@ data class AnalysisUiState(
         get() = athletes.firstOrNull { it.id == selectedAthleteId }
 
     val selectedAttempt: CapturedAttempt?
-        get() = attempts.firstOrNull { it.key == selectedAttemptKey }
+        get() = availableAttempts.firstOrNull { it.key == selectedAttemptKey }
+
+    val availableAttempts: List<CapturedAttempt>
+        get() = attempts.filter { attempt ->
+            attempt.athleteId == null || attempt.athleteId == selectedAthleteId
+        }
 
     val canAnalyze: Boolean
         get() = selectedAthlete != null && selectedAttempt != null && !isAnalyzing

@@ -44,8 +44,11 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -60,6 +63,7 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.buct.xsens.dot.R
+import com.buct.xsens.dot.data.CaptureAthleteOption
 import com.buct.xsens.dot.ui.screens.MainScreen
 import com.buct.xsens.dot.ui.theme.Accent
 import com.buct.xsens.dot.ui.theme.Bg
@@ -70,7 +74,13 @@ import com.buct.xsens.dot.ui.theme.Muted
 import com.buct.xsens.dot.ui.theme.Surface as AppSurfaceColor
 import com.buct.xsens.dot.ui.theme.XsensDotTheme
 import com.buct.xsens.dot.viewmodel.CollectionViewModel
+import com.buct.xsens.gait.data.GaitDataRepository
+import com.buct.xsens.gait.data.AthleteEntity
 import com.buct.xsens.gait.ui.screens.NativeAnalysisScreen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
 
@@ -104,7 +114,7 @@ class MainActivity : ComponentActivity() {
             android.app.AlertDialog.Builder(this)
                 .setTitle("需要文件访问权限")
                 .setMessage(
-                    "运动步态分析系统需要「所有文件访问权限」，以便保存采集文件并直接读取 offline_export / data_logging。\n\n请在设置页面中开启该权限后返回。"
+                    "步态分析系统需要「所有文件访问权限」，以便保存采集文件并直接读取 offline_export / data_logging。\n\n请在设置页面中开启该权限后返回。"
                 )
                 .setPositiveButton("前往设置") { _, _ ->
                     val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
@@ -144,6 +154,17 @@ private enum class WorkspaceTab {
 private fun UnifiedWorkbenchScreen() {
     var selectedTab by rememberSaveable { mutableStateOf(WorkspaceTab.Capture) }
     val captureViewModel: CollectionViewModel = viewModel()
+    val repository = remember { GaitDataRepository(captureViewModel.getApplication()) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == WorkspaceTab.Capture) {
+            val athletes = withContext(Dispatchers.IO) {
+                repository.listAthletes().map(AthleteEntity::toCaptureAthleteOption)
+            }
+            captureViewModel.setAvailableAthletes(athletes)
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -170,6 +191,22 @@ private fun UnifiedWorkbenchScreen() {
                         MainScreen(
                             viewModel = captureViewModel,
                             showBrandHeader = false,
+                            onSaveAthlete = { athlete, targetSlotId ->
+                                scope.launch {
+                                    val athletes = withContext(Dispatchers.IO) {
+                                        repository.saveAthlete(athlete.toAthleteEntity())
+                                        repository.listAthletes()
+                                            .map(AthleteEntity::toCaptureAthleteOption)
+                                    }
+                                    captureViewModel.setAvailableAthletes(athletes)
+                                    targetSlotId?.let { slotId ->
+                                        captureViewModel.selectParticipantAthlete(
+                                            slotId = slotId,
+                                            athleteId = athlete.athleteId,
+                                        )
+                                    }
+                                }
+                            },
                             modifier = Modifier
                                 .fillMaxSize()
                                 .verticalScroll(rememberScrollState())
@@ -218,6 +255,38 @@ private fun UnifiedWorkbenchScreen() {
             }
         }
     }
+}
+
+private fun AthleteEntity.toCaptureAthleteOption(): CaptureAthleteOption {
+    val extraObject = runCatching { JSONObject(extra) }.getOrElse { JSONObject() }
+    return CaptureAthleteOption(
+        athleteId = athleteId,
+        athleteName = name,
+        athleteCode = athleteCode,
+        gender = gender,
+        birthDate = birthDate,
+        heightCm = heightCm,
+        weightKg = weightKg,
+        groupName = groupName,
+        dominantLeg = extraObject.optString("dominant_leg", "left"),
+        extraJson = extra,
+    )
+}
+
+private fun CaptureAthleteOption.toAthleteEntity(): AthleteEntity {
+    val extraObject = runCatching { JSONObject(extraJson) }.getOrElse { JSONObject() }
+    extraObject.put("dominant_leg", dominantLeg)
+    return AthleteEntity(
+        athleteId = athleteId.ifBlank { "ath-local-${System.currentTimeMillis()}" },
+        athleteCode = athleteCode.ifBlank { athleteId.ifBlank { "LOCAL" } },
+        name = athleteName.trim(),
+        gender = gender.trim(),
+        birthDate = birthDate.trim(),
+        heightCm = heightCm,
+        weightKg = weightKg,
+        groupName = groupName.trim(),
+        extra = extraObject.toString(),
+    )
 }
 
 @Composable

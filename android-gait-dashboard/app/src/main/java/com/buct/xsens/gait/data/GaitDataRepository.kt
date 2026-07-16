@@ -235,13 +235,13 @@ class GaitDataRepository(context: Context) {
             val recordModeSuffix = if (analysisMode == "long_jump") "" else "_${analysisMode}"
             sourceFilePaths.forEach { rawPath ->
                 val rawName = rawPath.substringAfterLast('/').ifBlank { "uploaded.csv" }
-                val rawSide = if (sourceFilePaths.size > 1) inferSide(rawName) else null
+                val rawSide = if (sourceFilePaths.size > 1) inferSide(rawPath) else null
                 records.put(buildRawRecord(capturedStamp, athlete, attemptNo, attemptIndex, capturedAt, rawName, rawPath, analysisWindow, rawSide, recordModeSuffix))
             }
 
             val gaitRecords = mutableListOf<Pair<String, JSONObject>>()
             val mainSide = analysis.optJSONObject("contra_data")?.optString("side_main")?.ifBlank { null }
-                ?: inferSide(sourceName)
+                ?: inferSide(sourceFilePath)
             gaitRecords += mainSide to buildGaitRecord(capturedStamp, athlete, attemptNo, attemptIndex, capturedAt, mainSide, analysis.optJSONArray("strides"), analysisWindow, timestampAnchor, recordModeSuffix, analysisMode)
 
             val contra = analysis.optJSONObject("contra_data")
@@ -745,7 +745,10 @@ class GaitDataRepository(context: Context) {
     }
 
     private fun inferSide(name: String): String =
-        LongJumpDeviceRoles.sideCode(extractDeviceCode(name) ?: name)
+        readCsvMetadata(name)["foot_side"]
+            ?.uppercase(Locale.US)
+            ?.takeIf { it == "L" || it == "R" }
+            ?: LongJumpDeviceRoles.sideCode(extractDeviceCode(name) ?: name)
             ?: when {
                 name.contains("_L_", ignoreCase = true) || name.contains("LEFT", ignoreCase = true) -> "L"
                 name.contains("_R_", ignoreCase = true) || name.contains("RIGHT", ignoreCase = true) -> "R"

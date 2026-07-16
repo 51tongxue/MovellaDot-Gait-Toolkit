@@ -2,6 +2,7 @@ package com.buct.xsens.dot
 
 import android.app.Application
 import android.util.Log
+import com.buct.xsens.dot.data.DeviceRolePreferences
 import com.xsens.dot.android.sdk.DotSdk
 
 /**
@@ -13,6 +14,7 @@ class XsensDotApp : Application() {
         super.onCreate()
         DotSdk.setDebugEnabled(true)
         DotSdk.setReconnectEnabled(true)
+        DeviceRolePreferences(this).load()
         Log.i(TAG, "DotSdk initialized (Movella DOT SDK v2025.1.1)")
     }
 

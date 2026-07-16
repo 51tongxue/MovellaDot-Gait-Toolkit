@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">运动步态分析系统</string>
+    <string name="app_name">步态分析系统</string>
     <string name="app_org_name">北京体育大学体育工程学院</string>
-    <string name="app_product_name">运动步态分析系统</string>
+    <string name="app_product_name">步态分析系统</string>
     <string name="nav_capture">采集</string>
     <string name="nav_analysis">分析</string>
 </resources>

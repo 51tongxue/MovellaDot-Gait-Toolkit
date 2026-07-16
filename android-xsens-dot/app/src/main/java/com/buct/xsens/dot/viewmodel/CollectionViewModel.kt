@@ -5,21 +5,31 @@ import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.buct.xsens.dot.data.CaptureAthleteOption
+import com.buct.xsens.dot.data.CaptureParticipantBinding
 import com.buct.xsens.dot.data.CsvRecorder
+import com.buct.xsens.dot.data.DeviceRoleConfig
+import com.buct.xsens.dot.data.DeviceRolePreferences
 import com.buct.xsens.dot.data.LongJumpDeviceRoles
 import com.buct.xsens.dot.data.ScannedDevice
 import com.buct.xsens.dot.data.SensorData
 import com.buct.xsens.dot.engine.CollectionEngine
 import com.buct.xsens.dot.engine.FlashRecordingPhase
 import com.buct.xsens.dot.engine.RecordingEngine
+import com.buct.xsens.dot.engine.participantHasActiveRecordingOperation
+import com.buct.xsens.dot.engine.shouldSetupRecordingManagerAfterConnection
 import com.buct.xsens.dot.service.BleStreamingService
+import com.xsens.dot.android.sdk.models.DotDevice
+import com.xsens.dot.android.sdk.models.DotRecordingState
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,12 +40,22 @@ import java.util.concurrent.ConcurrentHashMap
 
 class CollectionViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val deviceRolePreferences = DeviceRolePreferences(application)
+    private val _deviceRoleConfig = MutableStateFlow(deviceRolePreferences.load())
+    val deviceRoleConfig: StateFlow<DeviceRoleConfig> = _deviceRoleConfig.asStateFlow()
+    private val _availableAthletes = MutableStateFlow<List<CaptureAthleteOption>>(emptyList())
+    val availableAthletes: StateFlow<List<CaptureAthleteOption>> = _availableAthletes.asStateFlow()
+
     private val engine = CollectionEngine(application)
     private val recEngine = RecordingEngine(application)
 
     val scannedDevices: StateFlow<List<ScannedDevice>> = engine.scannedDevices
     val isScanning: StateFlow<Boolean> = engine.isScanning
     val connectedDevices: StateFlow<List<String>> = engine.connectedDevices
+    val manuallyDisconnectedAddresses: StateFlow<Set<String>> =
+        engine.manuallyDisconnectedAddresses
+    val connectionTargetAddresses: StateFlow<Set<String>> =
+        engine.connectionTargetAddresses
     val state: StateFlow<CollectionEngine.CollectionState> = engine.state
     val recvCount: StateFlow<Long> = engine.recvCount
     val sensorData: StateFlow<Map<String, SensorData>> = engine.sensorData
@@ -44,6 +64,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     val isSynced: StateFlow<Boolean> = engine.isSynced
     val isSyncing: StateFlow<Boolean> = engine.isSyncing
     val syncProgress: StateFlow<Int> = engine.syncProgress
+    val syncTargetAddresses: StateFlow<Set<String>> = engine.syncTargetAddresses
     val needsSync: StateFlow<Boolean> = engine.needsSync
     val batteryStatus = engine.batteryStatus
     val deviceRssi = engine.deviceRssi
@@ -76,13 +97,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     val recNotifReady      = recEngine.notificationReady
     val recRecordingActive = recEngine.recordingActive
     val recRecordingPhase  = recEngine.recordingPhase
+    val recDeviceRecordingPhases = recEngine.deviceRecordingPhases
+    val recDelayedStopConfirmations = recEngine.delayedStopConfirmations
     val recRecordingStates = recEngine.recordingStates
     val recFileList        = recEngine.fileList
     val recExportProgress  = recEngine.exportProgress
     val recExportDone      = recEngine.exportDone
     val recExportTaskProgress = recEngine.exportTaskProgress
-    val recPendingRecordingExportKeys = recEngine.pendingRecordingExportKeys
-    val recPreparingRecordingExport = recEngine.preparingRecordingExport
+    val recRecordingExportDecisions = recEngine.recordingExportDecisions
     val recEraseTaskProgress = recEngine.eraseTaskProgress
     val recLog             = recEngine.recordingLog
     val recSelectedExportIds = recEngine.selectedExportIds
@@ -119,13 +141,35 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     private val _selectedFileKeys = MutableStateFlow<Set<String>>(emptySet())
     val selectedFileKeys: StateFlow<Set<String>> = _selectedFileKeys.asStateFlow()
 
+    private fun fileDeviceReady(address: String): Boolean {
+        val norm = LongJumpDeviceRoles.normalizeDeviceId(address)
+        val connected = engine.connectedDevices.value
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        val phase = recEngine.deviceRecordingPhases.value[norm]
+        return norm in connected &&
+            phase !in setOf(
+                FlashRecordingPhase.Starting,
+                FlashRecordingPhase.Recording,
+                FlashRecordingPhase.Stopping,
+            )
+    }
+
+    private fun eligibleFileKeys(): Set<String> =
+        recEngine.fileList.value
+            .filterKeys(::fileDeviceReady)
+            .flatMap { (addr, files) -> files.map { file -> "$addr-${file.fileId}" } }
+            .toSet()
+
     fun toggleFileSelection(addr: String, fileId: Int) {
+        if (!fileDeviceReady(addr)) return
         val key = "$addr-$fileId"
         _selectedFileKeys.update { if (key in it) it - key else it + key }
     }
 
     /** 切换某台设备下所有文件的选中状态（全选/全不选） */
     fun toggleDeviceSelection(addr: String) {
+        if (!fileDeviceReady(addr)) return
         val deviceKeys = recEngine.fileList.value[addr]
             ?.map { f -> "$addr-${f.fileId}" }?.toSet() ?: return
         _selectedFileKeys.update { current ->
@@ -135,26 +179,36 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun selectAllFiles() {
-        _selectedFileKeys.value = recEngine.fileList.value
-            .flatMap { (addr, files) -> files.map { f -> "$addr-${f.fileId}" } }
-            .toSet()
+        _selectedFileKeys.value = eligibleFileKeys()
     }
 
     fun clearFileSelection() { _selectedFileKeys.value = emptySet() }
 
     fun exportFiles() {
-        val sel = _selectedFileKeys.value
-        if (sel.isEmpty()) recEngine.exportAll() else recEngine.exportSelected(sel)
+        val eligible = eligibleFileKeys()
+        val selected = _selectedFileKeys.value.intersect(eligible)
+        val targets = selected.ifEmpty { eligible }
+        if (targets.isEmpty()) {
+            Toast.makeText(
+                getApplication(),
+                "没有可导出的已连接设备文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        _selectedFileKeys.value = selected
+        recEngine.exportSelected(targets)
     }
 
-    fun exportLatestRecording() {
+    fun retryFailedExports() = recEngine.retryFailedExports()
+
+    fun exportRecordingDecision(decisionId: String) {
         clearFileSelection()
-        recEngine.exportLatestRecording()
+        recEngine.exportRecordingDecision(decisionId)
     }
 
-    fun dismissLatestRecordingExport() {
-        clearFileSelection()
-        recEngine.dismissLatestRecordingExport()
+    fun dismissRecordingExportDecision(decisionId: String) {
+        recEngine.dismissRecordingExportDecision(decisionId)
     }
 
     private val _inRecordingMode = MutableStateFlow(false)
@@ -169,7 +223,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     private val _capturePreparePending = MutableStateFlow(false)
     private val _captureWorkflowPreparing = MutableStateFlow(false)
     val captureWorkflowPreparing: StateFlow<Boolean> = _captureWorkflowPreparing.asStateFlow()
+    private val _participantPreparingSlots = MutableStateFlow<Set<String>>(emptySet())
+    val participantPreparingSlots: StateFlow<Set<String>> =
+        _participantPreparingSlots.asStateFlow()
     private var capturePreflightGeneration = 0
+    private var participantConnectGeneration = 0
+    private var participantSyncJob: Job? = null
+    private var participantSyncSlotId: String? = null
+    private val participantStopJobs = ConcurrentHashMap<String, Job>()
 
     private val recordChannel = Channel<Pair<Int, SensorData>>(Channel.UNLIMITED)
     private val recorders = ConcurrentHashMap<Int, CsvRecorder>()
@@ -193,13 +254,62 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         viewModelScope.launch {
-            scannedDevices.collect { devices ->
-                val targetIndices = devices
+            combine(scannedDevices, deviceRoleConfig) { devices, config ->
+                val targetIds = config.targetDeviceIds
+                devices
                     .mapIndexedNotNull { index, device ->
-                        if (LongJumpDeviceRoles.isTargetDevice(device.address)) index else null
+                        val deviceId = LongJumpDeviceRoles.normalizeDeviceId(device.address)
+                        if (deviceId in targetIds) index else null
                     }
                     .toSet()
+            }.collect { targetIndices ->
                 _selectedForConnect.value = targetIndices
+            }
+        }
+        viewModelScope.launch {
+            var setupAddresses = emptySet<String>()
+            connectedDevices.collect { addresses ->
+                val connected = addresses
+                    .map(LongJumpDeviceRoles::normalizeDeviceId)
+                    .toSet()
+                val newlyConnected = connected - setupAddresses
+                setupAddresses = connected
+                if (newlyConnected.isEmpty()) return@collect
+                val isSyncReconnect = isSyncing.value ||
+                    newlyConnected.any { it in syncTargetAddresses.value }
+                var attempts = 0
+                while (
+                    attempts < 40 &&
+                    newlyConnected.any { !engine.isDeviceInitialized(it) }
+                ) {
+                    delay(250)
+                    attempts++
+                }
+                val devices = engine.getDevices().filter { device ->
+                    val normalized = device.address
+                        ?.let(LongJumpDeviceRoles::normalizeDeviceId)
+                        ?: return@filter false
+                    normalized in newlyConnected &&
+                        engine.isDeviceInitialized(normalized) &&
+                        device.connectionState == DotDevice.CONN_STATE_CONNECTED
+                }
+                if (
+                    devices.isNotEmpty() &&
+                    shouldSetupRecordingManagerAfterConnection(
+                        isSyncing = isSyncReconnect || isSyncing.value,
+                        newlyConnectedAddresses = newlyConnected,
+                        syncTargetAddresses = syncTargetAddresses.value,
+                    )
+                ) {
+                    recEngine.ensureSetup(devices)
+                }
+            }
+        }
+        viewModelScope.launch {
+            recEngine.recordingActive.collect { active ->
+                if (active) {
+                    _inRecordingMode.value = true
+                }
             }
         }
 
@@ -214,6 +324,13 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         // 数据回调在 BLE 工作线程调用（与官方示例一致），trySend 对 Channel.UNLIMITED 线程安全
         engine.setOnDataCallback { id, data ->
             if (_isRecording.value) recordChannel.trySend(id to data)
+        }
+        engine.isFlashRecordingDevice = { normalizedAddress ->
+            recEngine.deviceRecordingPhases.value[normalizedAddress] in setOf(
+                FlashRecordingPhase.Starting,
+                FlashRecordingPhase.Recording,
+                FlashRecordingPhase.Stopping,
+            )
         }
         // 设备断线重连回调：若当前在离线采集模式，恢复录制通知
         // onDotInitDone 重连分支已用 syncOutputRate 恢复采样率，无需再次调用 applyOfflineModeSettings
@@ -231,12 +348,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
                     }
                     FlashRecordingPhase.Idle -> {
                         engine.setRecordingState(false)
-                        if (_inRecordingMode.value &&
-                            !isSynced.value &&
+                        if (
+                            _inRecordingMode.value &&
                             previous in setOf(FlashRecordingPhase.Starting, FlashRecordingPhase.Stopping)
                         ) {
                             engine.stopMeasuring()
-                            recEngine.requestFlashInfo()
+                            if (!isSynced.value) {
+                                recEngine.requestFlashInfo()
+                            }
                         }
                     }
                     else -> Unit
@@ -245,39 +364,15 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             }
         }
         viewModelScope.launch {
-            var exportActive = false
+            var exportTargets = emptySet<String>()
             recEngine.exportTaskProgress.collect { task ->
-                val pending = task.hasPendingFiles
-                if (pending != exportActive) {
-                    exportActive = pending
-                    engine.setExportInProgress(pending)
+                val nextTargets =
+                    if (task.hasPendingFiles) task.targetAddresses else emptySet()
+                if (nextTargets != exportTargets) {
+                    exportTargets = nextTargets
+                    engine.setExportTargets(nextTargets)
                 }
             }
-        }
-        viewModelScope.launch {
-            var wasSyncing = false
-            combine(isSynced, isSyncing) { synced, syncing -> synced to syncing }
-                .collect { (synced, syncing) ->
-                    if (synced && !syncing && _capturePreparePending.value && !_inRecordingMode.value) {
-                        _capturePreparePending.value = false
-                        delay(1_000)
-                        enterRecordingMode()
-                    } else if (
-                        wasSyncing &&
-                        !syncing &&
-                        !synced &&
-                        _capturePreparePending.value
-                    ) {
-                        _capturePreparePending.value = false
-                        _captureWorkflowPreparing.value = false
-                        Toast.makeText(
-                            getApplication(),
-                            "设备同步未完成，请重新准备采集",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                    wasSyncing = syncing
-                }
         }
     }
 
@@ -303,31 +398,232 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     fun clearScanMessage() { _scanMessage.value = null }
     fun stopScan() = engine.stopScan()
 
-    fun toggleSelection(index: Int) {
-        _selectedForConnect.update { set ->
-            if (set.contains(index)) set - index else set + index
+    fun setAvailableAthletes(athletes: List<CaptureAthleteOption>) {
+        val normalized = athletes
+            .filter { it.athleteId.isNotBlank() }
+            .distinctBy(CaptureAthleteOption::athleteId)
+        _availableAthletes.value = normalized
+        val athletesById = normalized.associateBy(CaptureAthleteOption::athleteId)
+        val current = _deviceRoleConfig.value
+        val updated = current.participants.map { participant ->
+            val selected = athletesById[participant.athleteId]
+            if (participant.athleteId.isBlank() || selected == null) {
+                participant.copy(athleteId = "", athleteName = "")
+            } else {
+                participant.copy(
+                    athleteId = selected.athleteId,
+                    athleteName = selected.athleteName,
+                )
+            }
+        }
+        if (updated != current.participants) {
+            saveDeviceRoleConfig(DeviceRoleConfig(updated))
         }
     }
 
-    fun selectAll() {
-        _selectedForConnect.value = scannedDevices.value
-            .mapIndexedNotNull { index, device ->
-                if (LongJumpDeviceRoles.isTargetDevice(device.address)) index else null
-            }
-            .toSet()
+    fun addParticipant() {
+        if (configurationOperationLocked()) return
+        val current = _deviceRoleConfig.value
+        if (current.participants.size >= 3) return
+        val usedAthletes = current.participants.map(CaptureParticipantBinding::athleteId).toSet()
+        val nextAthlete = _availableAthletes.value.firstOrNull { it.athleteId !in usedAthletes }
+        val nextIndex = (1..3).first { candidate ->
+            current.participants.none { it.slotId == "participant-$candidate" }
+        }
+        val slotId = "participant-$nextIndex"
+        val (leftDeviceId, rightDeviceId) =
+            LongJumpDeviceRoles.defaultDeviceIdsForSlot(slotId)
+        val added = CaptureParticipantBinding(
+            slotId = slotId,
+            athleteId = nextAthlete?.athleteId.orEmpty(),
+            athleteName = nextAthlete?.athleteName.orEmpty(),
+            leftDeviceId = leftDeviceId,
+            rightDeviceId = rightDeviceId,
+        )
+        saveDeviceRoleConfig(
+            current.copy(participants = current.participants + added)
+        )
+        if (nextAthlete == null) {
+            Toast.makeText(
+                getApplication(),
+                "已添加第 $nextIndex 组，请在管理分组中选择运动员",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     }
 
-    fun deselectAll() {
-        _selectedForConnect.value = emptySet()
+    fun removeParticipant(slotId: String) {
+        if (participantConfigurationLocked(slotId)) return
+        val current = _deviceRoleConfig.value
+        if (current.participants.size <= 1) return
+        saveDeviceRoleConfig(
+            current.copy(
+                participants = current.participants.filterNot { it.slotId == slotId }
+            )
+        )
+    }
+
+    fun selectParticipantAthlete(slotId: String, athleteId: String) {
+        if (participantConfigurationLocked(slotId)) return
+        val athlete = _availableAthletes.value.firstOrNull { it.athleteId == athleteId } ?: return
+        val current = _deviceRoleConfig.value
+        val duplicate = current.participants.firstOrNull {
+            it.slotId != slotId && it.athleteId == athleteId
+        }
+        if (duplicate != null) {
+            Toast.makeText(getApplication(), "该运动员已加入本次采集", Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveDeviceRoleConfig(
+            current.copy(
+                participants = current.participants.map { participant ->
+                    if (participant.slotId == slotId) {
+                        participant.copy(
+                            athleteId = athlete.athleteId,
+                            athleteName = athlete.athleteName,
+                        )
+                    } else {
+                        participant
+                    }
+                }
+            )
+        )
+    }
+
+    fun assignParticipantDevice(slotId: String, sideCode: String, address: String) {
+        if (participantConfigurationLocked(slotId)) return
+        val selectedId = LongJumpDeviceRoles.normalizeDeviceId(address)
+        val current = _deviceRoleConfig.value
+        val target = current.participants.firstOrNull { it.slotId == slotId } ?: return
+        val targetCurrentId = if (sideCode == "L") target.leftDeviceId else target.rightDeviceId
+        if (selectedId == targetCurrentId) return
+
+        val existingAssignment = LongJumpDeviceRoles.assignmentForDevice(selectedId)
+        if (existingAssignment != null && existingAssignment.participant.slotId != slotId) {
+            Toast.makeText(
+                getApplication(),
+                "${existingAssignment.displayLabel}已使用该设备",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+
+        val updatedTarget = when {
+            sideCode == "L" && selectedId == target.rightDeviceId -> target.copy(
+                leftDeviceId = target.rightDeviceId,
+                rightDeviceId = target.leftDeviceId,
+            )
+            sideCode == "R" && selectedId == target.leftDeviceId -> target.copy(
+                leftDeviceId = target.rightDeviceId,
+                rightDeviceId = target.leftDeviceId,
+            )
+            sideCode == "L" -> target.copy(leftDeviceId = selectedId)
+            else -> target.copy(rightDeviceId = selectedId)
+        }
+        saveDeviceRoleConfig(
+            current.copy(
+                participants = current.participants.map {
+                    if (it.slotId == slotId) updatedTarget else it
+                }
+            )
+        )
+    }
+
+    fun assignLeftDevice(address: String) {
+        assignParticipantDevice(_deviceRoleConfig.value.participants.first().slotId, "L", address)
+    }
+
+    fun assignRightDevice(address: String) {
+        assignParticipantDevice(_deviceRoleConfig.value.participants.first().slotId, "R", address)
+    }
+
+    private fun configurationOperationLocked(): Boolean {
+        val collectionBusy = engine.state.value in setOf(
+            CollectionEngine.CollectionState.Measuring,
+            CollectionEngine.CollectionState.Recording,
+        )
+        if (
+            isScanning.value ||
+            isSyncing.value ||
+            collectionBusy ||
+            _captureWorkflowPreparing.value ||
+            _participantPreparingSlots.value.isNotEmpty() ||
+            recEngine.recordingPhase.value != FlashRecordingPhase.Idle ||
+            recEngine.recordingExportDecisions.value.isNotEmpty() ||
+            recEngine.exportTaskProgress.value.hasPendingFiles ||
+            recEngine.eraseTaskProgress.value.isErasing
+        ) {
+            Toast.makeText(getApplication(), "当前操作完成后再修改采集分组", Toast.LENGTH_SHORT).show()
+            return true
+        }
+        return false
+    }
+
+    private fun participantConfigurationLocked(slotId: String): Boolean {
+        if (configurationOperationLocked()) return true
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return true
+        val connectedIds = connectedDevices.value
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        if (participant.normalizedDeviceIds.any { it in connectedIds }) {
+            Toast.makeText(
+                getApplication(),
+                "请先断开该运动员设备，再修改分组配置",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return true
+        }
+        return false
+    }
+
+    private fun saveDeviceRoleConfig(config: DeviceRoleConfig) {
+        _deviceRoleConfig.value = deviceRolePreferences.save(config)
     }
 
     fun connectSelected() {
-        val list = scannedDevices.value
-        val selected = _selectedForConnect.value
-            .mapNotNull { list.getOrNull(it) }
-            .filter { LongJumpDeviceRoles.isTargetDevice(it.address) }
-            .sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address) }
-        if (selected.isNotEmpty()) startBleService()
+        val config = _deviceRoleConfig.value
+        val invalidParticipants = config.participants.filterNot(CaptureParticipantBinding::isComplete)
+        if (invalidParticipants.isNotEmpty()) {
+            val labels = invalidParticipants.joinToString("、") {
+                it.athleteName.ifBlank { "未选择运动员" }
+            }
+            Toast.makeText(
+                getApplication(),
+                "$labels 的左右脚配置不完整",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val devicesById = scannedDevices.value.associateBy {
+            LongJumpDeviceRoles.normalizeDeviceId(it.address)
+        }
+        val missing = buildList<String> {
+            config.participants.forEach { participant ->
+                if (devicesById[participant.leftDeviceId] == null) {
+                    add("${participant.athleteName}左脚 ${participant.leftDeviceId}")
+                }
+                if (devicesById[participant.rightDeviceId] == null) {
+                    add("${participant.athleteName}右脚 ${participant.rightDeviceId}")
+                }
+            }
+        }
+        if (missing.isNotEmpty()) {
+            Toast.makeText(
+                getApplication(),
+                "未扫描到${missing.joinToString("、")}，请靠近设备后重新扫描",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val selected = config.participants.flatMap { participant ->
+            listOfNotNull(
+                devicesById[participant.leftDeviceId],
+                devicesById[participant.rightDeviceId],
+            )
+        }
+        startBleService()
         engine.connectDevices(selected)
     }
 
@@ -342,6 +638,89 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         if (_inRecordingMode.value) exitRecordingMode()
         engine.disconnectAll()
         stopBleService()
+    }
+
+    fun disconnectParticipant(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        if (participantConnectionOperationLocked(targets, slotId)) return
+        val connected = connectedDevices.value.map(LongJumpDeviceRoles::normalizeDeviceId).toSet()
+        if (targets.none { it in connected }) return
+        _participantPreparingSlots.value -= slotId
+        if (engine.disconnectDevices(targets) && engine.connectedDevices.value.isEmpty()) {
+            stopBleService()
+        }
+    }
+
+    fun connectParticipant(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        if (participantConnectionOperationLocked(targets, slotId)) return
+        if (targets.size != 2) {
+            Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val generation = ++participantConnectGeneration
+        if (connectParticipantFromScan(targets)) return
+
+        startScan()
+        viewModelScope.launch {
+            while (
+                generation == participantConnectGeneration &&
+                isScanning.value
+            ) {
+                delay(200)
+            }
+            if (generation != participantConnectGeneration) return@launch
+            if (!connectParticipantFromScan(targets)) {
+                Toast.makeText(
+                    getApplication(),
+                    "${participant.athleteName}设备未扫描完整，请保持左右脚设备靠近后重试",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    private fun connectParticipantFromScan(targets: Set<String>): Boolean {
+        val connected = connectedDevices.value.map(LongJumpDeviceRoles::normalizeDeviceId).toSet()
+        val missingTargets = targets - connected
+        if (missingTargets.isEmpty()) return true
+        val scannedById = scannedDevices.value.associateBy {
+            LongJumpDeviceRoles.normalizeDeviceId(it.address)
+        }
+        val selected = missingTargets.mapNotNull(scannedById::get)
+        if (selected.size != missingTargets.size) return false
+        startBleService()
+        return engine.connectAdditionalDevices(selected)
+    }
+
+    private fun participantConnectionOperationLocked(
+        targets: Set<String>,
+        slotId: String,
+    ): Boolean {
+        val locked =
+            isSyncing.value ||
+                _isRecording.value ||
+                slotId in _participantPreparingSlots.value ||
+                participantHasActiveRecordingOperation(
+                    recEngine.deviceRecordingPhases.value,
+                    targets,
+                ) ||
+                recEngine.exportTaskProgress.value.hasPendingFiles ||
+                recEngine.eraseTaskProgress.value.isErasing
+        if (locked) {
+            Toast.makeText(
+                getApplication(),
+                "请先结束该运动员的准备或录制操作",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+        return locked
     }
 
     fun powerOffDevice(address: String) {
@@ -375,33 +754,161 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun startSync() {
-        // 同步前先停止所有采集状态，避免设备处于录制/测量中导致同步失败
-        if (recEngine.recordingPhase.value != FlashRecordingPhase.Idle) {
-            Toast.makeText(getApplication(), "请先停止离线录制并等待设备回连", Toast.LENGTH_SHORT).show()
+        val participant = _deviceRoleConfig.value.participants.firstOrNull { binding ->
+            participantTargets(binding).any { deviceSyncStates.value[it] != true }
+        } ?: return
+        startParticipantSync(participant.slotId)
+    }
+
+    fun startParticipantSync(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        if (targets.size != 2) {
+            Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
             return
         }
-        if (_isRecording.value) {
-            stopRecording()
-        }
-        if (engine.confirmExistingSyncIfAllConnected()) {
+        if (
+            participantHasActiveRecordingOperation(
+                recEngine.deviceRecordingPhases.value,
+                targets,
+            )
+        ) {
+            Toast.makeText(
+                getApplication(),
+                "请先停止${participant.athleteName}的录制",
+                Toast.LENGTH_SHORT,
+            ).show()
             return
         }
-        val prepared = engine.prepareSyncParameters(_recOutputRate.value, _recFilterProfile.value)
-        if (!prepared.success) {
-            Toast.makeText(getApplication(), "请先停止采集或解除同步，再执行 SDK 同步", Toast.LENGTH_SHORT).show()
+        if (targets.all { deviceSyncStates.value[it] == true }) return
+        if (_captureWorkflowPreparing.value) {
+            Toast.makeText(getApplication(), "采集准备正在同步设备，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
-        viewModelScope.launch {
-            if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
-            if (!engine.startSync()) {
-                Toast.makeText(getApplication(), "设备未就绪，请保持设备靠近后重新同步", Toast.LENGTH_SHORT).show()
+        if (participantSyncJob?.isActive == true) {
+            val activeName = _deviceRoleConfig.value.participants
+                .firstOrNull { it.slotId == participantSyncSlotId }
+                ?.athleteName
+                .orEmpty()
+            Toast.makeText(
+                getApplication(),
+                if (participantSyncSlotId == slotId) "${participant.athleteName}正在同步"
+                else "${activeName.ifBlank { "其他运动员" }}正在同步，请稍候",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        participantSyncSlotId = slotId
+        participantSyncJob = viewModelScope.launch {
+            try {
+                val recordingQuietWaitMs = recEngine.releaseDevicesForSync(targets)
+                if (recordingQuietWaitMs < 0L) {
+                    Toast.makeText(
+                        getApplication(),
+                        "${participant.athleteName}仍有录制操作，暂不能同步",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    return@launch
+                }
+                if (recordingQuietWaitMs > 0L) delay(recordingQuietWaitMs)
+                if (!waitForSyncTargetsReady(targets)) {
+                    Toast.makeText(
+                        getApplication(),
+                        "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    return@launch
+                }
+                val prepared = engine.prepareSyncParametersForDevices(
+                    targets,
+                    _recOutputRate.value,
+                    _recFilterProfile.value,
+                )
+                if (!prepared.success) {
+                    Toast.makeText(
+                        getApplication(),
+                        "${participant.athleteName}设备参数未准备好",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    return@launch
+                }
+                if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
+                if (!waitForSyncTargetsReady(targets)) {
+                    Toast.makeText(
+                        getApplication(),
+                        "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    return@launch
+                }
+                if (engine.startSync(targets)) return@launch
+                Toast.makeText(
+                    getApplication(),
+                    "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            } finally {
+                participantSyncJob = null
+                participantSyncSlotId = null
             }
         }
     }
+
     fun stopSync() {
+        stopSyncTargets(null)
+    }
+
+    fun stopParticipantSync(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        stopSyncTargets(participantTargets(participant))
+    }
+
+    private fun stopSyncTargets(targets: Set<String>?) {
+        val recordingTargets = targets ?: recEngine.deviceRecordingPhases.value.keys
+        if (
+            participantHasActiveRecordingOperation(
+                recEngine.deviceRecordingPhases.value,
+                recordingTargets,
+            )
+        ) {
+            Toast.makeText(getApplication(), "请先停止录制，再解除同步", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (recEngine.exportTaskProgress.value.hasPendingFiles) {
+            Toast.makeText(getApplication(), "请等待文件导出完成，再解除同步", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (recEngine.eraseTaskProgress.value.isErasing) {
+            Toast.makeText(getApplication(), "请等待 Flash 擦除完成，再解除同步", Toast.LENGTH_SHORT).show()
+            return
+        }
         _capturePreparePending.value = false
         _captureWorkflowPreparing.value = false
-        engine.stopSync()
+        capturePreflightGeneration++
+
+        val stopAction = {
+            if (targets == null) {
+                engine.stopSync()
+            } else {
+                engine.stopSync(targets)
+            }
+        }
+        if (_inRecordingMode.value && targets == null) {
+            recEngine.clear()
+            _inRecordingMode.value = false
+            clearFileSelection()
+            viewModelScope.launch {
+                // 清理录制通知会占用同一条 GATT 队列，排空后再发送解除同步。
+                delay(1_200)
+                stopAction()
+            }
+        } else {
+            stopAction()
+        }
     }
     fun startDirectMeasurement() = engine.startDirectMeasurement()
 
@@ -437,11 +944,31 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun beginRecordingStatePreflight() {
         val generation = ++capturePreflightGeneration
-        val devices = engine.getDevices()
-        if (devices.isEmpty()) {
+        val configuredTargets = _deviceRoleConfig.value.targetDeviceIds
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        val connectedTargets = engine.connectedDevices.value
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        val devices = engine.getDevices().filter { device ->
+            val address = device.address
+                ?.let(LongJumpDeviceRoles::normalizeDeviceId)
+                ?: return@filter false
+            address in configuredTargets &&
+                address in connectedTargets &&
+                device.connectionState == com.xsens.dot.android.sdk.models.DotDevice.CONN_STATE_CONNECTED
+        }
+        val expectedTargets = devices.mapNotNull { device ->
+            device.address?.let(LongJumpDeviceRoles::normalizeDeviceId)
+        }.toSet()
+        if (
+            devices.isEmpty() ||
+            expectedTargets.size != configuredTargets.size ||
+            !expectedTargets.containsAll(configuredTargets)
+        ) {
             failCapturePreparation(
                 generation,
-                "设备连接状态已变化，请重新连接后准备采集"
+                "本次运动员设备未全部连接，请保持设备靠近后重新准备"
             )
             return
         }
@@ -451,9 +978,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
         viewModelScope.launch {
             var attempts = 0
+            val maxAttempts = 24 + (expectedTargets.size - 2).coerceAtLeast(0) * 8
             while (
-                attempts < 24 &&
-                recEngine.recordingStates.value.size < devices.size
+                attempts < maxAttempts &&
+                !expectedTargets.all { it in recEngine.recordingStates.value }
             ) {
                 if (generation != capturePreflightGeneration || !_inRecordingMode.value) return@launch
                 delay(250)
@@ -466,8 +994,9 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
                 return@launch
             }
 
-            val states = recEngine.recordingStates.value.values
-            val allStatesKnown = states.size >= devices.size
+            val allStatesKnown = expectedTargets.all { target ->
+                target in recEngine.recordingStates.value
+            }
             if (!allStatesKnown) {
                 recEngine.clear()
                 _inRecordingMode.value = false
@@ -480,7 +1009,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
                 return@launch
             }
 
-            continueCapturePreparationAfterIdlePreflight(devices.size, generation)
+            continueCapturePreparationAfterIdlePreflight(expectedTargets.size, generation)
         }
     }
 
@@ -489,52 +1018,20 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         generation: Int
     ) {
         if (generation != capturePreflightGeneration) return
-        if (connectedCount >= 2 && !isSynced.value) {
+        if (connectedCount >= 2 && !allParticipantGroupsSynced()) {
             if (engine.confirmExistingSyncIfAllConnected()) {
+                _capturePreparePending.value = false
                 _captureWorkflowPreparing.value = false
-                return
-            }
-            val prepared = engine.prepareSyncParameters(_recOutputRate.value, _recFilterProfile.value)
-            if (!prepared.success) {
-                recEngine.clear()
-                _inRecordingMode.value = false
-                _captureWorkflowPreparing.value = false
-                Toast.makeText(getApplication(), "设备参数未准备好，无法开始同步", Toast.LENGTH_SHORT).show()
                 return
             }
             recEngine.clear()
             _inRecordingMode.value = false
             _capturePreparePending.value = true
             viewModelScope.launch {
-                if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
-                if (
-                    generation != capturePreflightGeneration ||
-                    !_capturePreparePending.value
-                ) {
-                    return@launch
-                }
-                if (!engine.startSync()) {
-                    failCapturePreparation(
-                        generation,
-                        "同步启动前设备连接已变化，请保持设备靠近后重新准备"
-                    )
-                    return@launch
-                }
-
-                // startSync() is synchronous up to publishing the SDK sync state. If neither
-                // syncing nor synced becomes visible, release the preparation lock explicitly.
+                // Recording cleanup updates notification state through GATT. Let those writes
+                // finish before synchronization starts on the same device connections.
                 delay(2_000)
-                if (
-                    generation == capturePreflightGeneration &&
-                    _capturePreparePending.value &&
-                    !isSyncing.value &&
-                    !isSynced.value
-                ) {
-                    failCapturePreparation(
-                        generation,
-                        "设备同步未启动，请确认连接稳定后重新准备"
-                    )
-                }
+                synchronizeParticipantGroups(generation)
             }
             return
         }
@@ -544,6 +1041,126 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         }
         _captureWorkflowPreparing.value = false
     }
+
+    private suspend fun synchronizeParticipantGroups(generation: Int) {
+        val participants = _deviceRoleConfig.value.participants
+        for (participant in participants) {
+            if (
+                generation != capturePreflightGeneration ||
+                !_capturePreparePending.value
+            ) {
+                return
+            }
+            val targets = participantTargets(participant)
+            if (targets.size != 2) {
+                failCapturePreparation(generation, "${participant.athleteName}左右脚配置不完整")
+                return
+            }
+            if (targets.all { deviceSyncStates.value[it] == true }) continue
+            val recordingQuietWaitMs = recEngine.releaseDevicesForSync(targets)
+            if (recordingQuietWaitMs < 0L) {
+                failCapturePreparation(
+                    generation,
+                    "${participant.athleteName}仍有录制操作，无法同步",
+                )
+                return
+            }
+            if (recordingQuietWaitMs > 0L) delay(recordingQuietWaitMs)
+            if (!waitForSyncTargetsReady(targets)) {
+                failCapturePreparation(
+                    generation,
+                    "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                )
+                return
+            }
+
+            val prepared = engine.prepareSyncParametersForDevices(
+                targets,
+                _recOutputRate.value,
+                _recFilterProfile.value,
+            )
+            if (!prepared.success) {
+                failCapturePreparation(generation, "${participant.athleteName}设备参数未准备好")
+                return
+            }
+            if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
+            if (!waitForSyncTargetsReady(targets)) {
+                failCapturePreparation(
+                    generation,
+                    "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                )
+                return
+            }
+            if (
+                generation != capturePreflightGeneration ||
+                !_capturePreparePending.value
+            ) {
+                return
+            }
+            if (!engine.startSync(targets)) {
+                failCapturePreparation(generation, "${participant.athleteName}同步未启动")
+                return
+            }
+
+            var waitTicks = 0
+            while (
+                waitTicks < 280 &&
+                generation == capturePreflightGeneration &&
+                _capturePreparePending.value &&
+                (
+                    isSyncing.value ||
+                        syncTargetAddresses.value.isNotEmpty() ||
+                        !targets.all { deviceSyncStates.value[it] == true }
+                    )
+            ) {
+                delay(250)
+                waitTicks++
+                if (
+                    !isSyncing.value &&
+                    syncTargetAddresses.value.isEmpty() &&
+                    !targets.all { deviceSyncStates.value[it] == true }
+                ) {
+                    break
+                }
+            }
+            if (!targets.all { deviceSyncStates.value[it] == true }) {
+                failCapturePreparation(generation, "${participant.athleteName}左右脚同步未完成")
+                return
+            }
+            delay(800)
+        }
+
+        if (
+            generation != capturePreflightGeneration ||
+            !_capturePreparePending.value
+        ) {
+            return
+        }
+        _capturePreparePending.value = false
+        delay(800)
+        enterRecordingMode()
+    }
+
+    private fun participantTargets(participant: CaptureParticipantBinding): Set<String> =
+        _deviceRoleConfig.value.targetsForParticipant(participant.slotId)
+
+    private suspend fun waitForSyncTargetsReady(
+        targets: Set<String>,
+        timeoutMs: Long = 8_000L,
+    ): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (engine.areDevicesReadyForSync(targets)) return true
+            delay(100L)
+        }
+        return engine.areDevicesReadyForSync(targets)
+    }
+
+    private fun allParticipantGroupsSynced(): Boolean =
+        _deviceRoleConfig.value.participants.all { participant ->
+            val targets = participantTargets(participant)
+            targets.size == 2 && targets.all { deviceSyncStates.value[it] == true }
+        }
 
     private fun failCapturePreparation(generation: Int, message: String) {
         if (generation != capturePreflightGeneration) return
@@ -621,27 +1238,141 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     fun requestFlashInfo()    = recEngine.requestFlashInfo()
     fun eraseFlash()          = recEngine.eraseAll()
     fun startFlashRecording() {
+        val participant = _deviceRoleConfig.value.participants.firstOrNull { binding ->
+            participantTargets(binding).all { target ->
+                recEngine.deviceRecordingPhases.value[target] == FlashRecordingPhase.Idle
+            }
+        } ?: return
+        startParticipantFlashRecording(participant.slotId)
+    }
+
+    fun startParticipantFlashRecording(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        if (targets.size != 2) {
+            Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!targets.all { target -> target in engine.connectedDevices.value.map(LongJumpDeviceRoles::normalizeDeviceId) }) {
+            Toast.makeText(getApplication(), "${participant.athleteName}设备未全部连接", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!targets.all { deviceSyncStates.value[it] == true }) {
+            Toast.makeText(getApplication(), "请先同步${participant.athleteName}的左右脚", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (slotId in _participantPreparingSlots.value) return
+
+        if (!participantRecordingSetupReady(targets)) {
+            prepareAndStartParticipantRecording(participant, targets)
+            return
+        }
+        startPreparedParticipantRecording(participant, targets)
+    }
+
+    private fun prepareAndStartParticipantRecording(
+        participant: CaptureParticipantBinding,
+        targets: Set<String>,
+    ) {
+        val devices = engine.getDevices().filter { device ->
+            val address = device.address
+                ?.let(LongJumpDeviceRoles::normalizeDeviceId)
+                ?: return@filter false
+            address in targets &&
+                device.connectionState ==
+                    com.xsens.dot.android.sdk.models.DotDevice.CONN_STATE_CONNECTED
+        }
+        if (devices.size != targets.size) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}设备未全部连接",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+
+        startBleService()
+        _inRecordingMode.value = true
+        _participantPreparingSlots.value += participant.slotId
+        recEngine.ensureSetup(devices)
+
+        viewModelScope.launch {
+            repeat(48) { attempt ->
+                if (participant.slotId !in _participantPreparingSlots.value) return@launch
+                if (participantRecordingSetupReady(targets)) {
+                    _participantPreparingSlots.value -= participant.slotId
+                    startPreparedParticipantRecording(participant, targets)
+                    return@launch
+                }
+                if (attempt > 0 && attempt % 8 == 0) {
+                    recEngine.refreshSetupState(targets)
+                }
+                delay(250)
+            }
+            _participantPreparingSlots.value -= participant.slotId
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}录制初始化超时，请保持设备靠近后重试",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    private fun participantRecordingSetupReady(targets: Set<String>): Boolean =
+        targets.all { it in recEngine.notificationReady.value } &&
+            targets.all { target ->
+                val (used, total) = recEngine.flashInfo.value[target] ?: return@all false
+                total > 0 && used.toFloat() / total.toFloat() < 0.9f
+            } &&
+            targets.all { target ->
+                recEngine.recordingStates.value[target] in setOf(
+                    DotRecordingState.idle,
+                    DotRecordingState.success,
+                )
+            }
+
+    private fun startPreparedParticipantRecording(
+        participant: CaptureParticipantBinding,
+        targets: Set<String>,
+    ) {
+        startBleService()
+        _inRecordingMode.value = true
+        if (!engine.prepareDevicesForFlashRecording(targets)) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}设备连接或同步状态已变化",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        if (!recEngine.prepareStartRecording(targets)) return
+        viewModelScope.launch {
+            delay(1_500)
+            if (targets.all {
+                    recEngine.deviceRecordingPhases.value[it] == FlashRecordingPhase.Starting
+                }
+            ) {
+                recEngine.startRecording(targets)
+            }
+        }
+    }
+
+    fun startAllFlashRecording() {
         if (recEngine.recordingPhase.value != FlashRecordingPhase.Idle) return
+        val targets = engine.connectedDevices.value
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        if (!engine.prepareDevicesForFlashRecording(targets)) {
+            Toast.makeText(getApplication(), "设备未全部连接或同步，无法开始录制", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!recEngine.prepareStartRecording()) return
-        if (!isSynced.value) {
-            engine.startOfflineRecordingMeasurement(_recOutputRate.value, _recFilterProfile.value)
-            viewModelScope.launch {
-                delay(1_500)
-                if (_inRecordingMode.value && recEngine.recordingPhase.value == FlashRecordingPhase.Starting) {
-                    recEngine.startRecording()
-                }
-            }
-        } else {
-            if (!engine.startSyncedRecordingMeasurement()) {
-                recEngine.forceStopRecording()
-                Toast.makeText(getApplication(), "设备未全部连接，无法开始录制", Toast.LENGTH_SHORT).show()
-                return
-            }
-            viewModelScope.launch {
-                delay(800)
-                if (_inRecordingMode.value && recEngine.recordingPhase.value == FlashRecordingPhase.Starting) {
-                    recEngine.startRecording()
-                }
+        viewModelScope.launch {
+            delay(1_500)
+            if (_inRecordingMode.value && recEngine.recordingPhase.value == FlashRecordingPhase.Starting) {
+                recEngine.startRecording()
             }
         }
     }
@@ -649,11 +1380,93 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         if (recEngine.recordingPhase.value != FlashRecordingPhase.Recording) return
         recEngine.stopRecording()
     }
+
+    fun stopParticipantFlashRecording(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        if (targets.none {
+                recEngine.deviceRecordingPhases.value[it] in setOf(
+                    FlashRecordingPhase.Recording,
+                    FlashRecordingPhase.Stopping,
+                )
+            }
+        ) return
+        recEngine.stopRecording(targets)
+        participantStopJobs.remove(slotId)?.cancel()
+        lateinit var stopJob: Job
+        stopJob = viewModelScope.launch {
+            try {
+                while (
+                    targets.any {
+                        recEngine.deviceRecordingPhases.value[it] in setOf(
+                            FlashRecordingPhase.Recording,
+                            FlashRecordingPhase.Stopping,
+                        )
+                    }
+                ) {
+                    delay(250)
+                }
+                engine.stopMeasuring(targets)
+            } finally {
+                participantStopJobs.remove(slotId, stopJob)
+            }
+        }
+        participantStopJobs[slotId] = stopJob
+    }
+
     fun forceStopFlashRecording() {
         if (recEngine.recordingPhase.value == FlashRecordingPhase.Idle) return
         recEngine.forceStopRecording()
     }
-    fun requestFiles()        = recEngine.requestFileInfo()
+    fun requestFiles() = recEngine.requestFileInfo()
+
+    fun requestParticipantFiles(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        val connected = engine.connectedDevices.value
+            .map(LongJumpDeviceRoles::normalizeDeviceId)
+            .toSet()
+        if (targets.size != 2 || !connected.containsAll(targets)) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}设备未全部连接",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val activeTargets = targets.filter { target ->
+            recEngine.deviceRecordingPhases.value[target] in setOf(
+                FlashRecordingPhase.Starting,
+                FlashRecordingPhase.Recording,
+                FlashRecordingPhase.Stopping,
+            )
+        }
+        if (activeTargets.isNotEmpty()) {
+            Toast.makeText(
+                getApplication(),
+                "请先结束该运动员的录制",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        _selectedFileKeys.update { current ->
+            current.filterNot { key ->
+                targets.any { target -> key.startsWith("$target-") }
+            }.toSet()
+        }
+        if (!recEngine.requestFileInfo(targets)) {
+            Toast.makeText(
+                getApplication(),
+                "设备正忙，请稍后读取历史文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
     fun stopExportFiles()     = recEngine.stopExporting()
 
     fun startRecording() {
@@ -702,6 +1515,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
     override fun onCleared() {
         super.onCleared()
+        participantSyncJob?.cancel()
+        participantStopJobs.values.forEach { it.cancel() }
+        participantStopJobs.clear()
+        engine.isFlashRecordingDevice = null
         recEngine.clear()
         engine.close()
         stopBleService()

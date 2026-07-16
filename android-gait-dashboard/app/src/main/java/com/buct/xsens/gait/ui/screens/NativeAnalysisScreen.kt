@@ -1,7 +1,5 @@
 package com.buct.xsens.gait.ui.screens
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,12 +26,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
-import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.Edit
-import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Person
@@ -146,14 +141,10 @@ fun NativeAnalysisScreen(
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    var showAthleteDialog by rememberSaveable { mutableStateOf(false) }
-    var editingAthlete by remember { mutableStateOf<AthleteProfile?>(null) }
     var showDataDialog by rememberSaveable { mutableStateOf(false) }
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        uri?.let(viewModel::importAthletes)
-    }
 
     LaunchedEffect(Unit) {
+        viewModel.refreshAthletes()
         viewModel.refreshCapturedAttempts()
     }
 
@@ -172,15 +163,6 @@ fun NativeAnalysisScreen(
                 onSelectMode = viewModel::setAnalysisMode,
                 onSelectAthlete = viewModel::selectAthlete,
                 onAttemptNoChange = viewModel::updateAttemptNo,
-                onNewAthlete = {
-                    editingAthlete = null
-                    showAthleteDialog = true
-                },
-                onEditAthlete = {
-                    editingAthlete = state.selectedAthlete
-                    showAthleteDialog = true
-                },
-                onImportAthletes = { importLauncher.launch("application/json") },
                 onSelectData = {
                     viewModel.refreshCapturedAttempts()
                     showDataDialog = true
@@ -210,20 +192,9 @@ fun NativeAnalysisScreen(
         }
     }
 
-    if (showAthleteDialog) {
-        AthleteEditorDialog(
-            initial = editingAthlete,
-            onDismiss = { showAthleteDialog = false },
-            onSave = {
-                viewModel.saveAthlete(it)
-                showAthleteDialog = false
-            },
-        )
-    }
-
     if (showDataDialog) {
         DataPickerDialog(
-            attempts = state.attempts,
+            attempts = state.availableAttempts,
             selectedKey = state.selectedAttemptKey,
             onDismiss = { showDataDialog = false },
             onSelect = {
@@ -280,9 +251,6 @@ private fun MainAnalysisContent(
     onSelectMode: (AnalysisMode) -> Unit,
     onSelectAthlete: (String) -> Unit,
     onAttemptNoChange: (String) -> Unit,
-    onNewAthlete: () -> Unit,
-    onEditAthlete: () -> Unit,
-    onImportAthletes: () -> Unit,
     onSelectData: () -> Unit,
     onAnalyze: () -> Unit,
 ) {
@@ -297,9 +265,6 @@ private fun MainAnalysisContent(
                 onSelectMode = onSelectMode,
                 onSelectAthlete = onSelectAthlete,
                 onAttemptNoChange = onAttemptNoChange,
-                onNewAthlete = onNewAthlete,
-                onEditAthlete = onEditAthlete,
-                onImportAthletes = onImportAthletes,
                 onSelectData = onSelectData,
                 onAnalyze = onAnalyze,
             )
@@ -330,9 +295,6 @@ private fun AnalysisPreparationPanel(
     onSelectMode: (AnalysisMode) -> Unit,
     onSelectAthlete: (String) -> Unit,
     onAttemptNoChange: (String) -> Unit,
-    onNewAthlete: () -> Unit,
-    onEditAthlete: () -> Unit,
-    onImportAthletes: () -> Unit,
     onSelectData: () -> Unit,
     onAnalyze: () -> Unit,
 ) {
@@ -341,6 +303,7 @@ private fun AnalysisPreparationPanel(
         AnalysisModeSelector(
             selected = state.analysisMode,
             onSelect = onSelectMode,
+            enabled = !state.isAnalyzing,
         )
         HorizontalDivider(
             modifier = Modifier.padding(vertical = 14.dp),
@@ -370,14 +333,6 @@ private fun AnalysisPreparationPanel(
                 modifier = Modifier.width(112.dp),
                 colors = analysisTextFieldColors(),
             )
-            CompactIconButton(Icons.Outlined.Add, "新建运动员", onNewAthlete)
-            CompactIconButton(
-                Icons.Outlined.Edit,
-                "编辑运动员",
-                onEditAthlete,
-                enabled = state.selectedAthlete != null,
-            )
-            CompactIconButton(Icons.Outlined.FileOpen, "导入名单", onImportAthletes)
         }
         HorizontalDivider(
             modifier = Modifier.padding(vertical = 14.dp),
@@ -393,7 +348,10 @@ private fun AnalysisPreparationPanel(
                 modifier = Modifier
                     .weight(1f)
                     .heightIn(min = 54.dp)
-                    .clickable(onClick = onSelectData),
+                    .clickable(
+                        enabled = !state.isAnalyzing,
+                        onClick = onSelectData,
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
@@ -447,6 +405,7 @@ private fun AnalysisPreparationPanel(
 private fun AnalysisModeSelector(
     selected: AnalysisMode,
     onSelect: (AnalysisMode) -> Unit,
+    enabled: Boolean,
 ) {
     Row(
         modifier = Modifier
@@ -465,7 +424,7 @@ private fun AnalysisModeSelector(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .clickable { onSelect(mode) },
+                    .clickable(enabled = enabled) { onSelect(mode) },
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Text(
@@ -1292,113 +1251,6 @@ private fun DataPickerDialog(
 }
 
 @Composable
-private fun AthleteEditorDialog(
-    initial: AthleteProfile?,
-    onDismiss: () -> Unit,
-    onSave: (AthleteProfile) -> Unit,
-) {
-    var name by rememberSaveable { mutableStateOf(initial?.name.orEmpty()) }
-    var code by rememberSaveable { mutableStateOf(initial?.code.orEmpty()) }
-    var gender by rememberSaveable { mutableStateOf(initial?.gender.orEmpty()) }
-    var birthDate by rememberSaveable { mutableStateOf(initial?.birthDate.orEmpty()) }
-    var height by rememberSaveable { mutableStateOf(initial?.heightCm?.takeIf { it > 0 }?.toString().orEmpty()) }
-    var weight by rememberSaveable { mutableStateOf(initial?.weightKg?.takeIf { it > 0 }?.toString().orEmpty()) }
-    var group by rememberSaveable { mutableStateOf(initial?.groupName.orEmpty()) }
-    var dominantLeg by rememberSaveable { mutableStateOf(initial?.dominantLeg ?: FootSide.Left) }
-
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            color = Card,
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(max = 760.dp)
-                .border(1.dp, Border, RoundedCornerShape(12.dp)),
-        ) {
-            Column(
-                modifier = Modifier
-                    .verticalScroll(rememberScrollState())
-                    .padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text(
-                    if (initial == null) "新建运动员" else "编辑运动员",
-                    color = AppText,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                AthleteField("姓名", name, { name = it })
-                AthleteField("运动员编号", code, { code = it })
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    AthleteField("性别", gender, { gender = it }, Modifier.weight(1f))
-                    AthleteField("出生日期", birthDate, { birthDate = it }, Modifier.weight(1f))
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    AthleteField("身高 (cm)", height, { height = it }, Modifier.weight(1f))
-                    AthleteField("体重 (kg)", weight, { weight = it }, Modifier.weight(1f))
-                }
-                AthleteField("组别", group, { group = it })
-                Text("惯用腿", color = Muted, style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FootSide.values().forEach { side ->
-                        FilterChip(
-                            selected = dominantLeg == side,
-                            onClick = { dominantLeg = side },
-                            label = { Text(side.label) },
-                            colors = analysisChipColors(),
-                        )
-                    }
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    NeutralButton("取消", onDismiss)
-                    Spacer(Modifier.width(8.dp))
-                    SuccessButton(
-                        "保存",
-                        onClick = {
-                            onSave(
-                                AthleteProfile(
-                                    id = initial?.id.orEmpty(),
-                                    code = code,
-                                    name = name,
-                                    gender = gender,
-                                    birthDate = birthDate,
-                                    heightCm = height.toDoubleOrNull() ?: 0.0,
-                                    weightKg = weight.toDoubleOrNull() ?: 0.0,
-                                    groupName = group,
-                                    dominantLeg = dominantLeg,
-                                    extraJson = initial?.extraJson ?: "{}",
-                                )
-                            )
-                        },
-                        enabled = name.isNotBlank(),
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun AthleteField(
-    label: String,
-    value: String,
-    onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier.fillMaxWidth(),
-) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        label = { Text(label) },
-        singleLine = true,
-        modifier = modifier,
-        colors = analysisTextFieldColors(),
-    )
-}
-
-@Composable
 private fun LanField(
     label: String,
     value: String,
@@ -1436,29 +1288,6 @@ private fun LegendDot(label: String, color: Color) {
         )
         Spacer(Modifier.width(5.dp))
         Text(label, color = Muted, style = MaterialTheme.typography.labelSmall)
-    }
-}
-
-@Composable
-private fun CompactIconButton(
-    imageVector: androidx.compose.ui.graphics.vector.ImageVector,
-    description: String,
-    onClick: () -> Unit,
-    enabled: Boolean = true,
-) {
-    IconButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier
-            .size(42.dp)
-            .background(AppSurface, RoundedCornerShape(8.dp))
-            .border(1.dp, Border, RoundedCornerShape(8.dp)),
-    ) {
-        Icon(
-            imageVector,
-            contentDescription = description,
-            tint = if (enabled) AppText else Muted,
-        )
     }
 }
 

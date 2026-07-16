@@ -12,6 +12,9 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.buct.xsens.dot.data.DeviceRoleAssignment
+import com.buct.xsens.dot.data.LongJumpDeviceRoles
+import com.buct.xsens.dot.data.RecordingSessionPreferences
 import com.buct.xsens.dot.data.TimestampUtcCalculator
 import com.xsens.dot.android.sdk.events.DotData
 import com.xsens.dot.android.sdk.interfaces.DotRecordingCallback
@@ -28,6 +31,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
+import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -51,6 +55,7 @@ data class ExportDataField(
 data class ExportTaskProgress(
     val isExporting: Boolean = false,
     val totalFiles: Int = 0,
+    val targetAddresses: Set<String> = emptySet(),
     val activeFileKeys: Set<String> = emptySet(),
     val framesByFile: Map<String, Int> = emptyMap(),
     val targetFramesByFile: Map<String, Int> = emptyMap(),
@@ -59,11 +64,115 @@ data class ExportTaskProgress(
     val completedFileKeys: Set<String> = emptySet(),
     val failedFileKeys: Set<String> = emptySet(),
 ) {
+    val targetFileKeys: Set<String>
+        get() = when {
+            targetBytesByFile.isNotEmpty() -> targetBytesByFile.keys
+            targetFramesByFile.isNotEmpty() -> targetFramesByFile.keys
+            else -> emptySet()
+        }
+
     val finishedFileKeys: Set<String>
         get() = completedFileKeys + failedFileKeys
 
+    val completedTargetFileKeys: Set<String>
+        get() = completedFileKeys.intersect(targetFileKeys)
+
+    val failedTargetFileKeys: Set<String>
+        get() = failedFileKeys.intersect(targetFileKeys)
+
     val hasPendingFiles: Boolean
-        get() = totalFiles > 0 && finishedFileKeys.size < totalFiles
+        get() = targetFileKeys.any { it !in finishedFileKeys }
+}
+
+data class RecordingExportDecision(
+    val id: String,
+    val sessionKey: String,
+    val targetAddresses: Set<String>,
+    val fileKeys: Set<String> = emptySet(),
+    val targetFramesByFile: Map<String, Int> = emptyMap(),
+    val isPreparing: Boolean = true,
+    val errorMessage: String? = null,
+) {
+    val fileCount: Int
+        get() = fileKeys.size
+
+    val isReady: Boolean
+        get() = !isPreparing && errorMessage == null && fileKeys.isNotEmpty()
+}
+
+internal fun canStartNextRecordingExportPreparation(
+    hasActivePreparation: Boolean,
+    hasExportTransfer: Boolean,
+    queuedSessionCount: Int,
+): Boolean =
+    !hasActivePreparation &&
+        !hasExportTransfer &&
+        queuedSessionCount > 0
+
+internal fun estimatedFlashSampleCount(dataSizeBytes: Int): Int =
+    ((dataSizeBytes.toLong().coerceAtLeast(1L) + 61L) / 62L)
+        .coerceIn(1L, Int.MAX_VALUE.toLong())
+        .toInt()
+
+internal fun estimatedRecordedSampleCount(
+    startUtcMs: Long,
+    stopUtcMs: Long,
+    outputRateHz: Int,
+): Int {
+    val durationMs = (stopUtcMs - startUtcMs).coerceAtLeast(1L)
+    val rate = outputRateHz.coerceAtLeast(1)
+    return ((durationMs * rate + 500L) / 1_000L)
+        .coerceIn(1L, Int.MAX_VALUE.toLong())
+        .toInt()
+}
+
+internal enum class ExportWatchdogAction {
+    Wait,
+    Retry,
+}
+
+internal fun resolveExportWatchdogAction(
+    nowMs: Long,
+    attemptStartedAtMs: Long,
+    lastProgressAtMs: Long,
+    hasReceivedData: Boolean,
+    isConnected: Boolean,
+    isResetting: Boolean,
+    isRestartScheduled: Boolean,
+    firstDataTimeoutMs: Long,
+    streamingStallTimeoutMs: Long,
+): ExportWatchdogAction {
+    if (!isConnected || isResetting || isRestartScheduled) {
+        return ExportWatchdogAction.Wait
+    }
+    val referenceTime = if (hasReceivedData) lastProgressAtMs else attemptStartedAtMs
+    val timeout = if (hasReceivedData) streamingStallTimeoutMs else firstDataTimeoutMs
+    return if (nowMs - referenceTime >= timeout) {
+        ExportWatchdogAction.Retry
+    } else {
+        ExportWatchdogAction.Wait
+    }
+}
+
+internal class ExportSampleProgressTracker {
+    private var previousPacketCounter: Int? = null
+    private var samplePosition = 0
+
+    @Synchronized
+    fun observe(packetCounter: Int): Int {
+        val current = packetCounter and 0xFF
+        val previous = previousPacketCounter
+        if (previous == null) {
+            samplePosition = 1
+        } else {
+            val delta = (current - previous + 256) % 256
+            if (delta > 0) {
+                samplePosition += delta
+            }
+        }
+        previousPacketCounter = current
+        return samplePosition
+    }
 }
 
 data class EraseTaskProgress(
@@ -80,6 +189,40 @@ enum class FlashRecordingPhase {
     Stopping,
 }
 
+internal fun aggregateFlashRecordingPhase(
+    devicePhases: Collection<FlashRecordingPhase>,
+    hasActiveRecordingDevices: Boolean,
+): FlashRecordingPhase =
+    when {
+        devicePhases.any { it == FlashRecordingPhase.Starting } -> FlashRecordingPhase.Starting
+        devicePhases.any { it == FlashRecordingPhase.Stopping } -> FlashRecordingPhase.Stopping
+        hasActiveRecordingDevices ||
+            devicePhases.any { it == FlashRecordingPhase.Recording } -> FlashRecordingPhase.Recording
+        else -> FlashRecordingPhase.Idle
+    }
+
+internal fun participantHasActiveRecordingOperation(
+    devicePhases: Map<String, FlashRecordingPhase>,
+    targetAddresses: Set<String>,
+): Boolean =
+    targetAddresses.any { address ->
+        devicePhases[address] in setOf(
+            FlashRecordingPhase.Starting,
+            FlashRecordingPhase.Recording,
+            FlashRecordingPhase.Stopping,
+        )
+    }
+
+internal fun shouldDeferRecordingNotification(
+    phase: FlashRecordingPhase?,
+    isKnownActiveRecording: Boolean,
+): Boolean =
+    isKnownActiveRecording ||
+        phase in setOf(
+            FlashRecordingPhase.Recording,
+            FlashRecordingPhase.Stopping,
+        )
+
 /**
  * 离线采集引擎 — 对标官方 SDK §4.12–4.13
  *
@@ -95,21 +238,32 @@ enum class FlashRecordingPhase {
  * 录制时无需配置 Mode；导出时通过 selectedExportIds 选择需要的字段。
  */
 class RecordingEngine(private val context: Context) : DotRecordingCallback {
+    private val recordingSessionPreferences = RecordingSessionPreferences(context)
 
     companion object {
         private const val TAG = "RecordingEngine"
         private const val LINK_DIAG_TAG = "DOT_LINK_DIAG"
+        private const val RECORDING_STATE_RECOVERY_ATTEMPTS = 6
+        private const val START_AFTER_STATE_QUERY_SETTLE_MS = 500L
         private const val EXPORT_WATCHDOG_INTERVAL_MS = 5_000L
-        private const val EXPORT_STALL_TIMEOUT_MS = 15_000L
+        private const val EXPORT_FIRST_DATA_TIMEOUT_MS = 45_000L
+        private const val EXPORT_STREAMING_STALL_TIMEOUT_MS = 60_000L
+        private const val EXPORT_RESTART_BASE_DELAY_MS = 900L
+        private const val EXPORT_RESTART_STAGGER_MS = 500L
         private const val EXPORT_MAX_RETRIES = 2
         private const val EXPORT_UI_PUBLISH_INTERVAL_MS = 250L
         private const val EXPORT_WRITE_BUFFER_SIZE = 64 * 1024
-        private const val EXPORT_PROTOCOL_BYTES_PER_FRAME = 3
         private const val AUTO_FILE_INFO_TIMEOUT_MS = 8_000L
-        private val EXPORT_FIELD_BINARY_LENGTHS = intArrayOf(
-            4, 16, 9, 12, 12, 16, 12, 12, 12, 6, 2, 1, 1
-        )
-
+        private const val FLASH_USAGE_REFRESH_INTERVAL_MS = 1_000L
+        private const val FLASH_STORAGE_BLOCK_BYTES = 4_096L
+        private const val STOP_RETRY_TICK_MS = 1_000L
+        private const val STOP_RETRY_SLOW_TICK_MS = 5_000L
+        private const val STOP_ACK_WAIT_MS = 3_000L
+        private const val STOP_STATE_SETTLE_MS = 800L
+        private const val STOP_CONFIRMATION_DELAY_WARNING_MS = 20_000L
+        private const val SYNC_GATT_QUIET_MS = 2_000L
+        // DOT 120 Hz Flash files grow at about 7.44 KB/s: 62 bytes per stored sample.
+        private const val FLASH_RECORDING_BYTES_PER_SAMPLE = 62L
         /**
          * 13 种可导出字段，按官方 RECORDING_DATA_TITLE_MAPPER 顺序。
          * ID 字节值与 DotRecordingManager.RECORDING_DATA_ID_* 常量一致（0–12）。
@@ -238,21 +392,40 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val command: RecordingCommand,
         val targets: Set<String>,
         val selectedKeys: Set<String> = emptySet(),
+        val targetFramesByFile: Map<String, Int> = emptyMap(),
         val epoch: Int,
     )
 
-    private data class AutoExportAfterStop(
+    private data class CompletedRecordingSession(
+        val sessionKey: String,
         val targets: Set<String>,
         val startUtcMs: Long,
         val stopUtcMs: Long,
+        val outputRatesByTarget: Map<String, Int>,
         val baselineKeys: Set<String>,
         val baselineKnown: Boolean,
+    ) {
+        val exportDecisionId: String
+            get() = "$sessionKey@$stopUtcMs"
+    }
+
+    private data class ActiveRecordingSession(
+        val sessionKey: String,
+        val targets: Set<String>,
+        val startUtcMs: Long,
+        val outputRatesByTarget: Map<String, Int>,
+        val baselineKeys: Set<String>,
     )
 
     private data class DeviceExportRequest(
         val address: String,
         val files: List<DotRecordingFileInfo>,
         val exportIds: ByteArray,
+    )
+
+    private data class ResolvedExportFile(
+        val key: String,
+        val fileInfo: DotRecordingFileInfo,
     )
 
     // ── 导出字段选择 ──
@@ -281,8 +454,17 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     private val _recordingPhase = MutableStateFlow(FlashRecordingPhase.Idle)
     val recordingPhase: StateFlow<FlashRecordingPhase> = _recordingPhase.asStateFlow()
 
+    private val _deviceRecordingPhases =
+        MutableStateFlow<Map<String, FlashRecordingPhase>>(emptyMap())
+    val deviceRecordingPhases: StateFlow<Map<String, FlashRecordingPhase>> =
+        _deviceRecordingPhases.asStateFlow()
+
     private val _recordingStates = MutableStateFlow<Map<String, DotRecordingState>>(emptyMap())
     val recordingStates: StateFlow<Map<String, DotRecordingState>> = _recordingStates.asStateFlow()
+
+    private val _delayedStopConfirmations = MutableStateFlow<Set<String>>(emptySet())
+    val delayedStopConfirmations: StateFlow<Set<String>> =
+        _delayedStopConfirmations.asStateFlow()
 
     private val _fileList = MutableStateFlow<Map<String, List<DotRecordingFileInfo>>>(emptyMap())
     val fileList: StateFlow<Map<String, List<DotRecordingFileInfo>>> = _fileList.asStateFlow()
@@ -296,13 +478,10 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     private val _exportTaskProgress = MutableStateFlow(ExportTaskProgress())
     val exportTaskProgress: StateFlow<ExportTaskProgress> = _exportTaskProgress.asStateFlow()
 
-    private val _pendingRecordingExportKeys = MutableStateFlow<Set<String>>(emptySet())
-    val pendingRecordingExportKeys: StateFlow<Set<String>> =
-        _pendingRecordingExportKeys.asStateFlow()
-
-    private val _preparingRecordingExport = MutableStateFlow(false)
-    val preparingRecordingExport: StateFlow<Boolean> =
-        _preparingRecordingExport.asStateFlow()
+    private val _recordingExportDecisions =
+        MutableStateFlow<Map<String, RecordingExportDecision>>(emptyMap())
+    val recordingExportDecisions: StateFlow<Map<String, RecordingExportDecision>> =
+        _recordingExportDecisions.asStateFlow()
 
     private val _eraseTaskProgress = MutableStateFlow(EraseTaskProgress())
     val eraseTaskProgress: StateFlow<EraseTaskProgress> = _eraseTaskProgress.asStateFlow()
@@ -316,28 +495,54 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     private val exportRequests = ConcurrentHashMap<String, DeviceExportRequest>()
     private val exportStartedDevices = ConcurrentHashMap.newKeySet<String>()
     private val exportDevicesWithData = ConcurrentHashMap.newKeySet<String>()
-    private val exportResettingDevices = ConcurrentHashMap.newKeySet<String>()
+    private val exportRestartScheduled = ConcurrentHashMap.newKeySet<String>()
+    private val exportDeferredRetryReasons = ConcurrentHashMap<String, String>()
     private val exportLastProgressAt = ConcurrentHashMap<String, Long>()
     private val exportRetryCounts = ConcurrentHashMap<String, Int>()
     private val exportFrameCounts = ConcurrentHashMap<String, AtomicLong>()
+    private val exportSampleProgress = ConcurrentHashMap<String, ExportSampleProgressTracker>()
     private val exportDeviceFrameCounts = ConcurrentHashMap<String, AtomicLong>()
     private val exportWrittenBytes = ConcurrentHashMap<String, Long>()
     private val exportStartedAt = ConcurrentHashMap<String, Long>()
     private val exportFirstDataAt = ConcurrentHashMap<String, Long>()
     private val exportLastUiPublishAt = ConcurrentHashMap<String, Long>()
+    private val exportRejectedCallbackKeys = ConcurrentHashMap.newKeySet<String>()
     private val exportProgressPublishLock = Any()
+    private val exportRestartSequence = AtomicLong(0L)
     @Volatile private var exportSessionStartedAt = 0L
     @Volatile private var exportStopRequested = false
 
     private val exportWatchdogRunnable = object : Runnable {
         override fun run() {
             if (exportStopRequested || exportRequests.isEmpty()) return
-            val now = System.currentTimeMillis()
-            exportRequests.keys.toList().forEach { norm ->
-                val lastProgress = exportLastProgressAt[norm] ?: now
-                if (now - lastProgress >= EXPORT_STALL_TIMEOUT_MS) {
-                    retryDeviceExport(norm, "导出长时间无进度")
+            val now = SystemClock.elapsedRealtime()
+            val retryTarget = exportRequests.keys
+                .toList()
+                .sortedBy { exportLastProgressAt[it] ?: Long.MAX_VALUE }
+                .firstOrNull { norm ->
+                    val manager = managers[norm]
+                    resolveExportWatchdogAction(
+                        nowMs = now,
+                        attemptStartedAtMs = exportStartedAt[norm]
+                            ?: exportLastProgressAt[norm]
+                            ?: now,
+                        lastProgressAtMs = exportLastProgressAt[norm] ?: now,
+                        hasReceivedData = norm in exportDevicesWithData,
+                        isConnected =
+                            manager?.mDevice?.connectionState == DotDevice.CONN_STATE_CONNECTED,
+                        isResetting = exportDeferredRetryReasons.containsKey(norm),
+                        isRestartScheduled = norm in exportRestartScheduled,
+                        firstDataTimeoutMs = EXPORT_FIRST_DATA_TIMEOUT_MS,
+                        streamingStallTimeoutMs = EXPORT_STREAMING_STALL_TIMEOUT_MS,
+                    ) == ExportWatchdogAction.Retry
                 }
+            if (retryTarget != null) {
+                val reason = if (retryTarget in exportDevicesWithData) {
+                    "导出数据长时间未继续"
+                } else {
+                    "启动后长时间未收到首帧"
+                }
+                retryDeviceExport(retryTarget, reason)
             }
             if (!exportStopRequested && exportRequests.isNotEmpty()) {
                 mainHandler.postDelayed(this, EXPORT_WATCHDOG_INTERVAL_MS)
@@ -347,26 +552,86 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     // addr -> latest recording clock anchors captured by this app session.
     private val recordingAnchors = ConcurrentHashMap<String, RecordingClockAnchors>()
+    private val recordingSessionUtcByDevice = ConcurrentHashMap<String, Long>()
+    private val activeRecordingSessions = ConcurrentHashMap<String, ActiveRecordingSession>()
     private val activeRecordingDevices = ConcurrentHashMap.newKeySet<String>()
     private val pendingStartAcks = ConcurrentHashMap.newKeySet<String>()
     private val pendingStopAcks = ConcurrentHashMap.newKeySet<String>()
+    private val reliableStopTargets = ConcurrentHashMap.newKeySet<String>()
+    private val reliableStopGroups = ConcurrentHashMap<String, Set<String>>()
+    private val stopRequestedAt = ConcurrentHashMap<String, Long>()
+    private val stopCommandSentAt = ConcurrentHashMap<String, Long>()
+    private val stopStateCheckAt = ConcurrentHashMap<String, Long>()
     private val latestRecordingStates = ConcurrentHashMap<String, DotRecordingState>()
     private val pendingStateChecks = ConcurrentHashMap<String, DotRecordingState>()
     private val lastNotificationEnableRequestAt = ConcurrentHashMap<String, Long>()
+    private val recordingFlashBaselines = ConcurrentHashMap<String, Int>()
+    private val recordingStartedAtElapsedMs = ConcurrentHashMap<String, Long>()
     private val pendingAutoFileInfoTargets = ConcurrentHashMap.newKeySet<String>()
     private val pendingAutoFileInfoRequests = ConcurrentHashMap.newKeySet<String>()
+    @Volatile private var flashUsageMonitoring = false
     @Volatile private var startAckTargets: Set<String> = emptySet()
     @Volatile private var stopAckTargets: Set<String> = emptySet()
-    @Volatile private var recordingSessionBaselineKeys: Set<String> = emptySet()
-    @Volatile private var recordingSessionTargets: Set<String> = emptySet()
-    @Volatile private var recordingSessionStartUtcMs: Long? = null
-    @Volatile private var autoExportAfterStop: AutoExportAfterStop? = null
+    @Volatile private var autoExportAfterStop: CompletedRecordingSession? = null
+    private val queuedAutoExportSessions = ArrayDeque<CompletedRecordingSession>()
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val reliableStopRunnable = object : Runnable {
+        override fun run() {
+            if (reliableStopTargets.isEmpty()) return
+            attemptReliableStops()
+            if (reliableStopTargets.isNotEmpty()) {
+                val nextDelay = if (_delayedStopConfirmations.value.isEmpty()) {
+                    STOP_RETRY_TICK_MS
+                } else {
+                    STOP_RETRY_SLOW_TICK_MS
+                }
+                mainHandler.postDelayed(this, nextDelay)
+            }
+        }
+    }
 
     @Volatile private var totalDevices = 0
     @Volatile private var operationEpoch = 0
     @Volatile private var pendingOperation: PendingRecordingOperation? = null
+
+    private val flashUsageRefreshRunnable = object : Runnable {
+        override fun run() {
+            if (!flashUsageMonitoring || activeRecordingDevices.isEmpty()) {
+                return
+            }
+
+            val now = SystemClock.elapsedRealtime()
+            val targets = activeRecordingDevices.toSet()
+            val updatedFlashInfo = _flashInfo.value.toMutableMap()
+            targets.forEach { norm ->
+                val mgr = managers[norm] ?: return@forEach
+                val current = updatedFlashInfo[norm] ?: return@forEach
+                val baseline = recordingFlashBaselines[norm] ?: current.first
+                val startedAt = recordingStartedAtElapsedMs[norm] ?: return@forEach
+                val outputRate = mgr.mDevice?.currentOutputRate
+                    ?.takeIf { it > 0 }
+                    ?: 120
+                val elapsedMs = (now - startedAt).coerceAtLeast(0L)
+                val payloadBytes =
+                    elapsedMs * outputRate * FLASH_RECORDING_BYTES_PER_SAMPLE / 1_000L
+                val allocatedBytes = if (payloadBytes > 0L) {
+                    ((payloadBytes + FLASH_STORAGE_BLOCK_BYTES - 1L) /
+                        FLASH_STORAGE_BLOCK_BYTES) * FLASH_STORAGE_BLOCK_BYTES +
+                        FLASH_STORAGE_BLOCK_BYTES
+                } else {
+                    0L
+                }
+                val estimatedUsed = (baseline.toLong() + allocatedBytes)
+                    .coerceAtMost(current.second.toLong())
+                    .coerceAtMost(Int.MAX_VALUE.toLong())
+                    .toInt()
+                updatedFlashInfo[norm] = estimatedUsed to current.second
+            }
+            _flashInfo.value = updatedFlashInfo
+            mainHandler.postDelayed(this, FLASH_USAGE_REFRESH_INTERVAL_MS)
+        }
+    }
 
     // ── 工具 ──
 
@@ -400,20 +665,50 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         }.getOrNull()
     }
 
-    private fun estimatedExportFrameCount(
-        fileInfo: DotRecordingFileInfo,
-        exportIds: ByteArray,
-    ): Int {
-        val frameBytes = EXPORT_PROTOCOL_BYTES_PER_FRAME + exportIds.sumOf { id ->
-            EXPORT_FIELD_BINARY_LENGTHS.getOrElse(id.toInt()) { 0 }
+    private fun estimatedExportFrameCount(fileInfo: DotRecordingFileInfo): Int =
+        estimatedFlashSampleCount(fileInfo.dataSize)
+
+    private fun resolveExportFile(
+        norm: String,
+        callbackInfo: DotRecordingFileInfo,
+    ): ResolvedExportFile? {
+        val request = exportRequests[norm] ?: return null
+        val requestedFile = request.files.firstOrNull { it.fileId == callbackInfo.fileId }
+            ?: callbackInfo.fileName
+                .takeIf { it.isNotBlank() }
+                ?.let { callbackName ->
+                    request.files.firstOrNull { it.fileName == callbackName }
+                }
+            ?: callbackInfo.startRecordingTimestamp
+                .takeIf { it > 0L }
+                ?.let { callbackTimestamp ->
+                    request.files.firstOrNull {
+                        it.startRecordingTimestamp == callbackTimestamp
+                    }
+                }
+            ?: return null
+        val key = exportFileKey(norm, requestedFile)
+        return key
+            .takeIf { it in _exportTaskProgress.value.targetFileKeys }
+            ?.let { ResolvedExportFile(it, requestedFile) }
+    }
+
+    private fun logRejectedExportCallbackOnce(
+        norm: String,
+        callbackInfo: DotRecordingFileInfo,
+    ) {
+        val callbackKey = "$norm-${callbackInfo.fileId}-${callbackInfo.fileName}"
+        if (exportRejectedCallbackKeys.add(callbackKey)) {
+            Log.w(
+                TAG,
+                "[$norm] ignored unmatched export callback: " +
+                    "fileId=${callbackInfo.fileId}, fileName=${callbackInfo.fileName}",
+            )
         }
-        if (frameBytes <= EXPORT_PROTOCOL_BYTES_PER_FRAME) return 1
-        return ((fileInfo.dataSize.toLong() + frameBytes - 1L) / frameBytes)
-            .coerceIn(1L, Int.MAX_VALUE.toLong())
-            .toInt()
     }
 
     private fun resetExportTracking(
+        targetAddresses: Set<String>,
         targetFiles: Map<String, Long>,
         targetFrames: Map<String, Int>,
     ) {
@@ -426,6 +721,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             ExportTaskProgress(
                 isExporting = true,
                 totalFiles = targetFileKeys.size,
+                targetAddresses = targetAddresses.map(::normalizeAddress).toSet(),
                 targetFramesByFile = targetFrames,
                 targetBytesByFile = targetFiles,
             )
@@ -435,11 +731,13 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     private fun clearExportRuntimeTracking() {
         exportFrameCounts.clear()
+        exportSampleProgress.clear()
         exportDeviceFrameCounts.clear()
         exportWrittenBytes.clear()
         exportStartedAt.clear()
         exportFirstDataAt.clear()
         exportLastUiPublishAt.clear()
+        exportRejectedCallbackKeys.clear()
         exportSessionStartedAt = 0L
     }
 
@@ -447,6 +745,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val norm = normalizeAddress(address)
         val prefix = "$norm-"
         exportFrameCounts.keys.removeIf { it.startsWith(prefix) }
+        exportSampleProgress.keys.removeIf { it.startsWith(prefix) }
         exportWrittenBytes.keys.removeIf { it.startsWith(prefix) }
         exportDeviceFrameCounts.remove(norm)
         exportStartedAt.remove(norm)
@@ -496,9 +795,10 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 it[norm] = deviceFrames
             }
             val task = _exportTaskProgress.value
+            if (writerKey !in task.targetFileKeys) return
             if (writerKey in task.finishedFileKeys && !force) return
             _exportTaskProgress.value = task.copy(
-                isExporting = task.totalFiles > 0,
+                isExporting = task.hasPendingFiles,
                 activeFileKeys = task.activeFileKeys + writerKey,
                 framesByFile = task.framesByFile.toMutableMap().also {
                     it[writerKey] = fileFrames
@@ -518,6 +818,13 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     private fun connectedManagerKeys(): Set<String> =
         managers.filterValues { it.mDevice?.connectionState == DotDevice.CONN_STATE_CONNECTED }.keys
+
+    private fun currentOutputRate(address: String): Int =
+        managers[normalizeAddress(address)]
+            ?.mDevice
+            ?.currentOutputRate
+            ?.takeIf { it > 0 }
+            ?: 120
 
     private fun setExportLinkPriority(address: String, highPriority: Boolean) {
         val norm = normalizeAddress(address)
@@ -560,11 +867,94 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         _recordingActive.value = activeRecordingDevices.isNotEmpty()
     }
 
-    private fun updateRecordingPhaseFromState() {
-        _recordingPhase.value = if (activeRecordingDevices.isNotEmpty()) {
-            FlashRecordingPhase.Recording
+    private fun startFlashUsageMonitoring(targets: Set<String> = activeRecordingDevices.toSet()) {
+        val now = SystemClock.elapsedRealtime()
+        targets.forEach { norm ->
+            _flashInfo.value[norm]?.first?.let { used ->
+                recordingFlashBaselines.putIfAbsent(norm, used)
+            }
+            recordingStartedAtElapsedMs.putIfAbsent(norm, now)
+        }
+        flashUsageMonitoring = true
+        mainHandler.removeCallbacks(flashUsageRefreshRunnable)
+        mainHandler.postDelayed(flashUsageRefreshRunnable, FLASH_USAGE_REFRESH_INTERVAL_MS)
+        Log.i(TAG, "live Flash usage estimation started")
+    }
+
+    private fun stopFlashUsageMonitoring() {
+        flashUsageMonitoring = false
+        mainHandler.removeCallbacks(flashUsageRefreshRunnable)
+    }
+
+    private fun clearFlashUsageMonitoring(
+        targets: Set<String> = recordingFlashBaselines.keys.toSet(),
+        restoreBaseline: Boolean = false,
+    ) {
+        if (restoreBaseline && targets.isNotEmpty()) {
+            _flashInfo.value = _flashInfo.value.toMutableMap().also { current ->
+                targets.forEach { norm ->
+                    val baseline = recordingFlashBaselines[norm] ?: return@forEach
+                    val total = current[norm]?.second ?: return@forEach
+                    current[norm] = baseline to total
+                }
+            }
+        }
+        targets.forEach { norm ->
+            recordingFlashBaselines.remove(norm)
+            recordingStartedAtElapsedMs.remove(norm)
+        }
+        if (activeRecordingDevices.isEmpty()) {
+            stopFlashUsageMonitoring()
         } else {
-            FlashRecordingPhase.Idle
+            flashUsageMonitoring = true
+            mainHandler.removeCallbacks(flashUsageRefreshRunnable)
+            mainHandler.postDelayed(flashUsageRefreshRunnable, FLASH_USAGE_REFRESH_INTERVAL_MS)
+        }
+    }
+
+    private fun setDeviceRecordingPhase(
+        targets: Set<String>,
+        phase: FlashRecordingPhase,
+    ) {
+        _deviceRecordingPhases.value = _deviceRecordingPhases.value.toMutableMap().also { phases ->
+            targets.forEach { phases[it] = phase }
+        }
+        updateAggregateRecordingPhase()
+    }
+
+    private fun updateAggregateRecordingPhase() {
+        _recordingPhase.value = aggregateFlashRecordingPhase(
+            devicePhases = _deviceRecordingPhases.value.values,
+            hasActiveRecordingDevices = activeRecordingDevices.isNotEmpty(),
+        )
+    }
+
+    private fun recordingSessionKey(targets: Set<String>): String {
+        val slotIds = targets.mapNotNull { target ->
+            LongJumpDeviceRoles.assignmentForDevice(target)?.participant?.slotId
+        }.distinct()
+        return slotIds.singleOrNull() ?: targets.sorted().joinToString("+")
+    }
+
+    private fun updateRecordingPhaseFromState() {
+        if (activeRecordingDevices.isNotEmpty()) {
+            val stoppingTargets = activeRecordingDevices.filter {
+                it in reliableStopTargets
+            }.toSet()
+            val recordingTargets = activeRecordingDevices - stoppingTargets
+            if (recordingTargets.isNotEmpty()) {
+                setDeviceRecordingPhase(recordingTargets, FlashRecordingPhase.Recording)
+            }
+            if (stoppingTargets.isNotEmpty()) {
+                setDeviceRecordingPhase(stoppingTargets, FlashRecordingPhase.Stopping)
+            }
+            startFlashUsageMonitoring()
+        } else {
+            _deviceRecordingPhases.value = _deviceRecordingPhases.value.mapValues {
+                FlashRecordingPhase.Idle
+            }
+            updateAggregateRecordingPhase()
+            clearFlashUsageMonitoring()
         }
     }
 
@@ -585,7 +975,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val oldState = latestRecordingStates[norm]
         if (
             applyActiveState &&
-            _recordingPhase.value == FlashRecordingPhase.Recording &&
+            _deviceRecordingPhases.value[norm] == FlashRecordingPhase.Recording &&
             oldState == DotRecordingState.onRecording &&
             state in setOf(DotRecordingState.idle, DotRecordingState.success, DotRecordingState.unknown)
         ) {
@@ -596,30 +986,75 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         _recordingStates.value = _recordingStates.value.toMutableMap().also { it[norm] = state }
         if (!applyActiveState) return
         when (state) {
-            DotRecordingState.onRecording -> activeRecordingDevices.add(norm)
+            DotRecordingState.onRecording -> {
+                activeRecordingDevices.add(norm)
+                restoreActiveRecordingSession(norm)
+                setDeviceRecordingPhase(
+                    setOf(norm),
+                    if (norm in reliableStopTargets) {
+                        FlashRecordingPhase.Stopping
+                    } else {
+                        FlashRecordingPhase.Recording
+                    }
+                )
+            }
             DotRecordingState.idle,
             DotRecordingState.success,
             DotRecordingState.fail,
-            DotRecordingState.invalidCmd -> activeRecordingDevices.remove(norm)
+            DotRecordingState.invalidCmd -> {
+                activeRecordingDevices.remove(norm)
+                setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Idle)
+            }
             else -> Unit
         }
         updateRecordingActive()
         updateRecordingPhaseFromStateIfStable()
     }
 
+    private fun restoreActiveRecordingSession(deviceId: String) {
+        val stored = recordingSessionPreferences.findAssignment(
+            deviceId = deviceId,
+            recordingUtcMs = 0L,
+        ) ?: return
+        val participant = stored.assignment.participant
+        val targets = participant.normalizedDeviceIds
+        if (targets.isEmpty()) return
+        val sessionKey = participant.slotId.ifBlank { recordingSessionKey(targets) }
+        activeRecordingSessions.putIfAbsent(
+            sessionKey,
+            ActiveRecordingSession(
+                sessionKey = sessionKey,
+                targets = targets,
+                startUtcMs = stored.sessionUtcMs,
+                outputRatesByTarget = targets.associateWith(::currentOutputRate),
+                baselineKeys = emptySet(),
+            ),
+        )
+        targets.forEach { target ->
+            recordingSessionUtcByDevice.putIfAbsent(target, stored.sessionUtcMs)
+        }
+    }
+
+    @Synchronized
     private fun finishStartAcksIfComplete() {
         if (pendingStartAcks.isNotEmpty()) return
         val targets = startAckTargets
+        if (targets.isEmpty()) return
         startAckTargets = emptySet()
+        val sessionKey = recordingSessionKey(targets)
         val recordingTargets = targets.filter { it in activeRecordingDevices }.toSet()
         if (targets.isNotEmpty() && recordingTargets.containsAll(targets)) {
-            _recordingPhase.value = FlashRecordingPhase.Recording
+            setDeviceRecordingPhase(targets, FlashRecordingPhase.Recording)
+            startFlashUsageMonitoring(targets)
             appendLog("开始录制 ACK 已全部返回")
             return
         }
-        recordingSessionStartUtcMs = null
-        recordingSessionBaselineKeys = emptySet()
-        recordingSessionTargets = emptySet()
+        clearFlashUsageMonitoring(targets, restoreBaseline = true)
+        activeRecordingSessions.remove(sessionKey)
+        targets.forEach {
+            recordingSessionUtcByDevice.remove(it)
+            recordingAnchors.remove(it)
+        }
         val rollbackTargets = targets.filter { norm ->
             managers[norm]?.mDevice?.connectionState == DotDevice.CONN_STATE_CONNECTED
         }.toSet()
@@ -628,7 +1063,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             pendingStopAcks.clear()
             pendingStopAcks.addAll(rollbackTargets)
             stopAckTargets = rollbackTargets
-            _recordingPhase.value = FlashRecordingPhase.Stopping
+            setDeviceRecordingPhase(rollbackTargets, FlashRecordingPhase.Stopping)
             rollbackTargets.forEach { norm ->
                 val mgr = managers[norm] ?: return@forEach
                 if (!mgr.stopRecording()) {
@@ -649,66 +1084,268 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         }
     }
 
+    @Synchronized
+    private fun beginReliableStop(
+        requestedTargets: Set<String>,
+        force: Boolean = false,
+    ) {
+        val normalizedTargets = requestedTargets.map(::normalizeAddress).toSet()
+        val targets = if (force) {
+            normalizedTargets.filter { it in managers.keys }.toSet()
+        } else {
+            normalizedTargets.filter { target ->
+                target in activeRecordingDevices ||
+                    _deviceRecordingPhases.value[target] in setOf(
+                        FlashRecordingPhase.Recording,
+                        FlashRecordingPhase.Stopping,
+                    )
+            }.toSet()
+        }
+        if (targets.isEmpty()) {
+            appendLog("该设备组当前没有正在录制的设备")
+            return
+        }
+
+        val sessionKey = recordingSessionKey(targets)
+        val fullSessionTargets = activeRecordingSessions[sessionKey]?.targets ?: targets
+        reliableStopGroups[sessionKey] = fullSessionTargets
+        reliableStopTargets.addAll(targets)
+        val now = SystemClock.elapsedRealtime()
+        targets.forEach { stopRequestedAt.putIfAbsent(it, now) }
+        _delayedStopConfirmations.value -= targets
+        setDeviceRecordingPhase(targets, FlashRecordingPhase.Stopping)
+        appendLog(
+            "停止请求已接管：${targets.size} 台设备；弱信号或断联时将自动等待回连并继续"
+        )
+        scheduleReliableStopAttempt(0L)
+    }
+
+    private fun scheduleReliableStopAttempt(delayMs: Long = STOP_RETRY_TICK_MS) {
+        mainHandler.removeCallbacks(reliableStopRunnable)
+        mainHandler.postDelayed(reliableStopRunnable, delayMs)
+    }
+
+    @Synchronized
+    private fun attemptReliableStops() {
+        val now = SystemClock.elapsedRealtime()
+        reliableStopTargets.toSet().forEach { norm ->
+            val manager = managers[norm] ?: return@forEach
+            val requestedAt = stopRequestedAt[norm] ?: now.also {
+                stopRequestedAt[norm] = it
+            }
+            if (
+                now - requestedAt >= STOP_CONFIRMATION_DELAY_WARNING_MS &&
+                norm !in _delayedStopConfirmations.value
+            ) {
+                _delayedStopConfirmations.value += norm
+                appendLog(
+                    "[${manager.mDevice?.address ?: norm}] 停止超过 20 秒仍未确认，" +
+                        "将降低轮询频率并继续自动重试"
+                )
+            }
+            val connected =
+                manager.mDevice?.connectionState == DotDevice.CONN_STATE_CONNECTED
+            if (!connected) return@forEach
+
+            val sentAt = stopCommandSentAt[norm] ?: 0L
+            if (norm in pendingStopAcks) {
+                if (now - sentAt < STOP_ACK_WAIT_MS) return@forEach
+                pendingStopAcks.remove(norm)
+                val stateRequested = manager.requestRecordingState()
+                stopStateCheckAt[norm] = now
+                appendLog(
+                    "[${manager.mDevice?.address ?: norm}] 停止 ACK 未返回，" +
+                        if (stateRequested) "正在复查设备状态" else "状态查询忙，稍后重试"
+                )
+                return@forEach
+            }
+
+            val checkedAt = stopStateCheckAt[norm] ?: 0L
+            if (now - checkedAt < STOP_STATE_SETTLE_MS) return@forEach
+
+            pendingStopAcks.add(norm)
+            stopCommandSentAt[norm] = now
+            val accepted = manager.stopRecording()
+            appendLog(
+                "[${manager.mDevice?.address ?: norm}] 已发送停止录制，等待 ACK" +
+                    if (accepted) "" else "（SDK 队列繁忙，将自动复查并重试）"
+            )
+        }
+    }
+
+    @Synchronized
+    private fun confirmReliableStop(
+        norm: String,
+        rawAddress: String,
+        source: String,
+    ) {
+        if (!reliableStopTargets.remove(norm)) return
+        pendingStopAcks.remove(norm)
+        stopRequestedAt.remove(norm)
+        stopCommandSentAt.remove(norm)
+        stopStateCheckAt.remove(norm)
+        _delayedStopConfirmations.value -= norm
+        latestRecordingStates[norm] = DotRecordingState.idle
+        _recordingStates.value = _recordingStates.value.toMutableMap().also {
+            it[norm] = DotRecordingState.idle
+        }
+        activeRecordingDevices.remove(norm)
+        setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Idle)
+        updateRecordingActive()
+        appendLog("[$rawAddress] 已确认停止（$source）")
+        finishReliableStopGroups()
+        if (reliableStopTargets.isEmpty()) {
+            mainHandler.removeCallbacks(reliableStopRunnable)
+        } else {
+            scheduleReliableStopAttempt(0L)
+        }
+    }
+
+    @Synchronized
+    private fun finishReliableStopGroups() {
+        val completed = reliableStopGroups.entries.filter { (_, targets) ->
+            targets.none { it in reliableStopTargets }
+        }
+        completed.forEach { (sessionKey, requestedTargets) ->
+            if (!reliableStopGroups.remove(sessionKey, requestedTargets)) return@forEach
+            val activeSession = activeRecordingSessions.remove(sessionKey)
+            val stoppedTargets = activeSession?.targets ?: requestedTargets
+            val sessionStartUtcMs = activeSession?.startUtcMs
+            val baselineKeys = activeSession?.baselineKeys.orEmpty()
+            val outputRatesByTarget = activeSession?.outputRatesByTarget
+                ?: stoppedTargets.associateWith(::currentOutputRate)
+            val baselineKnown = stoppedTargets.all { it in _fileList.value.keys }
+            val stopUtcMs = System.currentTimeMillis()
+            clearFlashUsageMonitoring(stoppedTargets)
+            setDeviceRecordingPhase(stoppedTargets, FlashRecordingPhase.Idle)
+            updateRecordingActive()
+            appendLog("该运动员左右脚停止 ACK 已全部确认")
+            if (stoppedTargets.isNotEmpty() && sessionStartUtcMs != null) {
+                enqueueAutoExportSession(
+                    CompletedRecordingSession(
+                        sessionKey = sessionKey,
+                        targets = stoppedTargets,
+                        startUtcMs = sessionStartUtcMs,
+                        stopUtcMs = stopUtcMs,
+                        outputRatesByTarget = outputRatesByTarget,
+                        baselineKeys = baselineKeys,
+                        baselineKnown = baselineKnown,
+                    )
+                )
+            } else {
+                refreshFlashAfterStop(stoppedTargets)
+            }
+        }
+    }
+
+    @Synchronized
     private fun finishStopAcksIfComplete() {
         if (pendingStopAcks.isNotEmpty()) return
         val requestedTargets = stopAckTargets
-        val stillRecording = activeRecordingDevices.toSet()
-        if (stillRecording.isNotEmpty()) {
+        if (requestedTargets.isEmpty()) return
+        val stillRecordingTargets = requestedTargets.filter {
+            it in activeRecordingDevices
+        }.toSet()
+        if (stillRecordingTargets.isNotEmpty()) {
             stopAckTargets = emptySet()
-            _recordingPhase.value = FlashRecordingPhase.Recording
+            setDeviceRecordingPhase(stillRecordingTargets, FlashRecordingPhase.Recording)
+            startFlashUsageMonitoring(stillRecordingTargets)
             updateRecordingActive()
             appendLog(
-                "部分设备未确认停止，仍保持录制状态：${stillRecording.joinToString()}"
+                "部分设备未确认停止，仍保持录制状态：${stillRecordingTargets.joinToString()}"
             )
             return
         }
-        val stoppedTargets = recordingSessionTargets.ifEmpty { requestedTargets }
-        val sessionStartUtcMs = recordingSessionStartUtcMs
-        val baselineKeys = recordingSessionBaselineKeys
+        val sessionKey = recordingSessionKey(requestedTargets)
+        val activeSession = activeRecordingSessions.remove(sessionKey)
+        val stoppedTargets = activeSession?.targets ?: requestedTargets
+        val sessionStartUtcMs = activeSession?.startUtcMs
+        val baselineKeys = activeSession?.baselineKeys.orEmpty()
+        val outputRatesByTarget = activeSession?.outputRatesByTarget
+            ?: stoppedTargets.associateWith(::currentOutputRate)
         val baselineKnown = stoppedTargets.all { it in _fileList.value.keys }
         val stopUtcMs = System.currentTimeMillis()
         stopAckTargets = emptySet()
-        recordingSessionStartUtcMs = null
-        recordingSessionBaselineKeys = emptySet()
-        recordingSessionTargets = emptySet()
+        clearFlashUsageMonitoring(stoppedTargets)
+        setDeviceRecordingPhase(stoppedTargets, FlashRecordingPhase.Idle)
         updateRecordingActive()
-        _recordingPhase.value = FlashRecordingPhase.Idle
         appendLog("停止录制 ACK 已全部返回")
         if (stoppedTargets.isNotEmpty() && sessionStartUtcMs != null) {
-            val session = AutoExportAfterStop(
+            val session = CompletedRecordingSession(
+                sessionKey = sessionKey,
                 targets = stoppedTargets,
                 startUtcMs = sessionStartUtcMs,
                 stopUtcMs = stopUtcMs,
+                outputRatesByTarget = outputRatesByTarget,
                 baselineKeys = baselineKeys,
                 baselineKnown = baselineKnown,
             )
-            autoExportAfterStop = session
-            _preparingRecordingExport.value = true
-            mainHandler.postDelayed({
-                if (_recordingPhase.value == FlashRecordingPhase.Idle && autoExportAfterStop == session) {
-                    requestAutoExportFileInfo(session)
-                }
-            }, 1_200L)
+            enqueueAutoExportSession(session)
         } else {
-            refreshFlashAfterStop()
+            refreshFlashAfterStop(stoppedTargets)
         }
     }
 
-    private fun refreshFlashAfterStop() {
+    private fun refreshFlashAfterStop(targets: Set<String>) {
         mainHandler.postDelayed({
-            if (_recordingPhase.value != FlashRecordingPhase.Idle) return@postDelayed
-            requestFlashInfo()
+            targets.forEach { managers[it]?.requestFlashInfo() }
         }, 700L)
     }
 
-    private fun requestAutoExportFileInfo(session: AutoExportAfterStop) {
+    private fun enqueueAutoExportSession(session: CompletedRecordingSession) {
+        val decision = RecordingExportDecision(
+            id = session.exportDecisionId,
+            sessionKey = session.sessionKey,
+            targetAddresses = session.targets,
+        )
+        _recordingExportDecisions.value = _recordingExportDecisions.value.toMutableMap().also {
+            it[decision.id] = decision
+        }
+        queuedAutoExportSessions.addLast(session)
+        startNextAutoExportSession()
+    }
+
+    private fun startNextAutoExportSession() {
+        if (!canStartNextRecordingExportPreparation(
+                hasActivePreparation = autoExportAfterStop != null,
+                hasExportTransfer = _exportTaskProgress.value.hasPendingFiles,
+                queuedSessionCount = queuedAutoExportSessions.size,
+            )
+        ) return
+        var session: CompletedRecordingSession? = null
+        while (queuedAutoExportSessions.isNotEmpty() && session == null) {
+            val candidate = queuedAutoExportSessions.removeFirst()
+            if (_recordingExportDecisions.value[candidate.exportDecisionId]?.isPreparing == true) {
+                session = candidate
+            }
+        }
+        val nextSession = session ?: return
+        autoExportAfterStop = nextSession
+        mainHandler.postDelayed({
+            if (autoExportAfterStop === nextSession) {
+                requestAutoExportFileInfo(nextSession)
+            }
+        }, 1_200L)
+    }
+
+    private fun updateRecordingExportDecision(
+        id: String,
+        transform: (RecordingExportDecision) -> RecordingExportDecision,
+    ) {
+        _recordingExportDecisions.value = _recordingExportDecisions.value.toMutableMap().also {
+            val current = it[id] ?: return
+            it[id] = transform(current)
+        }
+    }
+
+    private fun requestAutoExportFileInfo(session: CompletedRecordingSession) {
         pendingAutoFileInfoTargets.clear()
         pendingAutoFileInfoTargets.addAll(session.targets)
         pendingAutoFileInfoRequests.clear()
         _fileList.value = _fileList.value.toMutableMap().also { current ->
             session.targets.forEach { current.remove(it) }
         }
-        appendLog("正在读取刚才录制的文件…")
+        appendLog("正在读取该运动员刚才录制的文件…")
         session.targets.forEach { addr ->
             managers[addr]?.requestFlashInfo()
         }
@@ -720,14 +1357,21 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     private fun finishAutoExportFileInfoIfReady(force: Boolean = false) {
         val session = autoExportAfterStop ?: return
+        val decisionId = session.exportDecisionId
         if (!force && pendingAutoFileInfoTargets.isNotEmpty()) return
         if (force && pendingAutoFileInfoTargets.isNotEmpty()) {
             val missing = pendingAutoFileInfoTargets.toSet()
             pendingAutoFileInfoTargets.clear()
             pendingAutoFileInfoRequests.clear()
             autoExportAfterStop = null
-            _preparingRecordingExport.value = false
-            appendLog("部分设备文件列表读取超时，未生成不完整导出提示：${missing.joinToString()}")
+            updateRecordingExportDecision(decisionId) {
+                it.copy(
+                    isPreparing = false,
+                    errorMessage = "文件确认超时，请保持左右脚设备连接后从文件列表导出",
+                )
+            }
+            appendLog("该运动员部分设备文件列表读取超时：${missing.joinToString()}")
+            startNextAutoExportSession()
             return
         }
         pendingAutoFileInfoTargets.clear()
@@ -758,47 +1402,95 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             .filterValues { it.isEmpty() }
             .keys
         if (missingTargets.isNotEmpty()) {
-            appendLog("未完整找到本次录制文件，未生成导出提示：${missingTargets.joinToString()}")
+            appendLog("未完整找到该运动员本次录制文件：${missingTargets.joinToString()}")
             autoExportAfterStop = null
-            _preparingRecordingExport.value = false
+            updateRecordingExportDecision(decisionId) {
+                it.copy(
+                    isPreparing = false,
+                    errorMessage = "未完整找到左右脚文件，请从文件列表手动选择",
+                )
+            }
+            startNextAutoExportSession()
             return
         }
         val selectedKeys = selectedKeysByTarget.values.flatten().toSet()
 
         if (selectedKeys.isEmpty()) {
-            appendLog("未找到刚才录制的文件，请手动读取文件")
+            appendLog("未找到该运动员刚才录制的文件，请手动读取文件")
             autoExportAfterStop = null
-            _preparingRecordingExport.value = false
+            updateRecordingExportDecision(decisionId) {
+                it.copy(
+                    isPreparing = false,
+                    errorMessage = "未找到本次录制文件，请从文件列表手动选择",
+                )
+            }
+            startNextAutoExportSession()
             return
         }
 
         autoExportAfterStop = null
-        _preparingRecordingExport.value = false
-        _pendingRecordingExportKeys.value = selectedKeys
-        appendLog("本次录制的 ${selectedKeys.size} 个文件已就绪，等待确认是否导出")
-    }
-
-    fun exportLatestRecording() {
-        val selectedKeys = _pendingRecordingExportKeys.value
-        if (selectedKeys.isEmpty()) return
-        _preparingRecordingExport.value = false
-        _pendingRecordingExportKeys.value = emptySet()
-        appendLog("导出本次录制的 ${selectedKeys.size} 个文件")
-        exportSelected(selectedKeys)
-    }
-
-    fun dismissLatestRecordingExport() {
-        if (_preparingRecordingExport.value || _pendingRecordingExportKeys.value.isNotEmpty()) {
-            appendLog("已暂不导出本次录制，可从文件列表选择其他数据")
+        val targetFramesByFile = buildMap {
+            selectedKeysByTarget.forEach { (target, keys) ->
+                if (keys.size != 1) return@forEach
+                val outputRate = session.outputRatesByTarget[target]
+                    ?: currentOutputRate(target)
+                put(
+                    keys.single(),
+                    estimatedRecordedSampleCount(
+                        startUtcMs = session.startUtcMs,
+                        stopUtcMs = session.stopUtcMs,
+                        outputRateHz = outputRate,
+                    ),
+                )
+            }
         }
-        autoExportAfterStop = null
-        pendingAutoFileInfoTargets.clear()
-        pendingAutoFileInfoRequests.clear()
-        _preparingRecordingExport.value = false
-        _pendingRecordingExportKeys.value = emptySet()
+        updateRecordingExportDecision(decisionId) {
+            it.copy(
+                fileKeys = selectedKeys,
+                targetFramesByFile = targetFramesByFile,
+                isPreparing = false,
+                errorMessage = null,
+            )
+        }
+        appendLog("该运动员本次录制的 ${selectedKeys.size} 个文件已就绪")
+        startNextAutoExportSession()
+    }
+
+    fun exportRecordingDecision(decisionId: String): Boolean {
+        val decision = _recordingExportDecisions.value[decisionId] ?: return false
+        if (!decision.isReady || _exportTaskProgress.value.hasPendingFiles) return false
+        val accepted = requestStateThenRun(
+            command = RecordingCommand.ExportSelected,
+            selectedKeys = decision.fileKeys,
+            targetFramesByFile = decision.targetFramesByFile,
+        )
+        if (!accepted) return false
+        _recordingExportDecisions.value = _recordingExportDecisions.value - decisionId
+        appendLog("导出该运动员本次录制的 ${decision.fileCount} 个文件")
+        return true
+    }
+
+    fun dismissRecordingExportDecision(decisionId: String) {
+        val decision = _recordingExportDecisions.value[decisionId] ?: return
+        _recordingExportDecisions.value = _recordingExportDecisions.value - decisionId
+        queuedAutoExportSessions.removeAll { it.exportDecisionId == decisionId }
+        if (autoExportAfterStop?.exportDecisionId == decisionId) {
+            autoExportAfterStop = null
+            pendingAutoFileInfoTargets.clear()
+            pendingAutoFileInfoRequests.clear()
+        }
+        appendLog(
+            if (decision.errorMessage == null) {
+                "该运动员本次录制暂不导出，可从文件列表选择其他数据"
+            } else {
+                "已关闭该运动员的文件确认提示"
+            }
+        )
+        startNextAutoExportSession()
     }
 
     private fun scheduleStopAckTimeout(label: String) {
+        val timeoutMs = 7_000L + (pendingStopAcks.size - 2).coerceAtLeast(0) * 1_000L
         mainHandler.postDelayed({
             if (pendingStopAcks.isNotEmpty()) {
                 val timedOut = pendingStopAcks.toSet()
@@ -821,7 +1513,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                             val unresolved = pendingStopAcks.toSet()
                             pendingStopAcks.clear()
                             stopAckTargets = emptySet()
-                            _recordingPhase.value = FlashRecordingPhase.Recording
+                            setDeviceRecordingPhase(unresolved, FlashRecordingPhase.Recording)
+                            startFlashUsageMonitoring(unresolved)
                             updateRecordingActive()
                             appendLog(
                                 "仍有设备未确认停止，请保持设备靠近后重试：${unresolved.joinToString()}"
@@ -832,7 +1525,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     }
                 }, 2_000L)
             }
-        }, 7_000L)
+        }, timeoutMs)
     }
 
     private fun flashReadyForStart(targets: Set<String>): Boolean {
@@ -853,7 +1546,12 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         return true
     }
 
-    private fun requestStateThenRun(command: RecordingCommand, selectedKeys: Set<String> = emptySet()): Boolean {
+    private fun requestStateThenRun(
+        command: RecordingCommand,
+        selectedKeys: Set<String> = emptySet(),
+        targetFramesByFile: Map<String, Int> = emptyMap(),
+        explicitTargets: Set<String>? = null,
+    ): Boolean {
         if (pendingOperation != null || pendingStartAcks.isNotEmpty() || pendingStopAcks.isNotEmpty()) {
             appendLog("已有录制操作等待 ACK，请稍候")
             return false
@@ -864,7 +1562,10 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         }
 
         val connectedKeys = connectedManagerKeys()
-        val targets = when (command) {
+        val targets = explicitTargets
+            ?.map(::normalizeAddress)
+            ?.toSet()
+            ?: when (command) {
             RecordingCommand.Start -> managers.keys.toSet()
             RecordingCommand.Stop -> activeRecordingDevices.ifEmpty { managers.keys }.toSet()
             RecordingCommand.RequestFiles ->
@@ -875,7 +1576,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 .mapNotNull { it.substringBefore("-", missingDelimiterValue = "").ifBlank { null } }
                 .toSet()
                 .ifEmpty { connectedKeys }
-        }
+            }
 
         if (targets.isEmpty()) {
             appendLog("没有已连接设备可执行操作")
@@ -897,14 +1598,15 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             if (!flashReadyForStart(targets)) return false
         }
 
-        if (command == RecordingCommand.RequestFiles) {
-            doRequestFileInfo(targets)
-            return true
-        }
-
         val epoch = ++operationEpoch
         pendingStateChecks.clear()
-        pendingOperation = PendingRecordingOperation(command, targets, selectedKeys, epoch)
+        pendingOperation = PendingRecordingOperation(
+            command = command,
+            targets = targets,
+            selectedKeys = selectedKeys,
+            targetFramesByFile = targetFramesByFile,
+            epoch = epoch,
+        )
 
         var requestCount = 0
         targets.forEach { addr ->
@@ -930,8 +1632,23 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 if (op.command == RecordingCommand.Erase) {
                     _eraseTaskProgress.value = EraseTaskProgress()
                 }
-                if (op.command == RecordingCommand.Start || op.command == RecordingCommand.Stop) {
-                    updateRecordingPhaseFromState()
+                when (op.command) {
+                    RecordingCommand.Start ->
+                        setDeviceRecordingPhase(op.targets, FlashRecordingPhase.Idle)
+                    RecordingCommand.Stop -> {
+                        val stillRecording = op.targets.filter {
+                            it in activeRecordingDevices
+                        }.toSet()
+                        setDeviceRecordingPhase(
+                            op.targets - stillRecording,
+                            FlashRecordingPhase.Idle,
+                        )
+                        setDeviceRecordingPhase(
+                            stillRecording,
+                            FlashRecordingPhase.Recording,
+                        )
+                    }
+                    else -> Unit
                 }
             }
         }, 2_500L)
@@ -960,19 +1677,35 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     failedDevices = op.targets
                 )
             }
-            if (op.command == RecordingCommand.Start || op.command == RecordingCommand.Stop) {
-                updateRecordingPhaseFromState()
+            when (op.command) {
+                RecordingCommand.Start ->
+                    setDeviceRecordingPhase(op.targets, FlashRecordingPhase.Idle)
+                RecordingCommand.Stop ->
+                    setDeviceRecordingPhase(op.targets, FlashRecordingPhase.Recording)
+                else -> Unit
             }
             return
         }
 
         when (op.command) {
-            RecordingCommand.Start -> doStartRecording(op.targets)
+            RecordingCommand.Start -> {
+                // DotRecordingManager reports the state callback before the underlying GATT
+                // transaction is fully released. Starting immediately can make one device reject
+                // startRecording() as busy, especially in synchronized pairs.
+                mainHandler.postDelayed(
+                    { doStartRecording(op.targets) },
+                    START_AFTER_STATE_QUERY_SETTLE_MS,
+                )
+            }
             RecordingCommand.Stop -> doStopRecording(op.targets)
             RecordingCommand.RequestFiles -> doRequestFileInfo(op.targets)
             RecordingCommand.Erase -> doEraseAll(op.targets)
             RecordingCommand.ExportAll -> doExportAll(op.targets)
-            RecordingCommand.ExportSelected -> doExportSelected(op.targets, op.selectedKeys)
+            RecordingCommand.ExportSelected -> doExportSelected(
+                checkedTargets = op.targets,
+                selectedKeys = op.selectedKeys,
+                targetFramesByFile = op.targetFramesByFile,
+            )
         }
     }
 
@@ -990,7 +1723,6 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     fun setup(devices: List<DotDevice>) {
         clear()
-        totalDevices = devices.size
         _notificationReady.value = emptySet()
         _flashInfo.value = emptyMap()
         _fileList.value = emptyMap()
@@ -999,53 +1731,144 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         _log.value = emptyList()
         _recordingActive.value = false
         _recordingStates.value = emptyMap()
+        _deviceRecordingPhases.value = emptyMap()
         recordingAnchors.clear()
+        recordingSessionUtcByDevice.clear()
+        activeRecordingSessions.clear()
         activeRecordingDevices.clear()
         pendingStartAcks.clear()
         pendingStopAcks.clear()
+        reliableStopTargets.clear()
+        reliableStopGroups.clear()
+        stopRequestedAt.clear()
+        stopCommandSentAt.clear()
+        stopStateCheckAt.clear()
+        _delayedStopConfirmations.value = emptySet()
+        mainHandler.removeCallbacks(reliableStopRunnable)
         latestRecordingStates.clear()
         pendingStateChecks.clear()
         lastNotificationEnableRequestAt.clear()
         startAckTargets = emptySet()
         stopAckTargets = emptySet()
         pendingOperation = null
+        queuedAutoExportSessions.clear()
         _recordingStates.value = emptyMap()
         _recordingPhase.value = FlashRecordingPhase.Idle
+        ensureSetup(devices)
+    }
 
+    fun ensureSetup(devices: List<DotDevice>) {
         devices.forEach { dev ->
             val addr = normalizeAddress(dev.address ?: return@forEach)
-            val mgr = DotRecordingManager(context, dev, this)
-            managers[addr] = mgr
-            if (mgr.enableDataRecordingNotification()) {
+            val existing = managers[addr]
+            val manager = if (existing == null || existing.mDevice !== dev) {
+                existing?.clear()
+                _notificationReady.value = _notificationReady.value - addr
+                _flashInfo.value = _flashInfo.value - addr
+                _recordingStates.value = _recordingStates.value - addr
+                latestRecordingStates.remove(addr)
+                DotRecordingManager(context, dev, this).also { managers[addr] = it }
+            } else {
+                existing
+            }
+
+            if (addr !in _deviceRecordingPhases.value) {
+                _deviceRecordingPhases.value = _deviceRecordingPhases.value.toMutableMap().also {
+                    it[addr] = FlashRecordingPhase.Idle
+                }
+            }
+            val deferNotification = shouldDeferRecordingNotification(
+                phase = _deviceRecordingPhases.value[addr],
+                isKnownActiveRecording = addr in activeRecordingDevices,
+            )
+            if (
+                addr !in _notificationReady.value &&
+                !deferNotification &&
+                manager.enableDataRecordingNotification()
+            ) {
                 lastNotificationEnableRequestAt[addr] = System.currentTimeMillis()
                 appendLog("[${dev.address}] 正在启用录制通知…")
-            } else {
+            } else if (addr !in _notificationReady.value && deferNotification) {
+                appendLog("[${dev.address}] 录制中回连，先确认录制状态，不重写录制通知")
+            } else if (addr !in _notificationReady.value) {
                 appendLog("[${dev.address}] 发送启用录制通知失败")
             }
+            scheduleRecordingStateRecovery(addr, manager)
             mainHandler.postDelayed({
-                if (mgr.requestRecordingState()) {
-                    appendLog("[${dev.address}] 已发送录制状态查询")
-                } else {
-                    appendLog("[${dev.address}] 发送录制状态查询失败")
+                if (managers[addr] === manager) {
+                    manager.requestFlashInfo()
                 }
-            }, 500L)
+            }, 1_500L)
             mainHandler.postDelayed({
-                mgr.requestFlashInfo()
-            }, 1_200L)
-            mainHandler.postDelayed({
-                if (addr !in latestRecordingStates.keys) {
+                if (managers[addr] === manager && addr !in latestRecordingStates.keys) {
                     appendLog("[${dev.address}] 录制状态无返回，可先尝试强制停止")
                 }
             }, 3_000L)
         }
+        totalDevices = managers.size
+    }
+
+    /**
+     * 同步前释放当前分组的 RecordingManager。
+     *
+     * DOT 的录制通知、状态查询、Flash 查询与 DotSyncManager 共用设备 GATT 队列。
+     * 同步开始前必须让当前两台设备只由 DotSyncManager 操作，否则 root 命令或
+     * 回连后的同步 ACK 会被录制命令抢占。其他运动员的 manager 和录制状态保持不变。
+     *
+     * @return GATT 排空等待时间；-1 表示当前分组仍有录制操作，不能同步。
+     */
+    fun releaseDevicesForSync(targetAddresses: Set<String>): Long {
+        val targets = targetAddresses.map(::normalizeAddress).filter(String::isNotBlank).toSet()
+        if (targets.isEmpty()) return 0L
+
+        val activeTargets = targets.filter { target ->
+            target in activeRecordingDevices ||
+                _deviceRecordingPhases.value[target] !in setOf(
+                    null,
+                    FlashRecordingPhase.Idle,
+                )
+        }
+        val operation = pendingOperation
+        if (
+            activeTargets.isNotEmpty() ||
+            operation?.targets?.any { it in targets } == true
+        ) {
+            appendLog("当前分组仍有录制操作，不能开始同步")
+            return -1L
+        }
+
+        var releasedCount = 0
+        targets.forEach { target ->
+            managers.remove(target)?.let { manager ->
+                releasedCount++
+                manager.clear()
+            }
+        }
+        if (releasedCount == 0) return 0L
+
+        _notificationReady.value -= targets
+        _flashInfo.value = _flashInfo.value - targets
+        _recordingStates.value = _recordingStates.value - targets
+        _deviceRecordingPhases.value = _deviceRecordingPhases.value - targets
+        latestRecordingStates.keys.removeAll(targets)
+        pendingStateChecks.keys.removeAll(targets)
+        lastNotificationEnableRequestAt.keys.removeAll(targets)
+        recordingFlashBaselines.keys.removeAll(targets)
+        recordingStartedAtElapsedMs.keys.removeAll(targets)
+        totalDevices = managers.size
+        updateAggregateRecordingPhase()
+        appendLog("同步前已暂停当前分组录制通道，等待蓝牙命令完成")
+        return SYNC_GATT_QUIET_MS
     }
 
     fun requestFlashInfo() {
         managers.values.forEach { it.requestFlashInfo() }
     }
 
-    fun refreshSetupState() {
+    fun refreshSetupState(targetAddresses: Set<String> = managers.keys) {
+        val targets = targetAddresses.map(::normalizeAddress).toSet()
         managers.forEach { (norm, mgr) ->
+            if (norm !in targets) return@forEach
             val rawAddr = mgr.mDevice?.address ?: norm
             val now = System.currentTimeMillis()
             val lastRequestAt = lastNotificationEnableRequestAt[norm] ?: 0L
@@ -1055,8 +1878,12 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     appendLog("[$rawAddr] 补发录制通知启用…")
                 }
             }
-            mgr.requestRecordingState()
-            mgr.requestFlashInfo()
+            scheduleRecordingStateRecovery(norm, mgr)
+            mainHandler.postDelayed({
+                if (managers[norm] === mgr) {
+                    mgr.requestFlashInfo()
+                }
+            }, 700L)
         }
     }
 
@@ -1067,11 +1894,32 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     fun reenableNotification(address: String) {
         val norm = normalizeAddress(address)
         val mgr  = managers[norm] ?: return
+        if (
+            shouldDeferRecordingNotification(
+                phase = _deviceRecordingPhases.value[norm],
+                isKnownActiveRecording = norm in activeRecordingDevices,
+            )
+        ) {
+            Log.i(
+                LINK_DIAG_TAG,
+                "[${norm.takeLast(4)}] recording-notification deferred during active recording"
+            )
+            appendLog("[$address] 已回连，先确认录制状态")
+            scheduleRecordingStateRecovery(norm, mgr)
+            if (norm in reliableStopTargets) {
+                scheduleReliableStopAttempt(STOP_STATE_SETTLE_MS)
+            }
+            return
+        }
         val now = System.currentTimeMillis()
         val lastRequestAt = lastNotificationEnableRequestAt[norm] ?: 0L
         if (now - lastRequestAt < 5_000L) {
             Log.i(LINK_DIAG_TAG, "[${norm.takeLast(4)}] recording-notification skipped; requestStateOnly")
-            mgr.requestRecordingState()
+            scheduleRecordingStateRecovery(norm, mgr)
+            if (norm in reliableStopTargets) {
+                appendLog("[$address] 已回连，继续确认停止录制")
+                scheduleReliableStopAttempt(STOP_STATE_SETTLE_MS)
+            }
             return
         }
         if (mgr.enableDataRecordingNotification()) {
@@ -1082,7 +1930,37 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             Log.i(LINK_DIAG_TAG, "[${norm.takeLast(4)}] recording-notification enable failed")
             appendLog("[$address] 重新连接后启用录制通知失败")
         }
-        mgr.requestRecordingState()
+        scheduleRecordingStateRecovery(norm, mgr)
+        if (norm in reliableStopTargets) {
+            appendLog("[$address] 已回连，继续确认停止录制")
+            scheduleReliableStopAttempt(STOP_STATE_SETTLE_MS)
+        }
+    }
+
+    private fun scheduleRecordingStateRecovery(
+        norm: String,
+        manager: DotRecordingManager,
+        attempt: Int = 0,
+    ) {
+        val delayMs = if (attempt == 0) 250L else 850L
+        mainHandler.postDelayed({
+            if (
+                managers[norm] !== manager ||
+                latestRecordingStates.containsKey(norm)
+            ) return@postDelayed
+            val sent = manager.requestRecordingState()
+            if (sent) {
+                appendLog("[${manager.mDevice?.address ?: norm}] 已发送录制状态查询")
+            } else {
+                appendLog(
+                    "[${manager.mDevice?.address ?: norm}] 录制状态查询忙，正在重试 " +
+                        "(${attempt + 1}/$RECORDING_STATE_RECOVERY_ATTEMPTS)"
+                )
+            }
+            if (attempt + 1 < RECORDING_STATE_RECOVERY_ATTEMPTS) {
+                scheduleRecordingStateRecovery(norm, manager, attempt + 1)
+            }
+        }, delayMs)
     }
 
     fun eraseAll() {
@@ -1114,39 +1992,72 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     }
 
     fun startRecording() {
-        if (_recordingPhase.value != FlashRecordingPhase.Idle &&
-            _recordingPhase.value != FlashRecordingPhase.Starting
-        ) {
-            appendLog("当前不能开始录制：${_recordingPhase.value}")
+        startRecording(managers.keys.toSet())
+    }
+
+    fun startRecording(targetAddresses: Set<String>) {
+        val targets = targetAddresses.map(::normalizeAddress).toSet()
+        if (targets.isEmpty()) return
+        val invalid = targets.filter { target ->
+            _deviceRecordingPhases.value[target] !in setOf(
+                FlashRecordingPhase.Idle,
+                FlashRecordingPhase.Starting,
+            )
+        }
+        if (invalid.isNotEmpty()) {
+            appendLog("设备组当前不能开始录制：${invalid.joinToString()}")
             return
         }
-        _recordingPhase.value = FlashRecordingPhase.Starting
-        if (!requestStateThenRun(RecordingCommand.Start)) {
+        setDeviceRecordingPhase(targets, FlashRecordingPhase.Starting)
+        if (!requestStateThenRun(RecordingCommand.Start, explicitTargets = targets)) {
+            setDeviceRecordingPhase(targets, FlashRecordingPhase.Idle)
             updateRecordingPhaseFromState()
         }
     }
 
     fun prepareStartRecording(): Boolean {
-        if (_recordingPhase.value != FlashRecordingPhase.Idle) {
-            appendLog("当前不能开始录制：${_recordingPhase.value}")
+        return prepareStartRecording(managers.keys.toSet())
+    }
+
+    fun prepareStartRecording(targetAddresses: Set<String>): Boolean {
+        val targets = targetAddresses.map(::normalizeAddress).toSet()
+        if (targets.isEmpty()) return false
+        if (
+            pendingOperation != null ||
+            pendingStartAcks.isNotEmpty() ||
+            pendingStopAcks.isNotEmpty()
+        ) {
+            appendLog("已有录制操作等待确认，请稍候")
             return false
         }
-        _recordingPhase.value = FlashRecordingPhase.Starting
+        val invalid = targets.filter {
+            _deviceRecordingPhases.value[it] != FlashRecordingPhase.Idle
+        }
+        if (invalid.isNotEmpty()) {
+            appendLog("设备组当前不能开始录制：${invalid.joinToString()}")
+            return false
+        }
+        setDeviceRecordingPhase(targets, FlashRecordingPhase.Starting)
         return true
     }
 
     private fun doStartRecording(targets: Set<String>) {
-        autoExportAfterStop = null
-        pendingAutoFileInfoTargets.clear()
-        pendingAutoFileInfoRequests.clear()
-        _preparingRecordingExport.value = false
-        _pendingRecordingExportKeys.value = emptySet()
-        _exportProgress.value = emptyMap()
-        _exportDone.value = emptySet()
-        _exportTaskProgress.value = ExportTaskProgress()
-        recordingSessionBaselineKeys = fileKeysForTargets(targets)
-        recordingSessionTargets = targets
-        recordingSessionStartUtcMs = System.currentTimeMillis()
+        val sessionKey = recordingSessionKey(targets)
+        val baselineKeys = fileKeysForTargets(targets)
+        val sessionStartUtcMs = System.currentTimeMillis()
+        val outputRatesByTarget = targets.associateWith(::currentOutputRate)
+        activeRecordingSessions[sessionKey] = ActiveRecordingSession(
+            sessionKey = sessionKey,
+            targets = targets,
+            startUtcMs = sessionStartUtcMs,
+            outputRatesByTarget = outputRatesByTarget,
+            baselineKeys = baselineKeys,
+        )
+        targets.forEach { recordingSessionUtcByDevice[it] = sessionStartUtcMs }
+        recordingSessionPreferences.saveSession(
+            sessionStartUtcMs,
+            LongJumpDeviceRoles.currentConfig,
+        )
         try {
             // 用安全访问替代 !! 防止 mDevice 在同步后被 SDK 内部修改
             val unsynced = targets.mapNotNull { key ->
@@ -1163,7 +2074,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         pendingStartAcks.clear()
         pendingStartAcks.addAll(targets)
         startAckTargets = targets
-        _recordingPhase.value = FlashRecordingPhase.Starting
+        setDeviceRecordingPhase(targets, FlashRecordingPhase.Starting)
         targets.forEach { norm ->
             val mgr = managers[norm] ?: return@forEach
             val commandUtcMs = System.currentTimeMillis()
@@ -1181,6 +2092,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             finishStartAcksIfComplete()
         }
         appendLog("已发送开始录制，等待 SDK ACK（${pendingStartAcks.size} 台设备）")
+        val startAckTimeoutMs =
+            6_000L + (startAckTargets.size - 2).coerceAtLeast(0) * 1_000L
         mainHandler.postDelayed({
             if (pendingStartAcks.isNotEmpty()) {
                 val timedOut = pendingStartAcks.toSet()
@@ -1190,36 +2103,54 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 appendLog("开始录制 ACK 超时：${timedOut.joinToString()}")
                 finishStartAcksIfComplete()
             }
-        }, 6_000L)
+        }, startAckTimeoutMs)
     }
 
     fun stopRecording() {
-        if (_recordingPhase.value != FlashRecordingPhase.Recording) {
-            appendLog("当前不能停止录制：${_recordingPhase.value}")
-            return
-        }
-        _recordingPhase.value = FlashRecordingPhase.Stopping
-        if (!requestStateThenRun(RecordingCommand.Stop)) {
-            updateRecordingPhaseFromState()
-        }
+        stopRecording(activeRecordingDevices.toSet())
+    }
+
+    fun stopRecording(targetAddresses: Set<String>) {
+        val targets = targetAddresses
+            .map(::normalizeAddress)
+            .filter {
+                it in activeRecordingDevices ||
+                    _deviceRecordingPhases.value[it] in setOf(
+                        FlashRecordingPhase.Recording,
+                        FlashRecordingPhase.Stopping,
+                    )
+            }
+            .toSet()
+        beginReliableStop(targets)
     }
 
     fun forceStopRecording() {
+        forceStopRecording(connectedManagerKeys().ifEmpty { managers.keys })
+    }
+
+    fun forceStopRecording(targetAddresses: Set<String>) {
         if (managers.isEmpty()) {
             appendLog("没有可操作的设备")
             return
         }
-        val targets = connectedManagerKeys().ifEmpty { managers.keys }
+        val targets = targetAddresses.map(::normalizeAddress).toSet()
         if (targets.isEmpty()) {
             appendLog("没有已连接设备可停止录制")
             return
         }
+        beginReliableStop(targets, force = true)
+    }
+
+    private fun doForceStopRecording(targets: Set<String>) {
+        if (targets.none {
+                _deviceRecordingPhases.value[it] == FlashRecordingPhase.Stopping
+            }
+        ) return
         pendingOperation = null
         pendingStateChecks.clear()
         pendingStopAcks.clear()
         pendingStopAcks.addAll(targets)
         stopAckTargets = targets
-        _recordingPhase.value = FlashRecordingPhase.Stopping
         targets.forEach { norm ->
             val mgr = managers[norm] ?: return@forEach
             if (!mgr.stopRecording()) {
@@ -1246,7 +2177,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                         val stillRecording = pendingStopAcks.toSet()
                         pendingStopAcks.clear()
                         stopAckTargets = emptySet()
-                        _recordingPhase.value = FlashRecordingPhase.Recording
+                        setDeviceRecordingPhase(stillRecording, FlashRecordingPhase.Recording)
+                        startFlashUsageMonitoring(stillRecording)
                         updateRecordingActive()
                         appendLog(
                             "仍有设备未确认停止，请保持设备靠近后重试：${stillRecording.joinToString()}"
@@ -1262,7 +2194,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     private fun doStopRecording(targets: Set<String>) {
         pendingStopAcks.clear()
         stopAckTargets = targets
-        _recordingPhase.value = FlashRecordingPhase.Stopping
+        setDeviceRecordingPhase(targets, FlashRecordingPhase.Stopping)
         targets.forEach { norm ->
             val mgr = managers[norm] ?: return@forEach
             val state = latestRecordingStates[norm]
@@ -1290,10 +2222,16 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         requestStateThenRun(RecordingCommand.RequestFiles)
     }
 
+    fun requestFileInfo(targetAddresses: Set<String>): Boolean =
+        requestStateThenRun(
+            command = RecordingCommand.RequestFiles,
+            explicitTargets = targetAddresses,
+        )
+
     private fun doRequestFileInfo(targets: Set<String>) {
-        _fileList.value = emptyMap()
+        _fileList.value = _fileList.value - targets
         targets.forEach { addr -> managers[addr]?.requestFileInfo() }
-        appendLog("正在获取文件列表…")
+        appendLog("正在获取 ${targets.size} 台设备的文件列表…")
     }
 
     /** 对所有设备并行导出全部文件。 */
@@ -1319,11 +2257,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val targetFrames = exportTargets
             .flatMap { addr ->
                 _fileList.value[addr].orEmpty().map { file ->
-                    exportFileKey(addr, file) to estimatedExportFrameCount(file, exportIds)
+                    exportFileKey(addr, file) to estimatedExportFrameCount(file)
                 }
             }
             .toMap()
-        resetExportTracking(targetFiles, targetFrames)
+        resetExportTracking(exportTargets.toSet(), targetFiles, targetFrames)
         val skipped = targets.filter { addr -> _fileList.value[addr].isNullOrEmpty() }
         skipped.forEach { addr ->
             val rawAddr = managers[addr]?.mDevice?.address ?: addr
@@ -1344,7 +2282,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         requestStateThenRun(RecordingCommand.ExportSelected, selectedKeys)
     }
 
-    private fun doExportSelected(checkedTargets: Set<String>, selectedKeys: Set<String>) {
+    private fun doExportSelected(
+        checkedTargets: Set<String>,
+        selectedKeys: Set<String>,
+        targetFramesByFile: Map<String, Int> = emptyMap(),
+    ) {
         val sortedIds = _selectedExportIds.value.sorted()
         val exportIds = ByteArray(sortedIds.size) { sortedIds[it] }
         val fieldLabels = sortedIds.mapNotNull { id ->
@@ -1369,11 +2311,15 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     .orEmpty()
                     .filter { file -> "$addr-${file.fileId}" in selectedKeys }
                     .map { file ->
-                        exportFileKey(addr, file) to estimatedExportFrameCount(file, exportIds)
+                        val key = exportFileKey(addr, file)
+                        key to (
+                            targetFramesByFile[key]?.takeIf { it > 0 }
+                                ?: estimatedExportFrameCount(file)
+                            )
                     }
             }
             .toMap()
-        resetExportTracking(targetFiles, targetFrames)
+        resetExportTracking(targets.toSet(), targetFiles, targetFrames)
         appendLog("导出字段：$fieldLabels | 并行导出 ${targets.size} 台设备")
         startParallelDeviceExports(
             targets.mapNotNull { addr ->
@@ -1392,16 +2338,18 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         exportRequests.clear()
         exportStartedDevices.clear()
         exportDevicesWithData.clear()
-        exportResettingDevices.clear()
+        exportRestartScheduled.clear()
+        exportDeferredRetryReasons.clear()
         exportLastProgressAt.clear()
         exportRetryCounts.clear()
+        exportRestartSequence.set(0L)
         clearExportRuntimeTracking()
         exportStopRequested = false
         if (requests.isEmpty()) {
             val task = _exportTaskProgress.value
             _exportTaskProgress.value = task.copy(
                 isExporting = false,
-                failedFileKeys = task.targetBytesByFile.keys,
+                failedFileKeys = task.targetFileKeys,
             )
             appendLog("没有可启动的设备导出任务")
             return
@@ -1409,16 +2357,27 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         requests.forEachIndexed { index, request ->
             val norm = normalizeAddress(request.address)
             exportRequests[norm] = request.copy(address = norm)
-            exportLastProgressAt[norm] = System.currentTimeMillis()
-            exportResettingDevices.add(norm)
+            exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
             setExportLinkPriority(norm, highPriority = true)
             managers[norm]?.stopExporting()
-            mainHandler.postDelayed(
-                { startDeviceExport(norm) },
-                600L + index * 400L
-            )
+            scheduleDeviceExportStart(norm, preferredOrder = index)
         }
         mainHandler.postDelayed(exportWatchdogRunnable, EXPORT_WATCHDOG_INTERVAL_MS)
+    }
+
+    private fun scheduleDeviceExportStart(address: String, preferredOrder: Int? = null) {
+        val norm = normalizeAddress(address)
+        if (!exportRequests.containsKey(norm) || !exportRestartScheduled.add(norm)) return
+        val order = preferredOrder
+            ?: (exportRestartSequence.getAndIncrement() % 6L).toInt()
+        val delayMs = EXPORT_RESTART_BASE_DELAY_MS + order * EXPORT_RESTART_STAGGER_MS
+        mainHandler.postDelayed(
+            {
+                exportRestartScheduled.remove(norm)
+                startDeviceExport(norm)
+            },
+            delayMs,
+        )
     }
 
     private fun startDeviceExport(address: String) {
@@ -1428,6 +2387,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val manager = managers[norm]
         if (manager == null) {
             failDeviceExport(norm, "设备导出管理器不存在")
+            return
+        }
+        if (manager.mDevice?.connectionState != DotDevice.CONN_STATE_CONNECTED) {
+            exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
+            scheduleDeviceExportStart(norm)
             return
         }
 
@@ -1451,7 +2415,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             retryDeviceExport(norm, "启动导出失败")
             return
         }
-        exportLastProgressAt[norm] = System.currentTimeMillis()
+        exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
         val task = _exportTaskProgress.value
         _exportTaskProgress.value = task.copy(isExporting = true)
     }
@@ -1460,20 +2424,20 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val norm = normalizeAddress(address)
         synchronized(exportProgressPublishLock) {
             val task = _exportTaskProgress.value
-            val deviceFileKeys = task.targetBytesByFile.keys
+            val deviceFileKeys = task.targetFileKeys
                 .filter { it.startsWith("$norm-") }
                 .toSet()
             val failed = task.failedFileKeys + deviceFileKeys
-            val finished = task.completedFileKeys + failed
-            _exportTaskProgress.value = task.copy(
-                isExporting = task.totalFiles > 0 && finished.size < task.totalFiles,
+            val updated = task.copy(
                 activeFileKeys = task.activeFileKeys - deviceFileKeys,
                 failedFileKeys = failed,
             )
+            _exportTaskProgress.value = updated.copy(isExporting = updated.hasPendingFiles)
         }
         exportStartedDevices.remove(norm)
         exportDevicesWithData.remove(norm)
-        exportResettingDevices.remove(norm)
+        exportRestartScheduled.remove(norm)
+        exportDeferredRetryReasons.remove(norm)
         exportLastProgressAt.remove(norm)
         exportRetryCounts.remove(norm)
         exportRequests.remove(norm)
@@ -1482,12 +2446,19 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         resetDeviceExportRuntime(norm, resetPublishedProgress = false)
         appendLog("[${managers[norm]?.mDevice?.address ?: norm}] $reason")
         Log.e(TAG, "[$norm] $reason")
+        startDeferredRetryIfPossible()
         finishExportSessionIfDone()
     }
 
     private fun retryDeviceExport(address: String, reason: String) {
         val norm = normalizeAddress(address)
         if (exportStopRequested || !exportRequests.containsKey(norm)) return
+        if (exportDeferredRetryReasons.containsKey(norm) || norm in exportRestartScheduled) return
+        val manager = managers[norm]
+        if (manager?.mDevice?.connectionState != DotDevice.CONN_STATE_CONNECTED) {
+            exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
+            return
+        }
         val retries = exportRetryCounts.getOrDefault(norm, 0)
         if (retries >= EXPORT_MAX_RETRIES) {
             failDeviceExport(norm, "$reason，重试 $retries 次后仍失败")
@@ -1496,15 +2467,52 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         exportRetryCounts[norm] = retries + 1
         exportStartedDevices.remove(norm)
         exportDevicesWithData.remove(norm)
-        exportLastProgressAt[norm] = System.currentTimeMillis()
-        exportResettingDevices.add(norm)
+        exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
         closeDeviceExportWriters(norm, deletePartial = true)
         resetDeviceExportRuntime(norm, resetPublishedProgress = true)
         appendLog("[${managers[norm]?.mDevice?.address ?: norm}] $reason，正在重试 ${retries + 1}/$EXPORT_MAX_RETRIES")
         Log.w(TAG, "[$norm] retry export ${retries + 1}/$EXPORT_MAX_RETRIES: $reason")
-        managers[norm]?.stopExporting()
         setExportLinkPriority(norm, highPriority = true)
-        mainHandler.postDelayed({ startDeviceExport(norm) }, 800L)
+        val hasOtherActiveExport = exportStartedDevices.any { other ->
+            other != norm &&
+                exportRequests.containsKey(other) &&
+                !exportDeferredRetryReasons.containsKey(other) &&
+                other !in exportRestartScheduled
+        }
+        managers[norm]?.stopExporting()
+        if (hasOtherActiveExport) {
+            exportDeferredRetryReasons[norm] = reason
+            appendLog(
+                "[${managers[norm]?.mDevice?.address ?: norm}] 暂停该设备，" +
+                    "等待另一台完成后单独恢复"
+            )
+        } else {
+            scheduleDeviceExportStart(norm)
+        }
+    }
+
+    private fun startDeferredRetryIfPossible() {
+        if (exportStopRequested || exportDeferredRetryReasons.isEmpty()) return
+        val hasRunningTransfer =
+            exportStartedDevices.any { address ->
+                exportRequests.containsKey(address) &&
+                    !exportDeferredRetryReasons.containsKey(address)
+            } ||
+                exportRestartScheduled.any { address ->
+                    exportRequests.containsKey(address) &&
+                        !exportDeferredRetryReasons.containsKey(address)
+                }
+        if (hasRunningTransfer) return
+        val next = exportDeferredRetryReasons.keys
+            .sortedBy { exportRetryCounts[it] ?: 0 }
+            .firstOrNull { address ->
+                address !in exportRestartScheduled &&
+                    exportRequests.containsKey(address)
+            }
+            ?: return
+        exportDeferredRetryReasons.remove(next)
+        appendLog("[${managers[next]?.mDevice?.address ?: next}] 开始单独恢复导出")
+        scheduleDeviceExportStart(next)
     }
 
     private fun closeDeviceExportWriters(address: String, deletePartial: Boolean) {
@@ -1522,7 +2530,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     private fun finishExportSessionIfDone() {
         val done = synchronized(exportProgressPublishLock) {
             val task = _exportTaskProgress.value
-            val sessionDone = !task.hasPendingFiles || exportRequests.isEmpty()
+            val sessionDone = !task.hasPendingFiles && exportRequests.isEmpty()
             _exportTaskProgress.value = task.copy(
                 isExporting = !sessionDone,
                 activeFileKeys = if (sessionDone) emptySet() else task.activeFileKeys,
@@ -1537,16 +2545,69 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 Log.i(TAG, "export session timing: elapsed=${elapsedMs}ms")
             }
             exportSessionStartedAt = 0L
+            startNextAutoExportSession()
+        }
+    }
+
+    private fun finishDeviceExport(address: String, rawAddress: String) {
+        val norm = normalizeAddress(address)
+        if (!exportRequests.containsKey(norm) && norm !in exportStartedDevices) return
+        closeDeviceExportWriters(norm, deletePartial = false)
+        synchronized(exportProgressPublishLock) {
+            _exportDone.value = _exportDone.value + norm
+        }
+        exportStartedDevices.remove(norm)
+        exportDevicesWithData.remove(norm)
+        exportRestartScheduled.remove(norm)
+        exportDeferredRetryReasons.remove(norm)
+        exportLastProgressAt.remove(norm)
+        exportRetryCounts.remove(norm)
+        exportRequests.remove(norm)
+        setExportLinkPriority(norm, highPriority = false)
+        val finishedAt = SystemClock.elapsedRealtime()
+        val startedAt = exportStartedAt.remove(norm)
+        val firstDataAt = exportFirstDataAt.remove(norm)
+        val frames = exportDeviceFrameCounts.remove(norm)?.get() ?: 0L
+        exportLastUiPublishAt.remove(norm)
+        if (startedAt != null) {
+            val elapsedMs = (finishedAt - startedAt).coerceAtLeast(1L)
+            val firstDataDelayMs = firstDataAt?.let { (it - startedAt).coerceAtLeast(0L) }
+            val framesPerSecond = frames * 1000.0 / elapsedMs.toDouble()
+            Log.i(
+                TAG,
+                "[$norm] export timing: elapsed=${elapsedMs}ms, " +
+                    "firstData=${firstDataDelayMs ?: -1L}ms, frames=$frames, " +
+                    "throughput=${String.format(Locale.US, "%.1f", framesPerSecond)} frames/s"
+            )
+        }
+        appendLog("[$rawAddress] 全部文件导出完成 ✓")
+        Log.i(TAG, "[$rawAddress] export done")
+        startDeferredRetryIfPossible()
+        finishExportSessionIfDone()
+    }
+
+    private fun finishDeviceExportIfFilesComplete(address: String, rawAddress: String) {
+        val norm = normalizeAddress(address)
+        val task = _exportTaskProgress.value
+        val deviceFileKeys = task.targetFileKeys
+            .filter { it.startsWith("$norm-") }
+            .toSet()
+        if (
+            deviceFileKeys.isNotEmpty() &&
+            deviceFileKeys.all { it in task.finishedFileKeys }
+        ) {
+            finishDeviceExport(norm, rawAddress)
         }
     }
 
     fun stopExporting() {
-        mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacks(exportWatchdogRunnable)
         exportStopRequested = true
         exportRequests.clear()
         exportStartedDevices.clear()
         exportDevicesWithData.clear()
-        exportResettingDevices.clear()
+        exportRestartScheduled.clear()
+        exportDeferredRetryReasons.clear()
         exportLastProgressAt.clear()
         exportRetryCounts.clear()
         clearExportRuntimeTracking()
@@ -1561,7 +2622,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         exportWriters.clear()
         exportWriterFailures.clear()
         val task = _exportTaskProgress.value
-        val unfinished = task.targetBytesByFile.keys - task.finishedFileKeys
+        val unfinished = task.targetFileKeys - task.finishedFileKeys
         _exportTaskProgress.value = task.copy(
             isExporting = false,
             activeFileKeys = emptySet(),
@@ -1570,9 +2631,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         if (unfinished.isNotEmpty()) {
             appendLog("已停止导出，${unfinished.size} 个文件未完成")
         }
+        startNextAutoExportSession()
     }
 
     fun clear() {
+        clearFlashUsageMonitoring()
         stopExporting()
         managers.values.forEach { it.clear() }
         managers.clear()
@@ -1580,25 +2643,37 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         activeRecordingDevices.clear()
         pendingStartAcks.clear()
         pendingStopAcks.clear()
+        reliableStopTargets.clear()
+        reliableStopGroups.clear()
+        stopRequestedAt.clear()
+        stopCommandSentAt.clear()
+        stopStateCheckAt.clear()
+        _delayedStopConfirmations.value = emptySet()
+        mainHandler.removeCallbacks(reliableStopRunnable)
         latestRecordingStates.clear()
         pendingStateChecks.clear()
         lastNotificationEnableRequestAt.clear()
+        recordingFlashBaselines.clear()
+        recordingStartedAtElapsedMs.clear()
         pendingAutoFileInfoTargets.clear()
         pendingAutoFileInfoRequests.clear()
         startAckTargets = emptySet()
         stopAckTargets = emptySet()
-        recordingSessionStartUtcMs = null
-        recordingSessionBaselineKeys = emptySet()
-        recordingSessionTargets = emptySet()
+        recordingSessionUtcByDevice.clear()
+        activeRecordingSessions.clear()
         autoExportAfterStop = null
-        _preparingRecordingExport.value = false
-        _pendingRecordingExportKeys.value = emptySet()
+        queuedAutoExportSessions.clear()
+        _recordingExportDecisions.value = emptyMap()
         pendingOperation = null
+        _notificationReady.value = emptySet()
+        _flashInfo.value = emptyMap()
+        _recordingStates.value = emptyMap()
         _exportProgress.value = emptyMap()
         _exportDone.value = emptySet()
         _exportTaskProgress.value = ExportTaskProgress()
         _eraseTaskProgress.value = EraseTaskProgress()
         updateRecordingActive()
+        _deviceRecordingPhases.value = emptyMap()
         _recordingPhase.value = FlashRecordingPhase.Idle
     }
 
@@ -1607,14 +2682,21 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     override fun onDotRecordingNotification(address: String?, isEnabled: Boolean) {
         val addr = address ?: return
         val norm = normalizeAddress(addr)
+        if (!managers.containsKey(norm)) return
         if (isEnabled) {
             val wasReady = norm in _notificationReady.value
             _notificationReady.value = _notificationReady.value + norm
             if (!wasReady) {
                 appendLog("[$addr] 录制通知已启用")
             }
-            managers[norm]?.requestFlashInfo()
-            managers[norm]?.requestRecordingState()
+            managers[norm]?.let { manager ->
+                scheduleRecordingStateRecovery(norm, manager)
+                mainHandler.postDelayed({
+                    if (managers[norm] === manager) {
+                        manager.requestFlashInfo()
+                    }
+                }, 700L)
+            }
         } else {
             _notificationReady.value = _notificationReady.value - norm
             appendLog("[$addr] 录制通知未能启用")
@@ -1624,10 +2706,14 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     override fun onDotRequestFlashInfoDone(address: String?, usedFlashSpace: Int, totalFlashSpace: Int) {
         val addr = address ?: return
         val norm = normalizeAddress(addr)
+        if (!managers.containsKey(norm)) return
         _flashInfo.value = _flashInfo.value.toMutableMap().also {
             it[norm] = Pair(usedFlashSpace, totalFlashSpace)
         }
-        appendLog("[$addr] Flash: ${usedFlashSpace / 1024}KB / ${totalFlashSpace / 1024}KB 已用")
+        appendLog(
+            "[$addr] Flash: ${usedFlashSpace / 1024}KB / " +
+                "${totalFlashSpace / 1024}KB 已用"
+        )
         if (
             norm in pendingAutoFileInfoTargets &&
             autoExportAfterStop != null &&
@@ -1662,6 +2748,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         }
     }
 
+    @Synchronized
     override fun onDotRecordingAck(
         address: String,
         recordingId: Int,
@@ -1682,13 +2769,35 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             return
         }
         if (recordingId == DotRecordingManager.RECORDING_ID_STOP_RECORDING &&
-            !pendingStopAcks.contains(norm)
+            !pendingStopAcks.contains(norm) &&
+            norm !in reliableStopTargets
         ) {
             return
         }
         appendLog("[$address] $action ${if (isSuccess) "✓" else "✗"}  state=$recordingState")
         val nowUtcMs = System.currentTimeMillis()
         if (recordingId == DotRecordingManager.RECORDING_ID_GET_STATE) {
+            if (norm in reliableStopTargets) {
+                latestRecordingStates[norm] = recordingState
+                _recordingStates.value = _recordingStates.value.toMutableMap().also {
+                    it[norm] = recordingState
+                }
+                pendingStopAcks.remove(norm)
+                if (
+                    recordingState == DotRecordingState.idle ||
+                    recordingState == DotRecordingState.success
+                ) {
+                    confirmReliableStop(norm, address, "状态复查")
+                } else {
+                    if (recordingState == DotRecordingState.onRecording) {
+                        activeRecordingDevices.add(norm)
+                    }
+                    setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Stopping)
+                    updateRecordingActive()
+                    scheduleReliableStopAttempt(STOP_STATE_SETTLE_MS)
+                }
+                return
+            }
             // The DOT keeps Flash recording independently from the app. Always accept a queried
             // state so reconnecting/restarting the app restores the actual device recording state.
             syncLocalRecordingState(address, recordingState, applyActiveState = true)
@@ -1707,6 +2816,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     appendLog("[$address] startAckUtcMs=$nowUtcMs")
                 } else {
                     activeRecordingDevices.remove(norm)
+                    setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Idle)
                 }
                 updateRecordingActive()
                 if (pendingStartAcks.isEmpty()) {
@@ -1714,10 +2824,31 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 }
             }
             DotRecordingManager.RECORDING_ID_STOP_RECORDING -> {
+                if (norm in reliableStopTargets) {
+                    pendingStopAcks.remove(norm)
+                    if (
+                        isSuccess ||
+                        recordingState == DotRecordingState.idle ||
+                        recordingState == DotRecordingState.success
+                    ) {
+                        confirmReliableStop(
+                            norm,
+                            address,
+                            if (isSuccess) "停止 ACK" else "ACK 状态",
+                        )
+                    } else {
+                        setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Stopping)
+                        appendLog("[$address] 停止未确认，将自动复查并重试")
+                        scheduleReliableStopAttempt(STOP_STATE_SETTLE_MS)
+                    }
+                    return
+                }
                 if (!pendingStopAcks.remove(norm)) return
                 if (isSuccess) {
                     syncLocalRecordingState(address, DotRecordingState.idle, applyActiveState = true)
                     activeRecordingDevices.remove(norm)
+                } else {
+                    setDeviceRecordingPhase(setOf(norm), FlashRecordingPhase.Recording)
                 }
                 updateRecordingActive()
                 if (pendingStopAcks.isEmpty()) {
@@ -1772,18 +2903,49 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val info = fileInfo ?: return
         val data = exportedData ?: return
         val norm = normalizeAddress(addr)
-        val writerKey = exportFileKey(addr, info)
-        if (norm !in exportStartedDevices || writerKey in exportWriterFailures) return
+        val resolvedFile = resolveExportFile(norm, info)
+        if (resolvedFile == null) {
+            logRejectedExportCallbackOnce(norm, info)
+            return
+        }
+        val writerKey = resolvedFile.key
+        val targetInfo = resolvedFile.fileInfo
+        val task = _exportTaskProgress.value
+        if (
+            norm !in exportStartedDevices ||
+            writerKey !in task.targetFileKeys ||
+            writerKey in task.finishedFileKeys ||
+            writerKey in exportWriterFailures
+        ) {
+            return
+        }
         exportDevicesWithData.add(norm)
-        exportResettingDevices.remove(norm)
-        exportLastProgressAt[norm] = System.currentTimeMillis()
+        exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
         exportFirstDataAt.putIfAbsent(norm, SystemClock.elapsedRealtime())
         try {
             val writer = exportWriters.getOrPut(writerKey) {
-                ExportCsvWriter.create(addr, info, _selectedExportIds.value, recordingAnchors[norm])
+                val storedAssignment = recordingSessionPreferences.findAssignment(
+                    deviceId = norm,
+                    recordingUtcMs = recordingDateMs(targetInfo),
+                )
+                ExportCsvWriter.create(
+                    address = addr,
+                    fileInfo = targetInfo,
+                    selectedIds = _selectedExportIds.value,
+                    clockAnchors = recordingAnchors[norm],
+                    assignment = storedAssignment?.assignment
+                        ?: LongJumpDeviceRoles.assignmentForDevice(norm),
+                    captureSessionUtcMs = storedAssignment?.sessionUtcMs
+                        ?: recordingSessionUtcByDevice[norm],
+                )
             }
             val bytesWritten = writer.write(data)
-            exportFrameCounts.computeIfAbsent(writerKey) { AtomicLong() }.incrementAndGet()
+            val samplePosition = exportSampleProgress
+                .computeIfAbsent(writerKey) { ExportSampleProgressTracker() }
+                .observe(data.packetCounter)
+            exportFrameCounts
+                .computeIfAbsent(writerKey) { AtomicLong() }
+                .set(samplePosition.toLong())
             exportDeviceFrameCounts.computeIfAbsent(norm) { AtomicLong() }.incrementAndGet()
             exportWrittenBytes[writerKey] = bytesWritten
             publishExportProgress(norm, writerKey)
@@ -1791,17 +2953,18 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             if (exportWriterFailures.add(writerKey)) {
                 exportWriters.remove(writerKey)?.close()
                 synchronized(exportProgressPublishLock) {
-                    val task = _exportTaskProgress.value
-                    val failed = task.failedFileKeys + writerKey
-                    val finished = task.completedFileKeys + failed
-                    _exportTaskProgress.value = task.copy(
-                        isExporting = task.totalFiles > 0 && finished.size < task.totalFiles,
-                        activeFileKeys = task.activeFileKeys - writerKey,
+                    val currentProgress = _exportTaskProgress.value
+                    val failed = currentProgress.failedFileKeys + writerKey
+                    val updated = currentProgress.copy(
+                        activeFileKeys = currentProgress.activeFileKeys - writerKey,
                         failedFileKeys = failed,
                     )
+                    _exportTaskProgress.value =
+                        updated.copy(isExporting = updated.hasPendingFiles)
                 }
                 appendLog("[$addr] 导出写盘失败：${e.message ?: "未知错误"}")
                 Log.e(TAG, "[$addr] export write failed: ${e.message}", e)
+                failDeviceExport(norm, "导出写盘失败")
             }
         }
     }
@@ -1810,22 +2973,34 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val addr = address ?: return
         val info = fileInfo ?: return
         val norm = normalizeAddress(addr)
-        val writerKey = exportFileKey(addr, info)
-        exportLastProgressAt[norm] = System.currentTimeMillis()
+        val resolvedFile = resolveExportFile(norm, info)
+        if (resolvedFile == null) {
+            logRejectedExportCallbackOnce(norm, info)
+            return
+        }
+        val writerKey = resolvedFile.key
+        val targetInfo = resolvedFile.fileInfo
+        val currentTask = _exportTaskProgress.value
+        if (
+            norm !in exportStartedDevices ||
+            writerKey !in currentTask.targetFileKeys ||
+            writerKey in currentTask.finishedFileKeys
+        ) {
+            return
+        }
+        exportLastProgressAt[norm] = SystemClock.elapsedRealtime()
         exportWriters.remove(writerKey)?.close()
         publishExportProgress(norm, writerKey, force = true)
         synchronized(exportProgressPublishLock) {
             val task = _exportTaskProgress.value
             val completed = task.completedFileKeys + writerKey
-            val finished = completed + task.failedFileKeys
             val targetBytes = task.targetBytesByFile[writerKey]
                 ?: task.writtenBytesByFile[writerKey]
                 ?: 1L
             val targetFrames = task.targetFramesByFile[writerKey]
                 ?: task.framesByFile[writerKey]
                 ?: 1
-            _exportTaskProgress.value = task.copy(
-                isExporting = task.totalFiles > 0 && finished.size < task.totalFiles,
+            val updated = task.copy(
                 activeFileKeys = task.activeFileKeys - writerKey,
                 framesByFile = task.framesByFile.toMutableMap().also {
                     it[writerKey] = targetFrames
@@ -1835,10 +3010,13 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 },
                 completedFileKeys = completed,
             )
+            _exportTaskProgress.value = updated.copy(isExporting = updated.hasPendingFiles)
         }
         exportFrameCounts.remove(writerKey)
+        exportSampleProgress.remove(writerKey)
         exportWrittenBytes.remove(writerKey)
-        appendLog("[$addr] 文件 ${info.fileName} 导出完成 ✓")
+        appendLog("[$addr] 文件 ${targetInfo.fileName} 导出完成 ✓")
+        finishDeviceExportIfFilesComplete(norm, addr)
     }
 
     override fun onDotAllDataExported(address: String?) {
@@ -1849,7 +3027,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             return
         }
         val currentTask = _exportTaskProgress.value
-        val deviceFileKeys = currentTask.targetBytesByFile.keys
+        val deviceFileKeys = currentTask.targetFileKeys
             .filter { it.startsWith("$norm-") }
             .toSet()
         val hasCompletedFile = deviceFileKeys.any { it in currentTask.completedFileKeys }
@@ -1861,9 +3039,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             synchronized(exportProgressPublishLock) {
                 val task = _exportTaskProgress.value
                 val completed = task.completedFileKeys + (deviceFileKeys - task.failedFileKeys)
-                val finished = completed + task.failedFileKeys
-                _exportTaskProgress.value = task.copy(
-                    isExporting = task.totalFiles > 0 && finished.size < task.totalFiles,
+                val updated = task.copy(
                     activeFileKeys = task.activeFileKeys - deviceFileKeys,
                     framesByFile = task.framesByFile.toMutableMap().also { map ->
                         deviceFileKeys.forEach { key ->
@@ -1877,47 +3053,28 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     },
                     completedFileKeys = completed,
                 )
+                _exportTaskProgress.value =
+                    updated.copy(isExporting = updated.hasPendingFiles)
             }
         }
-        synchronized(exportProgressPublishLock) {
-            _exportDone.value = _exportDone.value + norm
-        }
-        exportStartedDevices.remove(norm)
-        exportDevicesWithData.remove(norm)
-        exportResettingDevices.remove(norm)
-        exportLastProgressAt.remove(norm)
-        exportRetryCounts.remove(norm)
-        exportRequests.remove(norm)
-        setExportLinkPriority(norm, highPriority = false)
-        val finishedAt = SystemClock.elapsedRealtime()
-        val startedAt = exportStartedAt.remove(norm)
-        val firstDataAt = exportFirstDataAt.remove(norm)
-        val frames = exportDeviceFrameCounts.remove(norm)?.get() ?: 0L
-        exportLastUiPublishAt.remove(norm)
-        if (startedAt != null) {
-            val elapsedMs = (finishedAt - startedAt).coerceAtLeast(1L)
-            val firstDataDelayMs = firstDataAt?.let { (it - startedAt).coerceAtLeast(0L) }
-            val framesPerSecond = frames * 1000.0 / elapsedMs.toDouble()
-            Log.i(
-                TAG,
-                "[$norm] export timing: elapsed=${elapsedMs}ms, " +
-                    "firstData=${firstDataDelayMs ?: -1L}ms, frames=$frames, " +
-                    "throughput=${String.format(Locale.US, "%.1f", framesPerSecond)} frames/s"
-            )
-        }
-        appendLog("[$addr] 全部文件导出完成 ✓")
-        Log.i(TAG, "[$addr] export done")
-        finishExportSessionIfDone()
+        finishDeviceExport(norm, addr)
     }
 
     override fun onDotStopExportingData(address: String?) {
         val addr = address ?: return
         val norm = normalizeAddress(addr)
         if (!exportStopRequested) {
-            if (exportResettingDevices.remove(norm)) {
-                appendLog("[$addr] SDK 导出状态已重置")
-            } else if (exportRequests.containsKey(norm)) {
-                retryDeviceExport(norm, "SDK 导出回调意外停止")
+            if (exportRequests.containsKey(norm)) {
+                appendLog(
+                    if (
+                        exportDeferredRetryReasons.containsKey(norm) ||
+                        norm in exportRestartScheduled
+                    ) {
+                        "[$addr] 当前导出已暂停"
+                    } else {
+                        "[$addr] SDK 导出已停止，等待自动恢复"
+                    }
+                )
             }
             return
         }
@@ -1931,6 +3088,13 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         appendLog("[$addr] 导出已停止")
     }
 
+    fun retryFailedExports() {
+        val failedKeys = _exportTaskProgress.value.failedTargetFileKeys
+        if (failedKeys.isEmpty() || _exportTaskProgress.value.hasPendingFiles) return
+        appendLog("重新导出 ${failedKeys.size} 个失败文件")
+        exportSelected(failedKeys)
+    }
+
     // ── 内部 CSV 写入器 ──
 
     private class ExportCsvWriter private constructor(
@@ -1938,6 +3102,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val filePath: String,
         private val fields: List<ExportDataField>,  // 按 ID 排序的选中字段
         private val clockAnchors: RecordingClockAnchors?,
+        private val assignment: DeviceRoleAssignment?,
+        private val captureSessionUtcMs: Long?,
         timestampAnchorUtcMs: Long,
     ) {
         private var headerWritten = false
@@ -1951,7 +3117,9 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 address: String,
                 fileInfo: DotRecordingFileInfo,
                 selectedIds: Set<Byte>,
-                clockAnchors: RecordingClockAnchors?
+                clockAnchors: RecordingClockAnchors?,
+                assignment: DeviceRoleAssignment?,
+                captureSessionUtcMs: Long?,
             ): ExportCsvWriter {
                 val fields = ALL_EXPORT_FIELDS
                     .filter { selectedIds.contains(it.id) }
@@ -1980,7 +3148,15 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     OutputStreamWriter(FileOutputStream(file, false), Charsets.UTF_8),
                     EXPORT_WRITE_BUFFER_SIZE,
                 )
-                return ExportCsvWriter(fw, file.absolutePath, fields, clockAnchors, timestampAnchorUtcMs)
+                return ExportCsvWriter(
+                    fileWriter = fw,
+                    filePath = file.absolutePath,
+                    fields = fields,
+                    clockAnchors = clockAnchors,
+                    assignment = assignment,
+                    captureSessionUtcMs = captureSessionUtcMs,
+                    timestampAnchorUtcMs = timestampAnchorUtcMs,
+                )
             }
 
             private fun ensurePublicDirWritable(dir: File) {
@@ -2032,6 +3208,13 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                 "record_start_command_utc_ms" to (clockAnchors?.startCommandUtcMs?.toString() ?: ""),
                 "record_start_ack_utc_ms" to (clockAnchors?.startAckUtcMs?.toString() ?: ""),
                 "recording_is_synced" to (clockAnchors?.isSyncedAtStart?.toString() ?: ""),
+                "capture_session_utc_ms" to (captureSessionUtcMs?.toString() ?: ""),
+                "athlete_id" to (assignment?.participant?.athleteId ?: ""),
+                "athlete_name" to (assignment?.participant?.athleteName ?: ""),
+                "participant_slot_id" to (assignment?.participant?.slotId ?: ""),
+                "foot_side" to (assignment?.sideCode ?: ""),
+                "left_device_id" to (assignment?.participant?.leftDeviceId ?: ""),
+                "right_device_id" to (assignment?.participant?.rightDeviceId ?: ""),
             )
             rows.forEach { (key, value) ->
                 writeCsvText("$key,$value\n")

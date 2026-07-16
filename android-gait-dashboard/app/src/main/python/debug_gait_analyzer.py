@@ -982,23 +982,60 @@ def infer_takeoff_step_by_signal_burst(
     return j + 1, "信号峰值识别"
 
 
-def calculate_gait_status(contact_time_info, swing_time_info):
-    """步态状态、腾空时间、双支撑时间，返回 (gait_status_info, flight_time_info, double_support_time_info)"""
+def calculate_bilateral_flight_time(
+    primary_hs,
+    primary_to,
+    contralateral_hs,
+):
+    """按双脚真实事件计算腾空时间 (ms)。"""
+    primary_hs_sorted = sorted(float(t) for t in primary_hs)
+    primary_to_sorted = sorted(float(t) for t in primary_to)
+    contralateral_hs_sorted = sorted(float(t) for t in contralateral_hs)
+    flight_time_info = []
+    for to_time in primary_to_sorted:
+        next_primary_hs = next(
+            (hs_time for hs_time in primary_hs_sorted if hs_time > to_time),
+            None,
+        )
+        next_contralateral_hs = next(
+            (
+                hs_time
+                for hs_time in contralateral_hs_sorted
+                if hs_time > to_time
+            ),
+            None,
+        )
+        if (
+            next_primary_hs is not None
+            and next_contralateral_hs is not None
+            and next_contralateral_hs < next_primary_hs
+        ):
+            flight_time_info.append(
+                (to_time, next_contralateral_hs - to_time)
+            )
+    return flight_time_info
+
+
+def calculate_gait_status(
+    contact_time_info,
+    swing_time_info,
+    bilateral_flight_time_info=None,
+):
+    """根据真实双脚事件判断跑/走，并返回腾空时间和双支撑时间。"""
     gait_status_info = []
     flight_time_info = []
     double_support_time_info = []
-    sw_dict = dict(swing_time_info)
+    if bilateral_flight_time_info is None:
+        return gait_status_info, flight_time_info, double_support_time_info
+
+    flight_dict = dict(bilateral_flight_time_info)
     for to_time, contact_time in contact_time_info:
-        swing_time = sw_dict.get(to_time)
-        if swing_time is not None:
-            flight_time = max(0, (swing_time - contact_time) / 2.0)
-            if swing_time > contact_time and flight_time > 0:
-                gait_status_info.append((to_time, "Run"))
-                flight_time_info.append((to_time, flight_time))
-            else:
-                gait_status_info.append((to_time, "Walk"))
-                double_support_time = max(0, (contact_time - swing_time) / 2.0)
-                double_support_time_info.append((to_time, double_support_time))
+        flight_time = flight_dict.get(to_time)
+        if flight_time is not None and flight_time > 0:
+            gait_status_info.append((to_time, "Run"))
+            flight_time_info.append((to_time, flight_time))
+        else:
+            gait_status_info.append((to_time, "Walk"))
     return gait_status_info, flight_time_info, double_support_time_info
 
 
@@ -1379,7 +1416,16 @@ def calculate_spatio_temporal(
     sw_info = calculate_swing_time(HS, TO)
     st_info = calculate_stride_time(HS, TO)
     sf_info = calculate_step_frequency(HS, TO)
-    gs_info, ft_info, inferred_dst_info = calculate_gait_status(ct_info, sw_info)
+    bilateral_ft_info = (
+        calculate_bilateral_flight_time(HS, TO, contralateral_hs)
+        if contralateral_hs is not None
+        else None
+    )
+    gs_info, ft_info, inferred_dst_info = calculate_gait_status(
+        ct_info,
+        sw_info,
+        bilateral_flight_time_info=bilateral_ft_info,
+    )
     has_bilateral_events = contralateral_hs is not None and contralateral_to is not None
     bilateral_dst_info = (
         calculate_bilateral_double_support(HS, TO, contralateral_hs, contralateral_to)
@@ -1432,7 +1478,7 @@ def calculate_spatio_temporal(
         frequency_hz = sf_dict.get(to_time, 0)
         stride_length = sl_dict.get(to_time, 0)
         gait_status = gs_dict.get(to_time, "Walk")
-        flight_time = ft_dict.get(to_time, 0)
+        flight_time = ft_dict.get(to_time)
         double_support = dst_dict.get(to_time)
         vgrf_peak_bw = vgrf_dict.get(to_time, 1.0)
 
@@ -1453,7 +1499,11 @@ def calculate_spatio_temporal(
             "stride_length_m": round(float(stride_length), 2),
             "stride_velocity_mps": round(float(stride_velocity), 2),
             "vGRF_peak_BW": round(float(vgrf_peak_bw), 2),
-            "flight_time_ms": int(round(max(0, flight_time))),
+            "flight_time_ms": (
+                int(round(max(0, flight_time)))
+                if flight_time is not None
+                else None
+            ),
             "gait_status": gait_status
         })
     return strides
@@ -1767,8 +1817,8 @@ def process_gait_data(
                         MS_c,
                         idata_contra,
                         is_long_jump=False,
-                        contralateral_hs=HS if not is_long_jump_mode else None,
-                        contralateral_to=TO if not is_long_jump_mode else None,
+                        contralateral_hs=HS,
+                        contralateral_to=TO,
                     )
                     
                     contra_data = {
@@ -1895,6 +1945,8 @@ def process_gait_data(
                         idata_contra,
                         is_long_jump=False,
                         include_terminal_contact=True,
+                        contralateral_hs=HS_for_metrics,
+                        contralateral_to=TO_for_metrics,
                     )
                     contra_data['events']['hs'] = c_hs
                     contra_data['events']['to'] = c_to
@@ -1913,8 +1965,16 @@ def process_gait_data(
             MS_for_metrics,
             idata,
             is_long_jump=long_jump_applied,
-            contralateral_hs=(contra_events.get('hs') if contra_events is not None and not is_long_jump_mode else None),
-            contralateral_to=(contra_events.get('to') if contra_events is not None and not is_long_jump_mode else None),
+            contralateral_hs=(
+                contra_events.get('hs')
+                if contra_events is not None
+                else None
+            ),
+            contralateral_to=(
+                contra_events.get('to')
+                if contra_events is not None
+                else None
+            ),
         )
         print(f"DEBUG: Strides calculated: {len(strides)}")
         
@@ -1923,6 +1983,11 @@ def process_gait_data(
             vals = [s[key] for s in strides if s.get(key) is not None]
             return float(np.mean(vals)) if vals else 0.0
 
+        def safe_optional_mean(key):
+            vals = [s[key] for s in strides if s.get(key) is not None]
+            return float(np.mean(vals)) if vals else None
+
+        flight_time_mean = safe_optional_mean("flight_time_ms")
         summary = {
             "analysis_mode": "long_jump" if is_long_jump_mode else "general_gait",
             "n_strides": len(strides),
@@ -1938,7 +2003,11 @@ def process_gait_data(
             "stride_length_m": round(safe_mean("stride_length_m"), 2),
             "stride_velocity_mps": round(safe_mean("stride_velocity_mps"), 2),
             "vGRF_peak_BW": round(safe_mean("vGRF_peak_BW"), 2),
-            "flight_time_ms": int(round(safe_mean("flight_time_ms"))),
+            "flight_time_ms": (
+                int(round(flight_time_mean))
+                if flight_time_mean is not None
+                else None
+            ),
             "duration_s": float((idata['Timestamp'].iloc[-1] - idata['Timestamp'].iloc[0]) / 1000.0),
             "gait_status_last": strides[-1]["gait_status"] if strides else "Unknown",
             "source_sample_rate_hz": float(fs_source),

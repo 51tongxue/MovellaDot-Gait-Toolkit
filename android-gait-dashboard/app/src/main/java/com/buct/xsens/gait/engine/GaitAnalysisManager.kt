@@ -1,6 +1,7 @@
 package com.buct.xsens.gait.engine
 
 import android.content.Context
+import com.buct.xsens.dot.data.LongJumpDeviceRoles
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import android.webkit.JavascriptInterface
@@ -8,6 +9,9 @@ import org.json.JSONObject
 import java.io.File
 
 class GaitAnalysisManager(private val context: Context) {
+    companion object {
+        private val analysisLock = Any()
+    }
 
     @Synchronized
     fun warmUp() {
@@ -77,29 +81,44 @@ class GaitAnalysisManager(private val context: Context) {
             "Analyzing file: $filePath, weight: $weight, start: $startTimeS, end: $endTimeS, " +
                 "takeoffStep: $takeoffStep, isTakeoffFoot: $isTakeoffFoot, isTripleJump: $isTripleJump",
         )
-        return try {
-            warmUp()
-            val py = Python.getInstance()
-            val module = py.getModule("gait_analyzer")
-            val result = module.callAttr(
-                "process_gait_data",
-                filePath,
-                weight,
-                startTimeS,
-                endTimeS,
-                takeoffStep,
-                isTakeoffFoot,
-                isTripleJump,
-            )
-            val jsonResult = result.toString()
-            android.util.Log.d("GaitAnalysis", "Analyzed success, result length: ${jsonResult.length}")
-            jsonResult
-        } catch (e: Exception) {
-            android.util.Log.e("GaitAnalysis", "Python error: ${e.message}", e)
-            JSONObject().apply {
-                put("ok", false)
-                put("error", e.message ?: "Unknown Python error")
-            }.toString()
+        return synchronized(analysisLock) {
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            try {
+                warmUp()
+                val py = Python.getInstance()
+                val module = py.getModule("gait_analyzer")
+                val roles = LongJumpDeviceRoles.currentConfig
+                val sourceName = File(filePath).name.uppercase()
+                val participant = roles.participants.firstOrNull {
+                    sourceName.contains(it.leftDeviceId) || sourceName.contains(it.rightDeviceId)
+                } ?: roles.participants.first()
+                val result = module.callAttr(
+                    "process_gait_data",
+                    filePath,
+                    weight,
+                    startTimeS,
+                    endTimeS,
+                    takeoffStep,
+                    isTakeoffFoot,
+                    isTripleJump,
+                    participant.leftDeviceId,
+                    participant.rightDeviceId,
+                )
+                val jsonResult = result.toString()
+                val elapsedMs =
+                    android.os.SystemClock.elapsedRealtime() - startedAt
+                android.util.Log.d(
+                    "GaitAnalysis",
+                    "Analyzed success in ${elapsedMs}ms, result length: ${jsonResult.length}",
+                )
+                jsonResult
+            } catch (e: Exception) {
+                android.util.Log.e("GaitAnalysis", "Python error: ${e.message}", e)
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", e.message ?: "Unknown Python error")
+                }.toString()
+            }
         }
     }
 

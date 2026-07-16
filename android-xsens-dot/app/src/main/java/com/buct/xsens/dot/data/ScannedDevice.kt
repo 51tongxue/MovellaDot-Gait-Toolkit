@@ -10,5 +10,5 @@ data class ScannedDevice(
 ) {
     val displayName: String get() = name.ifEmpty { "Xsens DOT" }
     val realMac: String get() = address.replace(":", "").replace("-", "").uppercase()
-    val sideLabel: String? get() = LongJumpDeviceRoles.sideLabel(realMac)
+    val sideLabel: String? get() = LongJumpDeviceRoles.assignmentLabel(realMac)
 }

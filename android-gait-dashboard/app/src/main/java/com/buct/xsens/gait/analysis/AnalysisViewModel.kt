@@ -22,7 +22,6 @@ import org.json.JSONObject
 import java.io.File
 import java.util.Date
 import java.util.Locale
-import kotlin.math.abs
 
 class AnalysisViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = GaitDataRepository(application)
@@ -49,7 +48,7 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setAnalysisMode(mode: AnalysisMode) {
-        analysisJob?.cancel()
+        if (_uiState.value.isAnalyzing) return
         _uiState.update {
             it.copy(
                 analysisMode = mode,
@@ -64,8 +63,13 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
 
     fun selectAthlete(athleteId: String) {
         _uiState.update {
+            val selectedAttemptKey = it.selectedAttemptKey?.takeIf { key ->
+                val attempt = it.attempts.firstOrNull { attempt -> attempt.key == key }
+                attempt != null && (attempt.athleteId == null || attempt.athleteId == athleteId)
+            }
             it.copy(
                 selectedAthleteId = athleteId,
+                selectedAttemptKey = selectedAttemptKey,
                 result = null,
                 manifestPath = "",
                 errorMessage = "",
@@ -124,6 +128,7 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
         historyLoadJob?.cancel()
         historyLoadJob = null
         val state = _uiState.value
+        if (state.isAnalyzing) return
         val athlete = state.selectedAthlete ?: run {
             _uiState.update { it.copy(errorMessage = "请先选择运动员") }
             return
@@ -439,7 +444,7 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
         loadLanConfig()
     }
 
-    private fun refreshAthletes() {
+    fun refreshAthletes() {
         viewModelScope.launch(Dispatchers.IO) {
             val athletes = repository.listAthletes().map(AthleteProfile::fromEntity)
             _uiState.update { state ->
@@ -549,51 +554,76 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                     ?.toList()
                     .orEmpty()
             }
-            .filter { file ->
-                val device = extractDeviceId(file.name)
-                device != null && LongJumpDeviceRoles.isTargetDevice(device)
-            }
             .sortedBy(::fileSourcePriority)
             .distinctBy { file ->
                 "${extractDeviceId(file.name)}_${captureStamp(file.name)}"
             }
 
-        data class Entry(val file: File, val side: FootSide, val capturedAt: Date)
+        data class Entry(
+            val file: File,
+            val side: FootSide,
+            val capturedAt: Date,
+            val athleteId: String?,
+            val sessionKey: String,
+        )
 
         val entries = files.mapNotNull { file ->
-            val side = FootSide.fromCode(LongJumpDeviceRoles.sideCode(extractDeviceId(file.name) ?: ""))
+            val metadata = readCsvHeaderMetadata(file)
+            val deviceId = extractDeviceId(file.name)
+            val assignment = deviceId?.let(LongJumpDeviceRoles::assignmentForDevice)
+            val side = FootSide.fromCode(metadata["foot_side"])
+                ?: FootSide.fromCode(assignment?.sideCode)
                 ?: return@mapNotNull null
             val capturedAt = parseCaptureDate(file.name) ?: return@mapNotNull null
-            Entry(file, side, capturedAt)
+            val athleteId = metadata["athlete_id"]
+                ?.takeIf(String::isNotBlank)
+                ?: assignment?.participant?.athleteId?.takeIf(String::isNotBlank)
+            val sessionKey = metadata["capture_session_utc_ms"]
+                ?.takeIf(String::isNotBlank)
+                ?: captureStamp(file.name)
+                ?: file.nameWithoutExtension
+            Entry(file, side, capturedAt, athleteId, sessionKey)
         }
-        val left = entries.filter { it.side == FootSide.Left }.sortedByDescending { it.capturedAt }
-        val rightRemaining = entries.filter { it.side == FootSide.Right }.toMutableList()
         val attempts = mutableListOf<CapturedAttempt>()
-
-        left.forEach { leftEntry ->
-            val right = rightRemaining
-                .filter { sameDay(it.capturedAt, leftEntry.capturedAt) }
-                .minByOrNull { abs(it.capturedAt.time - leftEntry.capturedAt.time) }
-                ?.takeIf { abs(it.capturedAt.time - leftEntry.capturedAt.time) <= PAIR_TOLERANCE_MS }
-            if (right != null) rightRemaining.remove(right)
-            val capturedAt = if (right == null) leftEntry.capturedAt
-            else Date(minOf(leftEntry.capturedAt.time, right.capturedAt.time))
-            attempts += CapturedAttempt(
-                key = "${capturedAt.time}_${leftEntry.file.name}_${right?.file?.name.orEmpty()}",
-                capturedAt = capturedAt,
-                leftPath = leftEntry.file.absolutePath,
-                rightPath = right?.file?.absolutePath,
-            )
-        }
-        rightRemaining.forEach { entry ->
-            attempts += CapturedAttempt(
-                key = "${entry.capturedAt.time}_${entry.file.name}",
-                capturedAt = entry.capturedAt,
-                leftPath = null,
-                rightPath = entry.file.absolutePath,
-            )
-        }
+        entries
+            .groupBy { "${it.athleteId.orEmpty()}_${it.sessionKey}" }
+            .forEach { (groupKey, groupEntries) ->
+                val left = groupEntries
+                    .filter { it.side == FootSide.Left }
+                    .minByOrNull(Entry::capturedAt)
+                val right = groupEntries
+                    .filter { it.side == FootSide.Right }
+                    .minByOrNull(Entry::capturedAt)
+                val capturedAt = listOfNotNull(left, right)
+                    .minOfOrNull(Entry::capturedAt)
+                    ?: return@forEach
+                val athleteId = left?.athleteId ?: right?.athleteId
+                attempts += CapturedAttempt(
+                    key = "${athleteId.orEmpty()}_${groupKey}_${capturedAt.time}",
+                    capturedAt = capturedAt,
+                    leftPath = left?.file?.absolutePath,
+                    rightPath = right?.file?.absolutePath,
+                    athleteId = athleteId,
+                )
+            }
         return attempts.sortedByDescending { it.capturedAt }
+    }
+
+    private fun readCsvHeaderMetadata(file: File): Map<String, String> {
+        val metadata = linkedMapOf<String, String>()
+        runCatching {
+            file.useLines(Charsets.UTF_8) { lines ->
+                lines.take(40).forEach { line ->
+                    val columns = line.split(',')
+                    if (columns.any { it.trim() == "PacketCounter" }) return@useLines
+                    if (columns.size >= 2 && columns[0].isNotBlank()) {
+                        metadata[columns[0].trim().lowercase(Locale.US)] =
+                            columns.drop(1).joinToString(",").trim()
+                    }
+                }
+            }
+        }
+        return metadata
     }
 
     private fun findAttemptForPath(path: String): CapturedAttempt? =
@@ -606,11 +636,6 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
         Regex("DOT_([0-9A-Fa-f]{12})").find(name)?.let { return it.groupValues[1] }
         Regex("^([0-9A-Fa-f]{12})_20\\d{6}").find(name)?.let { return it.groupValues[1] }
         return null
-    }
-
-    private fun sameDay(first: Date, second: Date): Boolean {
-        val formatter = java.text.SimpleDateFormat("yyyyMMdd", Locale.US)
-        return formatter.format(first) == formatter.format(second)
     }
 
     private fun fileSourcePriority(file: File): Int {
@@ -636,8 +661,4 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
             .put("password", password)
             .put("domain", domain)
             .put("upload_source_csv", uploadSourceCsv)
-
-    private companion object {
-        private const val PAIR_TOLERANCE_MS = 5_000L
-    }
 }

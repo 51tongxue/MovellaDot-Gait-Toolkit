@@ -51,6 +51,71 @@ data class SyncParameterPrepareResult(
     val waitMsBeforeSync: Long
 )
 
+internal fun isSyncCommandReady(
+    isConnected: Boolean,
+    initializedThisConnection: Boolean,
+    initializedBefore: Boolean,
+    connectedStableMs: Long,
+    reconnectStableRequirementMs: Long,
+): Boolean =
+    isConnected &&
+        (
+            initializedThisConnection ||
+                (
+                    initializedBefore &&
+                        connectedStableMs >= reconnectStableRequirementMs
+                    )
+            )
+
+internal fun shouldRetryIncompleteSync(
+    succeededCount: Int,
+    totalCount: Int,
+    retryCount: Int,
+    maxRetries: Int,
+): Boolean =
+    totalCount > 0 &&
+        succeededCount in 0 until totalCount &&
+        retryCount < maxRetries
+
+internal fun mergeObservedSyncState(
+    previouslyConfirmed: Boolean?,
+    sdkReportsSynced: Boolean,
+): Boolean =
+    sdkReportsSynced || previouslyConfirmed == true
+
+internal fun shouldDeferNegativeSyncStatus(
+    previouslyConfirmed: Boolean,
+    flashRecordingActive: Boolean,
+    reconnectPending: Boolean,
+    connectedStableMs: Long,
+    reconnectGuardMs: Long,
+): Boolean =
+    previouslyConfirmed &&
+        (
+            flashRecordingActive ||
+                reconnectPending ||
+                connectedStableMs < reconnectGuardMs
+            )
+
+internal fun shouldPollRssiForDevice(
+    isConnected: Boolean,
+    backgroundReadsPaused: Boolean,
+    isSyncing: Boolean,
+    isExportTarget: Boolean,
+): Boolean =
+    isConnected &&
+        !backgroundReadsPaused &&
+        !isSyncing &&
+        !isExportTarget
+
+internal fun shouldSetupRecordingManagerAfterConnection(
+    isSyncing: Boolean,
+    newlyConnectedAddresses: Set<String>,
+    syncTargetAddresses: Set<String>,
+): Boolean =
+    !isSyncing &&
+        newlyConnectedAddresses.none { it in syncTargetAddresses }
+
 /**
  * Movella DOT 数据采集引擎 — 对标官方 App (DeviceManager + PlotsFragment)
  *
@@ -74,19 +139,23 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         /** BLE 实时波形流 ODR（与官方一致）；120Hz 仅同步+离线 Flash */
         private const val STREAM_OUTPUT_RATE_HZ = 60
         private const val RECONNECT_DEBOUNCE_MS = 3_000L
+        private const val RECONNECT_SYNC_NEGATIVE_GUARD_MS = 8_000L
         // Android BLE GATT active reads must be serialized. Polling one of two DOTs every
         // 500 ms keeps each device near a 1 s refresh cadence without dropping callbacks.
         private const val RSSI_MONITOR_INTERVAL_MS = 500L
         private const val SYNC_RESULT_SETTLE_MS = 10_000L
+        private const val MAX_TRANSIENT_SYNC_RETRIES = 1
+        private const val TRANSIENT_SYNC_RETRY_DELAY_MS = 2_000L
         private const val SCAN_TIMEOUT_MS = 5_000L
         private const val BLUETOOTH_RESTART_RECONNECT_DELAY_MS = 1_500L
+        private const val RECONNECT_SYNC_READY_STABLE_MS = 1_500L
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var sdkScanner: DotScanner? = null
     private var scanTimeoutRunnable: Runnable? = null
     @Volatile private var scanSessionId = 0
-    @Volatile private var exportTransferActive = false
+    @Volatile private var exportTargetAddresses: Set<String> = emptySet()
     @Volatile private var userRequestedDisconnect = false
     private var bluetoothReceiverRegistered = false
     private var connectionTargets = emptyList<ConnectionTarget>()
@@ -102,6 +171,14 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
     private val _connectedDevices = MutableStateFlow<List<String>>(emptyList())
     val connectedDevices: StateFlow<List<String>> = _connectedDevices.asStateFlow()
+
+    private val _manuallyDisconnectedAddresses = MutableStateFlow<Set<String>>(emptySet())
+    val manuallyDisconnectedAddresses: StateFlow<Set<String>> =
+        _manuallyDisconnectedAddresses.asStateFlow()
+
+    private val _connectionTargetAddresses = MutableStateFlow<Set<String>>(emptySet())
+    val connectionTargetAddresses: StateFlow<Set<String>> =
+        _connectionTargetAddresses.asStateFlow()
 
     private val _state = MutableStateFlow(CollectionState.Idle)
     val state: StateFlow<CollectionState> = _state.asStateFlow()
@@ -122,6 +199,9 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     /** 设备断线后重新初始化完成时回调，参数为 BLE 地址（原始格式），供 ViewModel 恢复离线状态 */
     var onDeviceReconnected: ((address: String) -> Unit)? = null
 
+    /** 由录制状态机提供，避免 SDK 在 Flash 录制回连时自动重复 startMeasuring。 */
+    var isFlashRecordingDevice: ((normalizedAddress: String) -> Boolean)? = null
+
     private val _isSynced = MutableStateFlow(false)
     val isSynced: StateFlow<Boolean> = _isSynced.asStateFlow()
 
@@ -130,6 +210,9 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
     private val _syncProgress = MutableStateFlow(0)
     val syncProgress: StateFlow<Int> = _syncProgress.asStateFlow()
+
+    private val _syncTargetAddresses = MutableStateFlow<Set<String>>(emptySet())
+    val syncTargetAddresses: StateFlow<Set<String>> = _syncTargetAddresses.asStateFlow()
 
     private val _needsSync = MutableStateFlow(false)
     val needsSync: StateFlow<Boolean> = _needsSync.asStateFlow()
@@ -165,6 +248,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     private val lastReconnectHandledAt = ConcurrentHashMap<String, Long>()
     private val outOfRangeLoggedAddresses = ConcurrentHashMap.newKeySet<String>()
     private val lastInitDoneAtMs = ConcurrentHashMap<String, Long>()
+    private val connectedSinceAtMs = ConcurrentHashMap<String, Long>()
 
     // 地址映射缓存：connectDevices() 写入一次，之后只读（BLE 线程安全）
     private val addrToIdx = HashMap<String, Int>()
@@ -176,15 +260,19 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     @Volatile private var desiredMode       = DotPayload.PAYLOAD_TYPE_CUSTOM_MODE_1
     @Volatile private var targetDeviceCount = 0
     @Volatile private var measurementStarted = false
+    private val measuringAddresses = ConcurrentHashMap.newKeySet<String>()
     private val totalRecvCount    = java.util.concurrent.atomic.AtomicLong(0L)
     private val lastUiUpdateAtom  = java.util.concurrent.atomic.AtomicLong(0L)
 
     private val pendingSensorData = ConcurrentHashMap<String, SensorData>()
     private var syncManager: DotSyncManager? = null
+    private var activeSyncDevices: List<DotDevice> = emptyList()
     @Volatile private var syncEpoch = 0
     @Volatile private var syncSessionStartedAtMs = 0L
     @Volatile private var syncAttemptStartedAtMs = 0L
     @Volatile private var syncConfirmedAtMs = 0L
+    @Volatile private var activeSyncRetryCount = 0
+    private val syncConfirmedAtByDevice = ConcurrentHashMap<String, Long>()
     // 同步/离线录制目标采样率，与 UI 默认值保持一致（120Hz），startSync 前由 ViewModel 覆写
     @Volatile var syncOutputRate = 120
     @Volatile private var backgroundReadsPaused = false
@@ -238,6 +326,10 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
     private fun normalizeAddress(addr: String): String =
         addr.replace(":", "").replace("-", "").uppercase()
+
+    private fun clearSyncRootRoles(targetDevices: List<DotDevice> = devices) {
+        targetDevices.forEach { it.isRootDevice = false }
+    }
 
     private fun isBluetoothEnabled(): Boolean =
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)
@@ -319,7 +411,16 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         stopScan()
         appendSyncLog("已找到本次设备，正在自动重连")
         Log.i(DIAG_TAG, "Reconnect scan complete: rebuilding ${targets.size} DOT connections")
-        connectDevices(targets.sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address) })
+        val activeFlashRecordingAddresses = targets
+            .map { normalizeAddress(it.address) }
+            .filter { isFlashRecordingDevice?.invoke(it) == true }
+            .toSet()
+        connectDevices(
+            selected = targets.sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address) },
+            reconnectContextAddresses = activeFlashRecordingAddresses,
+            preservedMeasuringAddresses =
+                activeFlashRecordingAddresses.intersect(measuringAddresses),
+        )
     }
 
     private fun resolveDeviceIndex(address: String): Int? {
@@ -330,33 +431,120 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         return null
     }
 
+    private fun rebuildDeviceAddressIndexes() {
+        addressToIndex.clear()
+        addrToIdx.clear()
+        addrToNorm.clear()
+        devices.forEachIndexed { index, device ->
+            val address = device.address ?: return@forEachIndexed
+            val norm = normalizeAddress(address)
+            addressToIndex[norm] = index
+            addrToIdx[address] = index
+            addrToNorm[address] = norm
+        }
+    }
+
     private fun initializedDevices(): List<DotDevice> =
         devices.filter { normalizeAddress(it.address ?: "") in initDoneAddresses }
 
+    private fun devicesForAddresses(addresses: Set<String>): List<DotDevice> {
+        val normalized = addresses.map(::normalizeAddress).toSet()
+        return devices
+            .filter { normalizeAddress(it.address.orEmpty()) in normalized }
+            .sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address.orEmpty()) }
+    }
+
     private fun refreshDeviceSyncStates() {
+        val previous = _deviceSyncStates.value
         _deviceSyncStates.value = devices
             .mapNotNull { dev ->
                 val addr = dev.address ?: return@mapNotNull null
-                normalizeAddress(addr) to dev.isSynced
+                val norm = normalizeAddress(addr)
+                norm to mergeObservedSyncState(
+                    previouslyConfirmed = previous[norm],
+                    sdkReportsSynced = dev.isSynced,
+                )
             }
             .toMap()
     }
 
+    private fun connectedStableMs(norm: String): Long {
+        val connectedAt = connectedSinceAtMs[norm] ?: return Long.MAX_VALUE
+        return (SystemClock.elapsedRealtime() - connectedAt).coerceAtLeast(0L)
+    }
+
+    private fun deferNegativeSyncStatus(norm: String): Boolean =
+        shouldDeferNegativeSyncStatus(
+            previouslyConfirmed = _deviceSyncStates.value[norm] == true,
+            flashRecordingActive = isFlashRecordingDevice?.invoke(norm) == true,
+            reconnectPending = norm in reconnectPendingAddresses,
+            connectedStableMs = connectedStableMs(norm),
+            reconnectGuardMs = RECONNECT_SYNC_NEGATIVE_GUARD_MS,
+        )
+
+    private fun scheduleStableSyncStatusVerification(norm: String) {
+        val sessionId = connectSessionId
+        mainHandler.postDelayed({
+            if (
+                sessionId != connectSessionId ||
+                norm in _manuallyDisconnectedAddresses.value ||
+                isFlashRecordingDevice?.invoke(norm) == true
+            ) {
+                return@postDelayed
+            }
+            val device = devices.firstOrNull {
+                normalizeAddress(it.address.orEmpty()) == norm
+            } ?: return@postDelayed
+            if (
+                device.connectionState == DotDevice.CONN_STATE_CONNECTED &&
+                _deviceSyncStates.value[norm] == true
+            ) {
+                device.readSyncStatus()
+            }
+        }, RECONNECT_SYNC_NEGATIVE_GUARD_MS + 500L)
+    }
+
     private fun refreshGlobalSyncFromConnectedDevices() {
         if (_isSyncing.value) return
-        val connected = devices.filter { dev ->
-            dev.connectionState == DotDevice.CONN_STATE_CONNECTED &&
-                !dev.address.isNullOrBlank()
-        }
-        if (connected.size < 2) return
-
-        val allConnectedSynced = connected.all { it.isSynced }
-        if (allConnectedSynced) {
+        val configuredDevices = devices.filter { !it.address.isNullOrBlank() }
+        val allConfiguredSynced =
+            configuredDevices.size >= 2 &&
+                configuredDevices.size == targetDeviceCount &&
+                configuredDevices.all { dev ->
+                    val norm = normalizeAddress(dev.address.orEmpty())
+                    dev.connectionState == DotDevice.CONN_STATE_CONNECTED &&
+                        _deviceSyncStates.value[norm] == true
+                }
+        if (allConfiguredSynced) {
             _needsSync.value = false
             _isSynced.value = true
-        } else if (_isSynced.value) {
+        } else {
             _isSynced.value = false
-            _needsSync.value = true
+            _needsSync.value = configuredDevices.size >= 2
+        }
+    }
+
+    private fun markDevicesMeasuring(targetDevices: Collection<DotDevice>) {
+        targetDevices.forEach { device ->
+            device.address?.let { measuringAddresses.add(normalizeAddress(it)) }
+        }
+        measurementStarted = measuringAddresses.isNotEmpty()
+        if (measurementStarted) {
+            startLossReporting()
+            if (_state.value != CollectionState.Recording) {
+                _state.value = CollectionState.Measuring
+            }
+        }
+    }
+
+    private fun unmarkDevicesMeasuring(targetDevices: Collection<DotDevice>) {
+        targetDevices.forEach { device ->
+            device.address?.let { measuringAddresses.remove(normalizeAddress(it)) }
+        }
+        measurementStarted = measuringAddresses.isNotEmpty()
+        if (!measurementStarted) {
+            stopLossReporting()
+            _state.value = CollectionState.Connecting
         }
     }
 
@@ -397,7 +585,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     }
 
     private fun resumeBackgroundReads() {
-        if (exportTransferActive || _isSyncing.value) {
+        if (_isSyncing.value) {
             backgroundReadsPaused = true
             stopRssiMonitoring()
             return
@@ -409,19 +597,35 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     }
 
     /**
-     * Flash 导出依赖持续的 BLE notification。导出期间暂停 RSSI/电量等主动 GATT 读取，
-     * 避免与 DotRecordingManager 的数据通道争用；全部文件结束后再恢复。
+     * Flash 导出依赖目标设备持续发送 BLE notification。只暂停导出目标设备的
+     * RSSI/电量等主动 GATT 读取，其他运动员仍在录制时继续更新链路状态并可独立停止。
      */
-    fun setExportInProgress(active: Boolean) {
-        if (exportTransferActive == active) return
-        exportTransferActive = active
-        if (active) {
-            pauseBackgroundReads()
-            Log.i(DIAG_TAG, "Flash export active: background BLE reads paused")
+    fun setExportTargets(addresses: Set<String>) {
+        val normalized = addresses.map(::normalizeAddress).filter { it.isNotBlank() }.toSet()
+        if (exportTargetAddresses == normalized) return
+        exportTargetAddresses = normalized
+        if (backgroundReadsPaused || _isSyncing.value) {
+            stopRssiMonitoring()
+        } else if (devices.any { device ->
+                shouldPollRssiForDevice(
+                    isConnected = device.connectionState == DotDevice.CONN_STATE_CONNECTED,
+                    backgroundReadsPaused = false,
+                    isSyncing = false,
+                    isExportTarget = normalizeAddress(device.address.orEmpty()) in normalized,
+                )
+            }) {
+            startRssiMonitoring()
         } else {
-            resumeBackgroundReads()
-            Log.i(DIAG_TAG, "Flash export finished: background BLE reads resumed")
+            stopRssiMonitoring()
         }
+        Log.i(
+            DIAG_TAG,
+            if (normalized.isEmpty()) {
+                "Flash export finished: RSSI monitoring restored for all connected devices"
+            } else {
+                "Flash export targets=${normalized.joinToString()}: active reads paused only for targets"
+            },
+        )
     }
 
     private fun markReconnectPending(normAddr: String) {
@@ -475,6 +679,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     private fun appendSyncLog(msg: String) {
         val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
         _syncLog.value = _syncLog.value + "[$t] $msg"
+        Log.i(SYNC_TIMING_TAG, msg)
     }
 
     private fun logSyncTiming(message: String) {
@@ -526,16 +731,17 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         val dev = device ?: return
         mainHandler.post {
             val name = dev.name?.takeIf { it.isNotBlank() } ?: return@post
-            if (!LongJumpDeviceRoles.isTargetDevice(dev.address)) return@post
             val list = _scannedDevices.value.toMutableList()
             val index = list.indexOfFirst { normalizeAddress(it.address) == normalizeAddress(dev.address) }
             if (index >= 0) {
                 list[index] = list[index].copy(name = name, rssi = rssi)
-                _scannedDevices.value = list.sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address) }
             } else {
                 list.add(ScannedDevice(dev, name, dev.address, rssi))
-                _scannedDevices.value = list.sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address) }
             }
+            _scannedDevices.value = list.sortedWith(
+                compareBy<ScannedDevice> { LongJumpDeviceRoles.roleSortIndex(it.address) }
+                    .thenBy { normalizeAddress(it.address) }
+            )
             tryCompleteBluetoothRestartReconnect()
         }
     }
@@ -543,15 +749,36 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     // ── 连接 ──
 
     fun connectDevices(selected: List<ScannedDevice>) {
+        connectDevices(
+            selected = selected,
+            reconnectContextAddresses = emptySet(),
+            preservedMeasuringAddresses = emptySet(),
+        )
+    }
+
+    private fun connectDevices(
+        selected: List<ScannedDevice>,
+        reconnectContextAddresses: Set<String>,
+        preservedMeasuringAddresses: Set<String>,
+    ) {
         if (selected.isEmpty()) return
+        val reconnectContexts = reconnectContextAddresses
+            .map(::normalizeAddress)
+            .toSet()
+        val preservedMeasuring = preservedMeasuringAddresses
+            .map(::normalizeAddress)
+            .toSet()
         bluetoothRestartReconnectPending = false
         bluetoothRestartReconnectRunnable?.let(mainHandler::removeCallbacks)
         bluetoothRestartReconnectRunnable = null
         stopScan()
         userRequestedDisconnect = false
+        _manuallyDisconnectedAddresses.value = emptySet()
         connectionTargets = selected.map {
             ConnectionTarget(address = it.address, name = it.name, rssi = it.rssi)
         }
+        _connectionTargetAddresses.value =
+            connectionTargets.map { normalizeAddress(it.address) }.toSet()
         devices.forEach { device ->
             try {
                 device.cancelReconnecting()
@@ -565,11 +792,16 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         }
         connectSessionId++
         targetDeviceCount   = selected.size
-        measurementStarted  = false
+        measuringAddresses.clear()
+        measuringAddresses.addAll(preservedMeasuring)
+        measurementStarted  = measuringAddresses.isNotEmpty()
         _needsSync.value    = selected.size > 1
         _state.value        = CollectionState.Connecting
         devices.clear(); addressToIndex.clear(); initDoneAddresses.clear(); initializedOnceAddresses.clear()
         reconnectPendingAddresses.clear(); lastReconnectHandledAt.clear()
+        initializedOnceAddresses.addAll(reconnectContexts)
+        reconnectPendingAddresses.addAll(reconnectContexts)
+        connectedSinceAtMs.clear()
         lastFirmwareSummaryKey = null
         addrToIdx.clear(); addrToNorm.clear(); lastPktCounter.clear()
         // syncOutputRate 保留当前 ViewModel 设定值（默认 120），不在此重置
@@ -593,28 +825,166 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             }, i * 300L)
         }
 
-        // 20 秒后检查是否所有设备都完成初始化
+        // 多设备连接按 300ms 错峰，参与设备越多，初始化窗口相应延长。
+        val connectionTimeoutMs = 20_000L + (selected.size - 2).coerceAtLeast(0) * 3_000L
         mainHandler.postDelayed({
             if (sid != connectSessionId) return@postDelayed
             val missing = targetDeviceCount - initDoneAddresses.size
             if (missing > 0) {
                 appendSyncLog("连接超时：有 $missing 台设备未就绪，建议断开后扫描连接")
             }
-        }, 20_000L)
+        }, connectionTimeoutMs)
+    }
+
+    fun connectAdditionalDevices(selected: List<ScannedDevice>): Boolean {
+        if (selected.isEmpty()) return false
+        val connectedNorms = _connectedDevices.value.map(::normalizeAddress).toSet()
+        val existingNorms = devices.mapNotNull { it.address }.map(::normalizeAddress).toSet()
+        val additions = selected
+            .distinctBy { normalizeAddress(it.address) }
+            .filter { normalizeAddress(it.address) !in connectedNorms }
+        if (additions.isEmpty()) return true
+
+        stopScan()
+        userRequestedDisconnect = false
+        val additionNorms = additions.map { normalizeAddress(it.address) }.toSet()
+        _manuallyDisconnectedAddresses.value -= additionNorms
+        connectionTargets = (
+            connectionTargets.filterNot { normalizeAddress(it.address) in additionNorms } +
+                additions.map {
+                    ConnectionTarget(address = it.address, name = it.name, rssi = it.rssi)
+                }
+            ).distinctBy { normalizeAddress(it.address) }
+        _connectionTargetAddresses.value =
+            connectionTargets.map { normalizeAddress(it.address) }.toSet()
+
+        devices.removeAll { device ->
+            normalizeAddress(device.address.orEmpty()) in additionNorms &&
+                normalizeAddress(device.address.orEmpty()) in existingNorms
+        }
+        additions.forEach { scanned ->
+            val xsDev = DotDevice(context, scanned.device, this)
+            xsDev.setDotCiCallback(this)
+            xsDev.setDotMeasurementCallback(this)
+            devices.add(xsDev)
+        }
+        rebuildDeviceAddressIndexes()
+
+        val sid = ++connectSessionId
+        targetDeviceCount = devices.size
+        _state.value = CollectionState.Connecting
+        _needsSync.value = targetDeviceCount > 1
+        _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
+        additions.forEachIndexed { index, scanned ->
+            val norm = normalizeAddress(scanned.address)
+            initializedOnceAddresses.remove(norm)
+            initDoneAddresses.remove(norm)
+            reconnectPendingAddresses.remove(norm)
+            lastReconnectHandledAt.remove(norm)
+            connectedSinceAtMs.remove(norm)
+            outOfRangeLoggedAddresses.remove(norm)
+            mainHandler.postDelayed({
+                if (sid == connectSessionId) {
+                    devices.firstOrNull {
+                        normalizeAddress(it.address.orEmpty()) == norm
+                    }?.connect()
+                }
+            }, index * 300L)
+        }
+        appendSyncLog("正在连接 ${additions.size} 台分组设备")
+        return true
+    }
+
+    fun disconnectDevices(addresses: Set<String>): Boolean {
+        val normalizedTargets = addresses.map(::normalizeAddress).toSet()
+        val targets = devices.filter {
+            normalizeAddress(it.address.orEmpty()) in normalizedTargets
+        }
+        if (targets.isEmpty()) return false
+
+        _manuallyDisconnectedAddresses.value += normalizedTargets
+        connectionTargets = connectionTargets.filterNot {
+            normalizeAddress(it.address) in normalizedTargets
+        }
+        _connectionTargetAddresses.value =
+            connectionTargets.map { normalizeAddress(it.address) }.toSet()
+        userRequestedDisconnect = connectionTargets.isEmpty()
+        connectSessionId++
+        requestStopSyncing(targets, logSummary = false)
+        unmarkDevicesMeasuring(targets)
+
+        targets.forEach { device ->
+            runCatching { device.stopMeasuring() }
+            runCatching { device.cancelReconnecting() }
+            runCatching { device.setDotCiCallback(null) }
+            runCatching { device.setDotMeasurementCallback(null) }
+            runCatching { device.setDotDeviceCallback(null) }
+        }
+        mainHandler.postDelayed({
+            targets.forEach { device -> runCatching { device.disconnect() } }
+        }, 300)
+
+        devices.removeAll(targets.toSet())
+        normalizedTargets.forEach { norm ->
+            initDoneAddresses.remove(norm)
+            initializedOnceAddresses.remove(norm)
+            reconnectPendingAddresses.remove(norm)
+            lastReconnectHandledAt.remove(norm)
+            connectedSinceAtMs.remove(norm)
+            outOfRangeLoggedAddresses.remove(norm)
+            lastInitDoneAtMs.remove(norm)
+            measuringAddresses.remove(norm)
+            lastPktCounter.remove(norm)
+            syncConfirmedAtByDevice.remove(norm)
+            pendingSensorData.remove(norm)
+            waveDataMap.remove(norm)
+            lossStats.remove(norm)
+            recvStats.remove(norm)
+        }
+        rebuildDeviceAddressIndexes()
+        targetDeviceCount = devices.size
+        _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
+        _connectedDevices.value = devices.mapNotNull { device ->
+            device.address?.takeIf {
+                device.connectionState == DotDevice.CONN_STATE_CONNECTED
+            }
+        }
+        _batteryStatus.value = _batteryStatus.value - normalizedTargets
+        _deviceRssi.value = _deviceRssi.value - normalizedTargets
+        _deviceRssiUpdatedAt.value = _deviceRssiUpdatedAt.value - normalizedTargets
+        _deviceSyncStates.value = _deviceSyncStates.value - normalizedTargets
+        _firmwareStatus.value = _firmwareStatus.value - normalizedTargets
+        _sensorData.value = _sensorData.value - normalizedTargets
+        _waveData.value = _waveData.value - normalizedTargets
+        refreshDeviceSyncStates()
+        refreshGlobalSyncFromConnectedDevices()
+
+        if (devices.isEmpty()) {
+            stopRssiMonitoring()
+            _state.value = CollectionState.Idle
+            _needsSync.value = false
+            _isSynced.value = false
+        } else {
+            _state.value = CollectionState.Connecting
+            resumeBackgroundReads()
+        }
+        appendSyncLog("已断开 ${targets.size} 台分组设备")
+        return true
     }
 
     fun disconnectAll() {
         userRequestedDisconnect = true
         connectionTargets = emptyList()
+        _connectionTargetAddresses.value = emptySet()
         bluetoothRestartReconnectRunnable?.let(mainHandler::removeCallbacks)
         bluetoothRestartReconnectRunnable = null
         bluetoothRestartReconnectPending = false
         connectSessionId++; syncEpoch++
-        exportTransferActive = false
+        exportTargetAddresses = emptySet()
         stopLossReporting()
         stopRssiMonitoring()
         cancelSyncTimeout()
-        requestStopSyncing(logSummary = false)
+        requestStopSyncing(devices.toList(), logSummary = false)
 
         val targets = devices.toList()
         targets.forEach { it.stopMeasuring() }
@@ -622,21 +992,28 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
         devices.clear(); addressToIndex.clear(); initDoneAddresses.clear(); initializedOnceAddresses.clear()
         reconnectPendingAddresses.clear(); lastReconnectHandledAt.clear()
+        connectedSinceAtMs.clear()
         outOfRangeLoggedAddresses.clear()
         addrToIdx.clear(); addrToNorm.clear(); lastPktCounter.clear()
-        targetDeviceCount = 0; measurementStarted = false
+        targetDeviceCount = 0
+        measurementStarted = false
+        measuringAddresses.clear()
         _initProgress.value    = Pair(0, 0)
         _connectedDevices.value = emptyList()
+        _manuallyDisconnectedAddresses.value = emptySet()
         _state.value           = CollectionState.Idle
         _isSynced.value        = false
         _isSyncing.value       = false
         _syncProgress.value    = 0
+        _syncTargetAddresses.value = emptySet()
+        activeSyncDevices = emptyList()
         _needsSync.value       = false
         _recvCount.value       = 0
         _batteryStatus.value   = emptyMap()
         _deviceRssi.value      = emptyMap()
         _deviceSyncStates.value = emptyMap()
         syncConfirmedAtMs = 0L
+        syncConfirmedAtByDevice.clear()
         _firmwareStatus.value  = emptyMap()
         lastFirmwareSummaryKey = null
         totalRecvCount.set(0L)
@@ -682,15 +1059,18 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         mainHandler.post {
             val addr = address ?: return@post
             val normForLog = normalizeAddress(addr)
+            if (normForLog in _manuallyDisconnectedAddresses.value) return@post
             logLinkDiag(
                 addr,
                 "connection=${connectionStateLabel(state)} initialized=${normForLog in initializedOnceAddresses} " +
-                    "initDone=${normForLog in initDoneAddresses} measuring=$measurementStarted synced=${_isSynced.value}"
+                    "initDone=${normForLog in initDoneAddresses} " +
+                    "measuring=${normForLog in measuringAddresses} synced=${_deviceSyncStates.value[normForLog] == true}"
             )
             when (state) {
                 DotDevice.CONN_STATE_CONNECTED -> {
                     resolveDeviceIndex(addr)
                     val norm = normalizeAddress(addr)
+                    connectedSinceAtMs.putIfAbsent(norm, SystemClock.elapsedRealtime())
                     outOfRangeLoggedAddresses.remove(norm)
                     if (addrToIdx[addr] == null) {
                         val idx = addressToIndex[norm]
@@ -701,6 +1081,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     }
                     refreshConnectedDevices()
                     refreshDeviceSyncStates()
+                    refreshGlobalSyncFromConnectedDevices()
                     if (!_isSyncing.value) {
                         devices.firstOrNull { normalizeAddress(it.address ?: "") == norm }?.readRssi()
                         startRssiMonitoring()
@@ -710,6 +1091,13 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                 DotDevice.CONN_STATE_START_RECONNECTING,
                 DotDevice.CONN_STATE_RECONNECTING -> {
                     val norm = normalizeAddress(addr)
+                    if (isFlashRecordingDevice?.invoke(norm) == true) {
+                        devices.firstOrNull {
+                            normalizeAddress(it.address.orEmpty()) == norm
+                        }?.setAutoPlot(false)
+                        logLinkDiag(addr, "flash recording active: suppressed SDK auto measurement restore")
+                    }
+                    connectedSinceAtMs.remove(norm)
                     if (_isSyncing.value && !isBluetoothEnabled()) {
                         abortActiveSync("蓝牙已关闭，同步已取消")
                     }
@@ -717,6 +1105,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     clearRssi(norm)
                     refreshConnectedDevices(excludeNormAddr = norm)
                     refreshDeviceSyncStates()
+                    refreshGlobalSyncFromConnectedDevices()
                     _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
                     if (outOfRangeLoggedAddresses.add(norm)) {
                         appendSyncLog("[$addr] 设备超距，等待回连")
@@ -727,10 +1116,18 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                         abortActiveSync("[$addr] 设备断开，同步已取消")
                     }
                     val norm = normalizeAddress(addr)
+                    if (isFlashRecordingDevice?.invoke(norm) == true) {
+                        devices.firstOrNull {
+                            normalizeAddress(it.address.orEmpty()) == norm
+                        }?.setAutoPlot(false)
+                        logLinkDiag(addr, "flash recording active: kept SDK auto measurement restore disabled")
+                    }
+                    connectedSinceAtMs.remove(norm)
                     markReconnectPending(norm)
                     clearRssi(norm)
                     refreshConnectedDevices(excludeNormAddr = norm)
                     refreshDeviceSyncStates()
+                    refreshGlobalSyncFromConnectedDevices()
                     _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
                     if (outOfRangeLoggedAddresses.add(norm)) {
                         appendSyncLog("[$addr] 设备断开，等待回连")
@@ -804,6 +1201,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         mainHandler.post {
             val addr     = address ?: return@post
             val normAddr = normalizeAddress(addr)
+            if (normAddr in _manuallyDisconnectedAddresses.value) return@post
             resolveDeviceIndex(addr) ?: return@post
             val dev = devices.firstOrNull { normalizeAddress(it.address ?: "") == normAddr } ?: return@post
             val isFirstReady = normAddr !in initDoneAddresses
@@ -813,17 +1211,29 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
             // 必须在任何BLE操作之前检查：DotSyncManager的readAck在30ms后也排队到主线程
             // 若此处发起GATT write，会占用GATT导致readAck失败→同步75%失败
-            if (_isSyncing.value) return@post
+            if (_isSyncing.value) {
+                // 同步会主动让设备断联并回连。这里仍需恢复本地“初始化完成”状态，
+                // 否则同步成功后解除同步，再次同步会被未初始化检查错误拦截。
+                // DotSyncManager 会在约 30ms 后读取 ACK，此分支只能做最小内存标记：
+                // 不能更新 StateFlow、刷新 UI、写日志或发起任何 GATT 操作。
+                lastInitDoneAtMs[normAddr] = SystemClock.elapsedRealtime()
+                initDoneAddresses.add(normAddr)
+                initializedOnceAddresses.add(normAddr)
+                outOfRangeLoggedAddresses.remove(normAddr)
+                return@post
+            }
 
             // 部分固件会在普通 GATT 读取后重复上报 initDone。重复回调不能再次触发
             // 电量、RSSI、采样率等 BLE 操作，否则会形成 initDone -> read -> initDone 循环。
             if (!isFirstReady && !isReconnect) return@post
 
             lastInitDoneAtMs[normAddr] = SystemClock.elapsedRealtime()
+            connectedSinceAtMs.putIfAbsent(normAddr, SystemClock.elapsedRealtime())
             logLinkDiag(
                 addr,
                 "initDone firstReady=$isFirstReady firstSession=$isFirstInitInSession reconnect=$isReconnect " +
-                    "conn=${connectionStateLabel(dev.connectionState)} measuring=$measurementStarted synced=${_isSynced.value} " +
+                    "conn=${connectionStateLabel(dev.connectionState)} " +
+                    "measuring=${normAddr in measuringAddresses} synced=${dev.isSynced} " +
                     "rate=${dev.currentOutputRate} firmware=${dev.firmwareVersion ?: "unknown"}"
             )
             outOfRangeLoggedAddresses.remove(normAddr)
@@ -831,17 +1241,40 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             initializedOnceAddresses.add(normAddr)
             _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
             refreshDeviceSyncStates()
+            refreshGlobalSyncFromConnectedDevices()
             updateFirmwareStatus(normAddr, dev.firmwareVersion, dev.isCompatibleFirmwareVersion)
+            if (
+                shouldHandleReconnect &&
+                isFlashRecordingDevice?.invoke(normAddr) == true
+            ) {
+                // Flash recording continues on the sensor while BLE is unavailable. Rewriting
+                // output rate, payload mode, filter profile, or measurement state here truncates
+                // the active file even though the recording-state query still reports onRecording.
+                appendSyncLog("[$addr] 已回连，保持离线录制参数不变")
+                onDeviceReconnected?.invoke(addr)
+                return@post
+            }
+            if (shouldHandleReconnect) {
+                scheduleStableSyncStatusVerification(normAddr)
+            }
             val batteryReadSession = connectSessionId
             mainHandler.postDelayed({
-                if (batteryReadSession == connectSessionId && !backgroundReadsPaused && !_isSyncing.value) {
+                if (
+                    batteryReadSession == connectSessionId &&
+                    shouldPollRssiForDevice(
+                        isConnected = dev.connectionState == DotDevice.CONN_STATE_CONNECTED,
+                        backgroundReadsPaused = backgroundReadsPaused,
+                        isSyncing = _isSyncing.value,
+                        isExportTarget = normAddr in exportTargetAddresses,
+                    )
+                ) {
                     dev.readBattery()
                     dev.readRssi()
                 }
             }, 350L)
 
             if (targetDeviceCount == 1) {
-                val wasActive = measurementStarted  // 重连场景下为 true
+                val wasActive = normAddr in measuringAddresses
                 val resumeRate = if (wasActive && syncOutputRate == 120) syncOutputRate else STREAM_OUTPUT_RATE_HZ
                 dev.setOutputRate(if (wasActive) resumeRate else syncOutputRate)
                 dev.measurementMode = desiredMode
@@ -849,9 +1282,8 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     if (wasActive) {
                         if (!shouldHandleReconnect) return@postDelayed
                         if (dev.startMeasuring()) {
+                            markDevicesMeasuring(listOf(dev))
                             lastReconnectHandledAt[normAddr] = System.currentTimeMillis()
-                            startLossReporting()
-                            _state.value = CollectionState.Measuring
                             appendSyncLog("[$addr] 重新连接，测量已恢复")
                             onDeviceReconnected?.invoke(addr)
                         } else {
@@ -866,16 +1298,18 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     }
                 }, 2000)
             } else {
-                if (measurementStarted) {
+                val wasActive = normAddr in measuringAddresses
+                if (wasActive) {
                     if (!shouldHandleReconnect) return@post
-                    if (_isSynced.value) {
+                    if (dev.isSynced) {
                         appendSyncLog("[$addr] 重新连接，保持 SDK 同步测量状态")
                     } else {
-                        // 此分支：其他设备仍在测量中，仅对刚重连的设备独立恢复
                         appendSyncLog("[$addr] 重新连接，恢复测量…")
                         dev.setOutputRate(STREAM_OUTPUT_RATE_HZ)
                         dev.measurementMode = desiredMode
-                        dev.startMeasuring()
+                        if (dev.startMeasuring()) {
+                            markDevicesMeasuring(listOf(dev))
+                        }
                     }
                     onDeviceReconnected?.invoke(addr)
                 } else {
@@ -895,10 +1329,18 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                             }
                             appendSyncLog("全部 $targetDeviceCount 台设备已就绪，请选择「SDK 硬件同步」")
                         }, 300)
-                    } else if (isReconnect && _isSynced.value) {
+                    } else if (isReconnect) {
                         if (!dev.isSynced) {
-                            _isSynced.value = false
-                            appendSyncLog("[$addr] 重新连接但遭遇【硬件同步丢失】，请重新执行 SDK 同步！")
+                            if (_deviceSyncStates.value[normAddr] == true) {
+                                appendSyncLog("[$addr] 回连初始化中，保持已确认同步状态")
+                            } else {
+                                _deviceSyncStates.value =
+                                    _deviceSyncStates.value.toMutableMap().also {
+                                        it[normAddr] = false
+                                    }
+                                appendSyncLog("[$addr] 重新连接但硬件同步未确认，请重新同步该运动员左右脚")
+                            }
+                            refreshGlobalSyncFromConnectedDevices()
                         } else {
                             appendSyncLog("[$addr] 已恢复设定采样率 (${syncOutputRate}Hz) 且硬件同步状态完好 ✓")
                         }
@@ -920,9 +1362,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             targetDevices.firstOrNull()?.isRootDevice = false
             targetDevices.forEach { dev -> dev.measurementMode = desiredMode }
             targetDevices.forEach { dev -> dev.startMeasuring() }
-            measurementStarted = true
-            startLossReporting()
-            _state.value = CollectionState.Measuring
+            markDevicesMeasuring(targetDevices)
             appendSyncLog("测量已启动（${targetDevices.size} 台设备）")
         }, 500)
     }
@@ -933,7 +1373,11 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         mainHandler.post {
             if (sid != connectSessionId) return@post
             // 与官方一致：仅在已测量时才发 stopMeasuring，避免向从未启动测量的设备发无效 GATT 写
-            if (measurementStarted) targetDevices.forEach { it.stopMeasuring() }
+            val measuringTargets = targetDevices.filter {
+                normalizeAddress(it.address.orEmpty()) in measuringAddresses
+            }
+            measuringTargets.forEach { it.stopMeasuring() }
+            unmarkDevicesMeasuring(measuringTargets)
             // 实时 BLE 流式采集固定 ODR（与官方一致）；离线/同步仍可用 syncOutputRate=120
             targetDevices.forEach { dev -> dev.setOutputRate(STREAM_OUTPUT_RATE_HZ) }
             targetDevices.forEach { dev -> dev.measurementMode = desiredMode }
@@ -942,9 +1386,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                 val currentProfile = _filterProfile.value
                 targetDevices.forEach { dev -> applyFilterProfileToDevice(dev, currentProfile) }
                 targetDevices.forEach { dev -> dev.startMeasuring() }
-                measurementStarted = true
-                startLossReporting()
-                if (_state.value != CollectionState.Recording) _state.value = CollectionState.Measuring
+                markDevicesMeasuring(targetDevices)
             }, 2000)
         }
     }
@@ -955,22 +1397,24 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         mainHandler.post {
             if (
                 !isSynced &&
-                _isSynced.value &&
-                syncConfirmedAtMs > 0L &&
-                SystemClock.elapsedRealtime() - syncConfirmedAtMs < SYNC_RESULT_SETTLE_MS
+                (
+                    deferNegativeSyncStatus(norm) ||
+                        (
+                            _deviceSyncStates.value[norm] == true &&
+                                SystemClock.elapsedRealtime() -
+                                (syncConfirmedAtByDevice[norm] ?: 0L) <
+                                SYNC_RESULT_SETTLE_MS
+                            )
+                    )
             ) {
-                logLinkDiag(addr, "ignored stale sync-status=false after successful sync")
+                logLinkDiag(addr, "deferred transient sync-status=false")
                 return@post
             }
             _deviceSyncStates.value = _deviceSyncStates.value.toMutableMap().also {
                 it[norm] = isSynced
             }
-            if (!isSynced && _isSynced.value) {
-                _isSynced.value = false
-                _needsSync.value = true
-            } else {
-                refreshGlobalSyncFromConnectedDevices()
-            }
+            if (!isSynced) syncConfirmedAtByDevice.remove(norm)
+            refreshGlobalSyncFromConnectedDevices()
         }
     }
 
@@ -1003,7 +1447,15 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         override fun run() {
             if (backgroundReadsPaused || _isSyncing.value) return
             val connected = devices
-                .filter { it.connectionState == DotDevice.CONN_STATE_CONNECTED }
+                .filter { device ->
+                    shouldPollRssiForDevice(
+                        isConnected = device.connectionState == DotDevice.CONN_STATE_CONNECTED,
+                        backgroundReadsPaused = backgroundReadsPaused,
+                        isSyncing = _isSyncing.value,
+                        isExportTarget =
+                            normalizeAddress(device.address.orEmpty()) in exportTargetAddresses,
+                    )
+                }
                 .sortedBy { normalizeAddress(it.address.orEmpty()) }
             if (connected.isEmpty()) return
             if (rssiMonitorIndex >= connected.size) rssiMonitorIndex = 0
@@ -1105,6 +1557,52 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
     // ── 公开控制 ──
 
     fun getDevices(): List<DotDevice> = devices.toList()
+    fun isDeviceInitialized(address: String): Boolean =
+        normalizeAddress(address) in initDoneAddresses
+
+    private fun isDeviceReadyForSync(device: DotDevice): Boolean {
+        val norm = normalizeAddress(device.address.orEmpty())
+        val stableForMs = connectedSinceAtMs[norm]?.let {
+            SystemClock.elapsedRealtime() - it
+        } ?: 0L
+        return isSyncCommandReady(
+            isConnected = device.connectionState == DotDevice.CONN_STATE_CONNECTED,
+            initializedThisConnection = norm in initDoneAddresses,
+            initializedBefore = norm in initializedOnceAddresses,
+            connectedStableMs = stableForMs,
+            reconnectStableRequirementMs = RECONNECT_SYNC_READY_STABLE_MS,
+        )
+    }
+
+    fun areDevicesReadyForSync(targetAddresses: Set<String>): Boolean {
+        val normalizedTargets = targetAddresses.map(::normalizeAddress).toSet()
+        val targetDevices = devicesForAddresses(normalizedTargets)
+        return targetDevices.size == normalizedTargets.size &&
+            targetDevices.size >= 2 &&
+            targetDevices.all(::isDeviceReadyForSync)
+    }
+
+    fun syncReadinessDescription(targetAddresses: Set<String>): String {
+        val normalizedTargets = targetAddresses.map(::normalizeAddress).toSet()
+        val targetDevices = devicesForAddresses(normalizedTargets)
+        val found = targetDevices.map { normalizeAddress(it.address.orEmpty()) }.toSet()
+        val missing = normalizedTargets - found
+        if (missing.isNotEmpty()) {
+            return "未找到设备 ${missing.joinToString { it.takeLast(4) }}"
+        }
+        val disconnected = targetDevices.filter {
+            it.connectionState != DotDevice.CONN_STATE_CONNECTED
+        }
+        if (disconnected.isNotEmpty()) {
+            return "设备 ${disconnected.joinToString { it.address.orEmpty().takeLast(4) }} 尚未连接"
+        }
+        val initializing = targetDevices.filterNot(::isDeviceReadyForSync)
+        if (initializing.isNotEmpty()) {
+            return "设备 ${initializing.joinToString { it.address.orEmpty().takeLast(4) }} 正在初始化"
+        }
+        return "设备已就绪"
+    }
+
     fun setOutputRate(rate: Int) { devices.forEach { it.setOutputRate(rate) } }
     /** 立即向所有已连接设备写入目标采样率（用户点击选择按钮时调用） */
     fun setAllDevicesOutputRate(rate: Int) {
@@ -1114,19 +1612,44 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         }
         mainHandler.post { devices.forEach { d -> d.setOutputRate(rate) } }
     }
-    fun prepareSyncParameters(rate: Int, filterMode: Int): SyncParameterPrepareResult {
-        if (!canWriteDeviceParameters()) {
-            appendSyncLog("当前已进入测量/同步状态，请先停止采集或解除同步再修改同步参数")
+    fun prepareSyncParameters(rate: Int, filterMode: Int): SyncParameterPrepareResult =
+        prepareSyncParametersForDevices(
+            devices.mapNotNull { it.address }.map(::normalizeAddress).toSet(),
+            rate,
+            filterMode,
+        )
+
+    fun prepareSyncParametersForDevices(
+        targetAddresses: Set<String>,
+        rate: Int,
+        filterMode: Int,
+    ): SyncParameterPrepareResult {
+        val devList = devicesForAddresses(targetAddresses)
+        if (devList.size != targetAddresses.map(::normalizeAddress).toSet().size || devList.isEmpty()) {
+            appendSyncLog("同步组设备不完整，请保持设备连接后重试")
             return SyncParameterPrepareResult(success = false, wroteParameters = false, waitMsBeforeSync = 0L)
+        }
+        if (_isSyncing.value || measurementStarted) {
+            appendSyncLog("当前已进入测量/同步状态，请先停止采集再修改同步参数")
+            return SyncParameterPrepareResult(success = false, wroteParameters = false, waitMsBeforeSync = 0L)
+        }
+        if (devList.all { it.isSynced }) {
+            return SyncParameterPrepareResult(success = true, wroteParameters = false, waitMsBeforeSync = 0L)
+        }
+        if (devList.any { it.isSynced }) {
+            appendSyncLog("同步组状态不一致，将先解除该组同步后重新同步")
+            return SyncParameterPrepareResult(success = true, wroteParameters = false, waitMsBeforeSync = 0L)
         }
         pauseBackgroundReads()
         syncSessionStartedAtMs = SystemClock.elapsedRealtime()
         syncAttemptStartedAtMs = 0L
-        logSyncTiming("prepareSyncParameters begin rate=${rate}Hz filter=${filterMode} devices=${devices.size}")
+        logSyncTiming(
+            "prepareSyncParameters begin rate=${rate}Hz filter=$filterMode " +
+                "devices=${devList.joinToString { it.address.orEmpty() }}"
+        )
         syncOutputRate = rate
         _filterProfile.value = filterMode
 
-        val devList = devices.toList()
         val needsWrite = devList.any { dev ->
             dev.currentOutputRate != rate ||
                 dev.currentFilterProfileIndex != filterMode ||
@@ -1164,35 +1687,57 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         )
     }
     fun canWriteDeviceParameters(): Boolean =
-        !_isSyncing.value && !_isSynced.value && !measurementStarted
+        !_isSyncing.value && devices.none { it.isSynced } && !measurementStarted
 
     fun confirmExistingSyncIfAllConnected(): Boolean {
         val connected = devices.filter { dev ->
             dev.connectionState == DotDevice.CONN_STATE_CONNECTED &&
                 !dev.address.isNullOrBlank()
         }
-        if (connected.size < 2 || !connected.all { it.isSynced }) return false
+        if (
+            connected.size < 2 ||
+            connected.size != targetDeviceCount ||
+            !connected.all { it.isSynced }
+        ) return false
 
         mainHandler.post {
             _needsSync.value = false
             _isSynced.value = true
             _isSyncing.value = false
             _syncProgress.value = 100
-            refreshDeviceSyncStates()
-            measurementStarted = true
-            startLossReporting()
-            _state.value = CollectionState.Measuring
-            appendSyncLog("检测到设备已处于 SDK 同步状态，直接保持已同步")
+            val now = SystemClock.elapsedRealtime()
+            _deviceSyncStates.value = _deviceSyncStates.value.toMutableMap().also { states ->
+                connected.forEach { device ->
+                    val norm = normalizeAddress(device.address.orEmpty())
+                    states[norm] = true
+                    syncConfirmedAtByDevice[norm] = now
+                }
+            }
+            connected.forEach { device -> runCatching { device.stopMeasuring() } }
+            unmarkDevicesMeasuring(connected)
+            appendSyncLog("检测到各运动员设备已同步，已进入录制准备状态")
         }
         return true
     }
 
-    fun startMeasuring() { devices.forEach { it.startMeasuring() } }
+    fun startMeasuring() {
+        devices.forEach { it.startMeasuring() }
+        markDevicesMeasuring(devices)
+    }
     fun stopMeasuring() {
         devices.forEach { it.stopMeasuring() }
+        measuringAddresses.clear()
         measurementStarted = false
         stopLossReporting()
         mainHandler.post { _state.value = CollectionState.Connecting }
+    }
+
+    fun stopMeasuring(targetAddresses: Set<String>) {
+        val targetDevices = devicesForAddresses(targetAddresses).filter { device ->
+            normalizeAddress(device.address.orEmpty()) in measuringAddresses
+        }
+        targetDevices.forEach { it.stopMeasuring() }
+        unmarkDevicesMeasuring(targetDevices)
     }
 
     // ── 直接采集 ──
@@ -1203,9 +1748,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             if (ready.isEmpty()) { appendSyncLog("无已就绪设备，请先完成连接"); return@post }
             if (_isSyncing.value) { appendSyncLog("同步进行中，请等待或停止同步"); return@post }
             if (_isSynced.value) {
-                measurementStarted = true
-                startLossReporting()
-                _state.value = CollectionState.Measuring
+                markDevicesMeasuring(ready)
                 appendSyncLog("已处于 SDK 同步测量状态，保持 ${syncOutputRate}Hz；如需 60Hz 实时采集请先解除同步")
                 return@post
             } else {
@@ -1225,7 +1768,12 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
      * @return true when the request was accepted (including an already active/synced session),
      * false when current device readiness prevents sync from starting.
      */
-    fun startSync(): Boolean = startSyncInternal()
+    fun startSync(): Boolean = startSync(
+        devices.mapNotNull { it.address }.map(::normalizeAddress).toSet()
+    )
+
+    fun startSync(targetAddresses: Set<String>): Boolean =
+        startSyncInternal(targetAddresses)
 
     /**
      * 官方 §4.9 同步流程：
@@ -1236,65 +1784,92 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
      *
      * 采样率和滤波器由用户点击选择按钮时立即写入设备，此处不再重复写入（避免 GATT 并发）。
      */
-    private fun startSyncInternal(): Boolean {
+    private fun startSyncInternal(
+        targetAddresses: Set<String>,
+        retryingIncompleteResult: Boolean = false,
+    ): Boolean {
+        val normalizedTargets = targetAddresses.map(::normalizeAddress).toSet()
+        val targetDevices = devicesForAddresses(normalizedTargets)
         if (syncSessionStartedAtMs == 0L) syncSessionStartedAtMs = SystemClock.elapsedRealtime()
-        logSyncTiming("startSyncInternal called devices=${devices.size}")
-        if (_isSyncing.value) {
-            appendSyncLog("同步正在进行中，请稍候…")
-            return true
+        logSyncTiming("startSyncInternal called targets=${normalizedTargets.joinToString()}")
+        if (_isSyncing.value && !retryingIncompleteResult) {
+            val sameTargets = normalizedTargets == _syncTargetAddresses.value
+            appendSyncLog(
+                if (sameTargets) "该运动员同步正在进行中，请稍候…"
+                else "其他运动员设备正在同步，请稍候…"
+            )
+            logSyncTiming("startSyncInternal active sameTargets=$sameTargets")
+            return sameTargets
         }
-        if (devices.isEmpty()) {
+        if (targetDevices.isEmpty()) {
             resumeBackgroundReads()
             appendSyncLog("没有可同步的设备")
+            logSyncTiming("startSyncInternal rejected: no devices")
             return false
         }
-        if (devices.size < 2) {
-            appendSyncLog("单设备无需 SDK 同步")
+        if (targetDevices.size != normalizedTargets.size || targetDevices.size < 2) {
             resumeBackgroundReads()
-            _isSynced.value = false
-            applyModeAndStart()
-            return true
+            appendSyncLog("同步组必须包含两台已连接设备")
+            logSyncTiming(
+                "startSyncInternal rejected: targets=${normalizedTargets.size} found=${targetDevices.size}"
+            )
+            return false
         }
-        if (devices.any { it.connectionState != DotDevice.CONN_STATE_CONNECTED }) {
+        val disconnectedDevices = targetDevices.filter {
+            it.connectionState != DotDevice.CONN_STATE_CONNECTED
+        }
+        if (disconnectedDevices.isNotEmpty()) {
             resumeBackgroundReads()
             appendSyncLog("部分设备未连接，请等待后重试")
+            logSyncTiming(
+                "startSyncInternal rejected: disconnected=" +
+                    disconnectedDevices.joinToString { device ->
+                        "${device.address ?: "?"}:${connectionStateLabel(device.connectionState)}"
+                    }
+            )
             return false
         }
 
         // 额外检查：所有设备必须完成初始化（onDotInitDone 已调用）才能同步
-        val uninitAddrs = devices.filter {
-            normalizeAddress(it.address ?: "") !in initDoneAddresses
-        }.mapNotNull { it.address }
+        val uninitAddrs = targetDevices.filterNot(::isDeviceReadyForSync).mapNotNull { it.address }
         if (uninitAddrs.isNotEmpty()) {
             resumeBackgroundReads()
             appendSyncLog("设备尚未就绪：$uninitAddrs，请等待初始化后重试")
+            logSyncTiming("startSyncInternal rejected: init pending=$uninitAddrs")
             return false
         }
 
         _isSyncing.value = true
-        _syncProgress.value = 0
+        if (!retryingIncompleteResult) {
+            _syncProgress.value = 0
+            activeSyncRetryCount = 0
+        }
+        activeSyncDevices = targetDevices
+        _syncTargetAddresses.value = normalizedTargets
         pauseBackgroundReads()
 
         // 官方 §4.10.3：有条件 stopMeasuring
-        if (measurementStarted) {
-            devices.forEach { try { it.stopMeasuring() } catch (_: Exception) {} }
-            measurementStarted = false
+        val measuringTargets = targetDevices.filter {
+            normalizeAddress(it.address.orEmpty()) in measuringAddresses
+        }
+        if (measuringTargets.isNotEmpty()) {
+            measuringTargets.forEach { try { it.stopMeasuring() } catch (_: Exception) {} }
+            unmarkDevicesMeasuring(measuringTargets)
         }
         syncManager = null
 
         // 官方 §4.9.1：检查 isSynced，只对已同步设备 stopSyncing
-        val syncedDevices = devices.filter { it.isSynced }
-        if (syncedDevices.size == devices.size) {
-            appendSyncLog("检测到全部设备已同步，保持当前 SDK 同步状态")
+        val syncedDevices = targetDevices.filter { it.isSynced }
+        if (syncedDevices.size == targetDevices.size) {
+            appendSyncLog("该运动员左右脚已同步，保持当前状态")
             logSyncTiming("all devices already synced, skip startSyncing")
-            _needsSync.value = false
-            _isSynced.value = true
             _isSyncing.value = false
             _syncProgress.value = 100
+            _syncTargetAddresses.value = emptySet()
+            activeSyncDevices = emptyList()
             refreshDeviceSyncStates()
-            measurementStarted = true
-            startLossReporting()
-            _state.value = CollectionState.Measuring
+            refreshGlobalSyncFromConnectedDevices()
+            _state.value = CollectionState.Connecting
             resumeBackgroundReads()
             return true
         }
@@ -1303,6 +1878,11 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             logSyncTiming("stopSyncing before resync syncedDevices=${syncedDevices.size}")
             var proceeded = false
             val preEpoch = syncEpoch
+            val pendingStops = syncedDevices.mapNotNull { device ->
+                device.address?.let(::normalizeAddress)
+            }.toMutableSet()
+            val stopRetryCounts = mutableMapOf<String, Int>()
+            var stopFailed = false
 
             fun proceedToSync() {
                 if (proceeded) return
@@ -1310,7 +1890,22 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                 if (preEpoch == syncEpoch) doStartSyncing()
             }
 
-            DotSyncManager.getInstance(object : DotSyncCallback {
+            fun failBeforeSync(message: String) {
+                if (proceeded || preEpoch != syncEpoch) return
+                proceeded = true
+                _isSyncing.value = false
+                _syncProgress.value = 0
+                _syncTargetAddresses.value = emptySet()
+                activeSyncDevices = emptyList()
+                refreshGlobalSyncFromConnectedDevices()
+                _needsSync.value = true
+                resumeBackgroundReads()
+                appendSyncLog(message)
+                logSyncTiming("pre-sync stop failed: $message")
+            }
+
+            lateinit var stopManager: DotSyncManager
+            stopManager = DotSyncManager.getInstance(object : DotSyncCallback {
                 override fun onSyncingStarted(address: String?, isSuccess: Boolean, requestCode: Int) {}
                 override fun onSyncingProgress(progress: Int, requestCode: Int) {}
                 override fun onSyncingResult(address: String?, isSuccess: Boolean, requestCode: Int) {}
@@ -1320,19 +1915,59 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                         if (preEpoch != syncEpoch) return@post
                         appendSyncLog("[${address ?: "?"}] 解除同步 ${if (isSuccess) "✓" else "✗"}")
                         logSyncTiming("stopSyncing callback address=${address ?: "?"} success=$isSuccess")
-                        proceedToSync()
+                        val norm = address?.let(::normalizeAddress)
+                        if (!isSuccess && norm != null && norm in pendingStops) {
+                            val retryCount = stopRetryCounts[norm] ?: 0
+                            val retryDevice = syncedDevices.firstOrNull {
+                                normalizeAddress(it.address.orEmpty()) == norm
+                            }
+                            if (
+                                retryCount < 2 &&
+                                retryDevice?.connectionState == DotDevice.CONN_STATE_CONNECTED
+                            ) {
+                                stopRetryCounts[norm] = retryCount + 1
+                                appendSyncLog("[$address] BLE 通道繁忙，正在重试解除同步…")
+                                mainHandler.postDelayed({
+                                    if (
+                                        preEpoch == syncEpoch &&
+                                        !proceeded &&
+                                        norm in pendingStops
+                                    ) {
+                                        stopManager.stopSyncing(arrayListOf(retryDevice))
+                                    }
+                                }, 500L)
+                                return@post
+                            }
+                            stopFailed = true
+                        }
+                        norm?.let(pendingStops::remove)
+                        if (pendingStops.isEmpty()) {
+                            if (stopFailed) {
+                                failBeforeSync("部分设备解除同步失败，请保持设备靠近后重试")
+                            } else {
+                                mainHandler.postDelayed({
+                                    if (preEpoch == syncEpoch) proceedToSync()
+                                }, 1_000L)
+                            }
+                        }
                     }
                 }
-            }).stopSyncing()
+            })
+            val stopSent = stopManager.stopSyncing(ArrayList(syncedDevices))
+            logSyncTiming("stopSyncing(targets) returned $stopSent")
 
-            // 超时兜底：2 秒内未收到回调则强制继续
+            // 未收到全部解除回调时不能继续同步，否则仍处于同步状态的设备会让新一轮失败。
             mainHandler.postDelayed({
-                if (preEpoch == syncEpoch) {
-                    appendSyncLog("解除同步超时，强制继续…")
-                    logSyncTiming("stopSyncing timeout, continue")
-                    proceedToSync()
+                if (
+                    preEpoch == syncEpoch &&
+                    !proceeded &&
+                    pendingStops.isNotEmpty()
+                ) {
+                    failBeforeSync(
+                        "解除同步超时：${pendingStops.joinToString()}，请重新同步"
+                    )
                 }
-            }, 2000L)
+            }, 8_000L)
             return true
         }
 
@@ -1346,11 +1981,24 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         syncAttemptStartedAtMs = SystemClock.elapsedRealtime()
         logSyncTiming("doStartSyncing")
         scheduleSyncTimeout(myEpoch)
+        val expectedTargets = _syncTargetAddresses.value
+        val syncDevices = activeSyncDevices
+            .filter { it.connectionState == DotDevice.CONN_STATE_CONNECTED }
+            .sortedBy { LongJumpDeviceRoles.roleSortIndex(it.address.orEmpty()) }
+        if (
+            syncDevices.size != expectedTargets.size ||
+            syncDevices.size < 2 ||
+            syncDevices.any { normalizeAddress(it.address.orEmpty()) !in expectedTargets }
+        ) {
+            abortActiveSync("同步启动前设备连接状态已变化")
+            return
+        }
 
-        // 官方 §4.9.2：只对第一台设备设置 root（与官方示例 setRootDevice(true) 一致）
-        // 不对其余设备设置 isRootDevice=false，避免触发 4 个并发 GATT write 导致拥塞
-        devices.first().isRootDevice = true
-        devices.forEach { d ->
+        // isRootDevice 是 SDK 本地角色字段，不会写 GATT。每轮必须先清空旧角色，
+        // 再设置唯一 root，避免断联重排或失败重试后遗留多个 root。
+        clearSyncRootRoles()
+        syncDevices.first().isRootDevice = true
+        syncDevices.forEach { d ->
             val role = if (d.isRootDevice) "root" else "scanner"
             appendSyncLog("[${d.address}] $role | isSynced=${d.isSynced} | rate=${d.currentOutputRate}Hz | filter=${d.currentFilterProfileIndex}")
         }
@@ -1364,31 +2012,41 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             syncFinalized = true
             logSyncTiming("finalizeSyncOnce succeeded=$succeeded desc=$desc")
             cancelSyncTimeout()
-            devices.firstOrNull()?.isRootDevice = false
+            clearSyncRootRoles(syncDevices)
             syncManager = null
+            _initProgress.value = Pair(initDoneAddresses.size, targetDeviceCount)
 
             if (succeeded) {
-                _needsSync.value = false
-                _isSynced.value = true
+                activeSyncRetryCount = 0
                 _isSyncing.value = false
                 _syncProgress.value = 100
                 syncConfirmedAtMs = SystemClock.elapsedRealtime()
-                _deviceSyncStates.value = devices.mapNotNull { dev ->
-                    dev.address?.let { normalizeAddress(it) to true }
-                }.toMap()
-                devices.forEach { dev -> try { dev.stopMeasuring() } catch (_: Exception) {} }
-                measurementStarted = false
-                stopLossReporting()
-                _state.value = CollectionState.Connecting
+                _deviceSyncStates.value = _deviceSyncStates.value.toMutableMap().also { states ->
+                    syncDevices.forEach { dev ->
+                        dev.address?.let {
+                            val norm = normalizeAddress(it)
+                            states[norm] = true
+                            syncConfirmedAtByDevice[norm] = syncConfirmedAtMs
+                        }
+                    }
+                }
+                syncDevices.forEach { dev -> try { dev.stopMeasuring() } catch (_: Exception) {} }
+                unmarkDevicesMeasuring(syncDevices)
                 resumeBackgroundReads()
-                appendSyncLog("$desc — 已同步，等待开始录制")
+                _syncTargetAddresses.value = emptySet()
+                activeSyncDevices = emptyList()
+                refreshGlobalSyncFromConnectedDevices()
+                appendSyncLog("$desc — 该运动员左右脚已同步")
             } else {
+                activeSyncRetryCount = 0
                 syncConfirmedAtMs = 0L
-                _isSynced.value = false
                 _isSyncing.value = false
                 _syncProgress.value = 0
+                _syncTargetAddresses.value = emptySet()
+                activeSyncDevices = emptyList()
                 refreshDeviceSyncStates()
-                appendSyncLog("$desc — 请重新点击「SDK 硬件同步」重试")
+                refreshGlobalSyncFromConnectedDevices()
+                appendSyncLog("$desc — 请重新同步该运动员设备")
                 _state.value = CollectionState.Connecting
                 resumeBackgroundReads()
             }
@@ -1408,7 +2066,10 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     if (myEpoch != syncEpoch) return@post
                     if (progress != lastLoggedProgress) {
                         lastLoggedProgress = progress
-                        _syncProgress.value = progress.coerceIn(0, 100)
+                        _syncProgress.value = maxOf(
+                            _syncProgress.value,
+                            progress.coerceIn(0, 100),
+                        )
                         logSyncTiming("onSyncingProgress progress=$progress")
                         appendSyncLog("同步进度: $progress%")
                     }
@@ -1435,6 +2096,41 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                     if (count == total) {
                         // 全部成功
                         finalizeSyncOnce(true, "同步完成 ✓ $count/$total 全部成功")
+                    } else if (
+                        total == syncDevices.size &&
+                        shouldRetryIncompleteSync(
+                            succeededCount = count,
+                            totalCount = total,
+                            retryCount = activeSyncRetryCount,
+                            maxRetries = MAX_TRANSIENT_SYNC_RETRIES,
+                        )
+                    ) {
+                        if (syncFinalized) return@post
+                        syncFinalized = true
+                        cancelSyncTimeout()
+                        clearSyncRootRoles(syncDevices)
+                        syncManager = null
+                        activeSyncRetryCount++
+                        appendSyncLog(
+                            if (count == 0) {
+                                "设备重连确认延迟，正在继续同步…"
+                            } else {
+                                "同步确认不完整 $count/$total，正在自动恢复…"
+                            }
+                        )
+                        logSyncTiming(
+                            "incomplete result $count/$total; retry=$activeSyncRetryCount/" +
+                                MAX_TRANSIENT_SYNC_RETRIES
+                        )
+                        mainHandler.postDelayed({
+                            if (myEpoch != syncEpoch || !_isSyncing.value) {
+                                return@postDelayed
+                            }
+                            startSyncInternal(
+                                targetAddresses = expectedTargets,
+                                retryingIncompleteResult = true,
+                            )
+                        }, TRANSIENT_SYNC_RETRY_DELAY_MS)
                     } else {
                         val desc = if (count == 0) "同步失败 ✗ 0/$total" else "同步部分成功 $count/$total"
                         finalizeSyncOnce(false, desc)
@@ -1451,16 +2147,28 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
 
         appendSyncLog("开始同步…")
         logSyncTiming("calling startSyncing")
-        val started = syncManager?.startSyncing(ArrayList(devices), SYNCING_REQUEST_CODE) ?: false
+        val started = syncManager?.startSyncing(ArrayList(syncDevices), SYNCING_REQUEST_CODE) ?: false
         logSyncTiming("startSyncing returned $started")
         if (!started) {
-            devices.firstOrNull()?.isRootDevice = false
+            clearSyncRootRoles(syncDevices)
             syncManager = null
             finalizeSyncOnce(false, "同步启动失败 ✗")
         }
     }
 
-    private fun requestStopSyncing(logSummary: Boolean) {
+    private fun requestStopSyncing(
+        targetDevices: List<DotDevice>,
+        logSummary: Boolean,
+    ) {
+        val stopTargets = targetDevices.filter {
+            it.connectionState == DotDevice.CONN_STATE_CONNECTED
+        }
+        val pendingStops = stopTargets.mapNotNull { device ->
+            device.address?.let(::normalizeAddress)
+        }.toMutableSet()
+        var stopCompleted = false
+        var stopFailed = false
+
         // syncManager 在同步完成后被清为 null，需重新获取 DotSyncManager 实例才能真正停止设备同步
         val mgr = syncManager ?: DotSyncManager.getInstance(object : DotSyncCallback {
             override fun onSyncingStarted(address: String?, isSuccess: Boolean, requestCode: Int) {}
@@ -1469,40 +2177,87 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             override fun onSyncingDone(syncingResultMap: HashMap<String, Boolean>, isSuccess: Boolean, requestCode: Int) {}
             override fun onSyncingStopped(address: String?, isSuccess: Boolean, requestCode: Int) {
                 mainHandler.post {
+                    if (stopCompleted) return@post
                     appendSyncLog("[${address ?: "?"}] 解除同步 ${if (isSuccess) "✓" else "✗"}")
+                    if (!isSuccess) stopFailed = true
+                    address?.let(::normalizeAddress)?.let(pendingStops::remove)
+                    if (pendingStops.isEmpty()) {
+                        stopCompleted = true
+                        if (logSummary) {
+                            appendSyncLog(
+                                if (stopFailed) "部分设备解除同步失败，请保持设备靠近后重试"
+                                else "该运动员左右脚已解除同步"
+                            )
+                        }
+                    }
                 }
             }
         })
-        val stopTargets = devices.filter { it.connectionState == DotDevice.CONN_STATE_CONNECTED }
-        val sent = if (stopTargets.isNotEmpty()) {
+        if (logSummary) {
+            appendSyncLog("正在解除同步，等待设备确认…")
+        }
+        val accepted = if (stopTargets.isNotEmpty()) {
             mgr.stopSyncing(ArrayList(stopTargets))
         } else {
             mgr.stopSyncing()
         }
-        if (!sent) {
-            appendSyncLog("解除同步指令发送失败，请确认设备仍在连接范围内")
-        }
+        logSyncTiming(
+            "stopSyncing request accepted=$accepted targets=" +
+                stopTargets.joinToString { it.address.orEmpty() }
+        )
         syncManager = null
-        if (logSummary) {
-            appendSyncLog("已发送解除同步指令，等待设备回调确认")
+        if (pendingStops.isNotEmpty()) {
+            mainHandler.postDelayed({
+                if (!stopCompleted && pendingStops.isNotEmpty()) {
+                    stopCompleted = true
+                    if (logSummary) {
+                        appendSyncLog(
+                            "解除同步超时：${pendingStops.joinToString { it.takeLast(4) }}，请保持设备靠近后重试"
+                        )
+                    }
+                }
+            }, 8_000L)
         }
     }
 
     fun stopSync() {
-        requestStopSyncing(logSummary = true)
+        stopSync(devices.mapNotNull { it.address }.map(::normalizeAddress).toSet())
+    }
+
+    fun stopSync(targetAddresses: Set<String>) {
+        val targetDevices = devicesForAddresses(targetAddresses)
+        if (targetDevices.isEmpty()) {
+            appendSyncLog("没有可解除同步的设备")
+            return
+        }
+        requestStopSyncing(targetDevices, logSummary = true)
+        clearSyncRootRoles(targetDevices)
         // 同时停止测量，清理本地采集状态
-        if (measurementStarted) {
-            devices.forEach { try { it.stopMeasuring() } catch (_: Exception) {} }
-            measurementStarted = false
+        val measuringTargets = targetDevices.filter {
+            normalizeAddress(it.address.orEmpty()) in measuringAddresses
+        }
+        if (measuringTargets.isNotEmpty()) {
+            measuringTargets.forEach { try { it.stopMeasuring() } catch (_: Exception) {} }
+            unmarkDevicesMeasuring(measuringTargets)
         }
         ++syncEpoch  // 使任何残留的 epoch 回调失效
         mainHandler.post {
-        _isSynced.value  = false
-        syncConfirmedAtMs = 0L
+            syncConfirmedAtMs = 0L
             _isSyncing.value = false
             _syncProgress.value = 0
-            _state.value     = CollectionState.Connecting
-            _deviceSyncStates.value = _deviceSyncStates.value.mapValues { false }
+            _syncTargetAddresses.value = emptySet()
+            activeSyncDevices = emptyList()
+            _state.value = CollectionState.Connecting
+            _deviceSyncStates.value = _deviceSyncStates.value.toMutableMap().also { states ->
+                targetDevices.forEach { device ->
+                    device.address?.let {
+                        val norm = normalizeAddress(it)
+                        states[norm] = false
+                        syncConfirmedAtByDevice.remove(norm)
+                    }
+                }
+            }
+            refreshGlobalSyncFromConnectedDevices()
             resumeBackgroundReads()
         }
     }
@@ -1511,14 +2266,17 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
         if (!_isSyncing.value) return
         ++syncEpoch
         cancelSyncTimeout()
-        devices.firstOrNull()?.isRootDevice = false
+        clearSyncRootRoles()
         syncManager = null
         syncConfirmedAtMs = 0L
-        _isSynced.value = false
+        activeSyncRetryCount = 0
         _isSyncing.value = false
         _syncProgress.value = 0
+        _syncTargetAddresses.value = emptySet()
+        activeSyncDevices = emptyList()
         _needsSync.value = devices.size > 1
         refreshDeviceSyncStates()
+        refreshGlobalSyncFromConnectedDevices()
         _state.value = CollectionState.Connecting
         resumeBackgroundReads()
         appendSyncLog("$reason，请恢复连接后重新准备采集")
@@ -1615,7 +2373,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
      * 进入离线页面时只配置参数，不立即 startMeasuring，避免设备看起来已经在采集，
      * 也避免测量数据占用 GATT 队列导致 Flash 状态读取不稳定。
      */
-    private fun applyOfflineModeSettings(rate: Int, filterMode: Int, startMeasurement: Boolean) {
+    private fun applyOfflineModeSettings(rate: Int, filterMode: Int) {
         val devList = devices.toList()
         if (devList.isEmpty()) return
         if (_isSynced.value) {
@@ -1627,9 +2385,7 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
             if (sid != connectSessionId) return@post
             if (measurementStarted) {
                 devList.forEach { try { it.stopMeasuring() } catch (_: Exception) {} }
-                measurementStarted = false
-                stopLossReporting()
-                _state.value = CollectionState.Connecting
+                unmarkDevicesMeasuring(devList)
             }
             devList.forEach { dev ->
                 dev.setOutputRate(rate)
@@ -1637,41 +2393,32 @@ class CollectionEngine(private val context: Context) : DotDeviceCallback, DotMea
                 applyFilterProfileToDevice(dev, filterMode)
             }
             val profileLabel = if (filterMode == 1) "Dynamic" else "General"
-            if (!startMeasurement) {
-                appendSyncLog("离线准备：${rate}Hz / $profileLabel，未开始录制")
-                return@post
-            }
-            mainHandler.postDelayed({
-                if (sid != connectSessionId) return@postDelayed
-                devList.forEach { dev -> dev.startMeasuring() }
-                measurementStarted = true
-                _state.value = CollectionState.Measuring
-                appendSyncLog("离线录制测量已启动：${rate}Hz / $profileLabel")
-            }, 500)
+            appendSyncLog("离线准备：${rate}Hz / $profileLabel，未开始录制")
         }
     }
 
     fun prepareOfflineModeSettings(rate: Int, filterMode: Int) {
-        applyOfflineModeSettings(rate, filterMode, startMeasurement = false)
+        applyOfflineModeSettings(rate, filterMode)
     }
 
-    fun startOfflineRecordingMeasurement(rate: Int, filterMode: Int) {
-        applyOfflineModeSettings(rate, filterMode, startMeasurement = true)
-    }
-
-    fun startSyncedRecordingMeasurement(): Boolean {
-        val devList = devices.filter { it.connectionState == DotDevice.CONN_STATE_CONNECTED }
-        if (!_isSynced.value || devList.isEmpty()) return false
-        val sid = connectSessionId
-        mainHandler.post {
-            if (sid != connectSessionId) return@post
-            devList.forEach { dev -> dev.measurementMode = desiredMode }
-            devList.forEach { dev -> dev.startMeasuring() }
-            measurementStarted = true
-            startLossReporting()
-            _state.value = CollectionState.Measuring
-            appendSyncLog("同步设备测量已启动，正在开始录制")
+    /** Flash recording is device-local and must not share the BLE real-time measurement channel. */
+    fun prepareDevicesForFlashRecording(targetAddresses: Set<String>): Boolean {
+        val normalizedTargets = targetAddresses.map(::normalizeAddress).toSet()
+        val devList = devicesForAddresses(normalizedTargets)
+        if (
+            normalizedTargets.isEmpty() ||
+            devList.size != normalizedTargets.size ||
+            devList.any { device ->
+                val norm = normalizeAddress(device.address.orEmpty())
+                device.connectionState != DotDevice.CONN_STATE_CONNECTED ||
+                    norm !in initDoneAddresses ||
+                    _deviceSyncStates.value[norm] != true
+            }
+        ) {
+            return false
         }
+
+        appendSyncLog("离线录制通道已就绪（${devList.size} 台设备）")
         return true
     }
 

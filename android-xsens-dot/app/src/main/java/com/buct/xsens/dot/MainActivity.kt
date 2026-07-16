@@ -15,11 +15,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.buct.xsens.dot.service.BleStreamingService
+import com.buct.xsens.dot.data.CaptureAthleteOption
 import com.buct.xsens.dot.ui.screens.MainScreen
 import com.buct.xsens.dot.ui.theme.Bg
 import com.buct.xsens.dot.ui.theme.XsensDotTheme
@@ -56,8 +58,30 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize(),
                         color = Bg
                     ) {
+                        val collectionViewModel: com.buct.xsens.dot.viewmodel.CollectionViewModel = viewModel()
+                        LaunchedEffect(Unit) {
+                            collectionViewModel.setAvailableAthletes(
+                                listOf(
+                                    CaptureAthleteOption(
+                                        athleteId = "local-athlete-1",
+                                        athleteName = "运动员 1",
+                                    )
+                                )
+                            )
+                        }
                         MainScreen(
-                            viewModel = viewModel(),
+                            viewModel = collectionViewModel,
+                            onSaveAthlete = { athlete, targetSlotId ->
+                                val athletes = collectionViewModel.availableAthletes.value
+                                    .filterNot { it.athleteId == athlete.athleteId } + athlete
+                                collectionViewModel.setAvailableAthletes(athletes)
+                                targetSlotId?.let { slotId ->
+                                    collectionViewModel.selectParticipantAthlete(
+                                        slotId = slotId,
+                                        athleteId = athlete.athleteId,
+                                    )
+                                }
+                            },
                             modifier = Modifier.verticalScroll(rememberScrollState())
                         )
                     }
