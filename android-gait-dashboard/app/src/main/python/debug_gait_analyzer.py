@@ -37,7 +37,7 @@ def _detect_format(idata):
 # 步态分析核心配置
 GRAVITY = 9.80665
 MS_PER_S = 1000.0
-GYRO_LOW_CUTOFF_HZ = 10
+GYRO_LOW_CUTOFF_HZ = 6
 ACC_LOW_CUTOFF_HZ = 6
 BASE_FS_HZ = 60          # 基准采样率（用于 Savgol 窗口缩放）
 BASE_SAVGOL_WINDOW = 15  # 基准 Savgol 窗口（60Hz，须为奇数）
@@ -382,6 +382,42 @@ def enforce_msw_minimum_interval_ms(idata, det, min_interval_ms):
         idata.loc[idx, 'MSW'] = g
 
 
+def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level):
+    """以首个有效正到负零交叉定位 IC，后续负向波形只负责确认。"""
+    signal_values = np.asarray(seg_signal, dtype=np.float64)
+    timestamps = np.asarray(seg_timestamps, dtype=np.float64)
+    if signal_values.size < 3 or timestamps.size != signal_values.size:
+        return None, False
+
+    negative_threshold = -max(10.0, float(gyro_noise_level) * 0.10)
+    for index in range(signal_values.size - 1):
+        if signal_values[index] <= 0 or signal_values[index + 1] > 0:
+            continue
+
+        crossing_time = float(timestamps[index + 1])
+
+        lookahead_end = crossing_time + IC_WINDOW_MS
+        lookahead_indices = np.flatnonzero(
+            (timestamps >= timestamps[index + 1])
+            & (timestamps <= lookahead_end)
+        )
+        if lookahead_indices.size == 0:
+            continue
+        positive_offsets = np.flatnonzero(
+            signal_values[lookahead_indices] > 0
+        )
+        if positive_offsets.size > 0:
+            lookahead_indices = lookahead_indices[:positive_offsets[0]]
+        if (
+            lookahead_indices.size == 0
+            or float(np.min(signal_values[lookahead_indices])) > negative_threshold
+        ):
+            continue
+
+        return crossing_time, True
+    return None, False
+
+
 def gait_identification(idata, fs=BASE_FS_HZ):
     """步态事件识别。fs 为实际采样率（Hz），窗口/order 参数随 fs 等比缩放。"""
     # idata：含原始 ACC，用于写入事件列后返回给步幅积分
@@ -428,40 +464,6 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     idata['IC_raw'] = np.nan
     idata['IC_is_zc'] = False
 
-    def find_ic_time(seg_signal, seg_timestamps):
-        if len(seg_signal) < 3: return None, False
-        
-        from scipy.signal import find_peaks
-        valleys, _ = find_peaks(-seg_signal)
-        
-        valid_valleys = [v for v in valleys if seg_signal[v] < gyro_noise_level]
-        
-        if len(valid_valleys) == 0:
-            zc_idxs = [j for j in range(len(seg_signal)-1) if seg_signal[j] > 0 and seg_signal[j+1] <= 0]
-            if zc_idxs:
-                j = zc_idxs[0]
-                cal_time = seg_timestamps[j] + (seg_timestamps[j+1]-seg_timestamps[j]) * (-seg_signal[j])/(seg_signal[j+1]-seg_signal[j])
-                return cal_time, True
-            return None, False
-
-        # --------- 原逻辑（已注释，保留作参考） ---------
-        # first_valley_idx = valid_valleys[0]
-        # 
-        # if seg_signal[first_valley_idx] >= 0:
-        #     return seg_timestamps[first_valley_idx], False
-        # else:
-        #     zc_idxs = [j for j in range(first_valley_idx) if seg_signal[j] > 0 and seg_signal[j+1] <= 0]
-        #     if zc_idxs:
-        #         j = zc_idxs[0]
-        #         cal_time = seg_timestamps[j] + (seg_timestamps[j+1]-seg_timestamps[j]) * (-seg_signal[j])/(seg_signal[j+1]-seg_signal[j])
-        #         return cal_time, True
-        #     else:
-        #         return seg_timestamps[first_valley_idx], False
-
-        # --------- 新逻辑：存在波谷时，直接将第一个波谷作为 IC ---------
-        first_valley_idx = valid_valleys[0]
-        return seg_timestamps[first_valley_idx], False
-
     ic_windows = []
     for i in range(len(MSW_timestamps) - 1):
         ic_windows.append((MSW_timestamps[i], MSW_timestamps[i + 1]))
@@ -469,16 +471,14 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     if len(MSW_timestamps) > 0:
         ic_windows.append((MSW_timestamps[-1], idata['Timestamp'].iloc[-1]))
 
-    for idx_w, (w_start, w_end) in enumerate(ic_windows):
+    for w_start, w_end in ic_windows:
         mask = (idata['Timestamp'] >= w_start) & (idata['Timestamp'] <= w_end)
-        ic_time, is_zc = find_ic_time(idata.loc[mask, 'Gmax(°/s)'].values, idata.loc[mask, 'Timestamp'].values)
+        ic_time, is_zc = _find_ic_time(
+            idata.loc[mask, 'Gmax(°/s)'].values,
+            idata.loc[mask, 'Timestamp'].values,
+            gyro_noise_level,
+        )
 
-        if ic_time is None and idx_w == len(ic_windows) - 1:
-            seg_ts = idata.loc[mask, 'Timestamp'].values
-            if len(seg_ts) > 0:
-                ic_time = seg_ts[-1]
-                is_zc = False
-                
         if ic_time is not None:
             idx = nearest_timestamp_index(idata, ic_time)
             if idx is not None:
@@ -603,41 +603,6 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     #     HS_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
 
     # HS_timestamps = sorted(set(HS_refined))
-
-    # ---------- TC 细化（ACC.Z 波峰 × 0.3 + 陀螺仪谷底 × 0.7）----------
-    # 对每个粗检 TC，在动态窗口（相邻 TC 间距 15%）内找 ACC.Z 最大正峰，
-    # 与陀螺仪给出的 TC 时刻加权融合，得到更精确的 TC
-    TO_refined = list(TO_timestamps)
-    for i, tc_time in enumerate(TO_timestamps):
-        # 动态窗口：用相邻 TC 间距的 15%，TC 不足两个时跳过细化
-        if len(TO_timestamps) < 2:
-            continue
-        if i < len(TO_timestamps) - 1:
-            window_size = (TO_timestamps[i + 1] - TO_timestamps[i]) * 0.15
-        else:
-            window_size = (TO_timestamps[i] - TO_timestamps[i - 1]) * 0.15
-
-        window = idata[(idata['Timestamp'] >= tc_time - window_size) &
-                       (idata['Timestamp'] <= tc_time + window_size)]
-        if window.empty:
-            continue
-
-        acc_z_vals = window['ACC.Z'].values
-        peaks, _ = find_peaks(acc_z_vals, distance=5)
-        if len(peaks) == 0:
-            continue
-
-        # 选窗口内最大 ACC.Z 正峰
-        max_peak_local = peaks[np.argmax(acc_z_vals[peaks])]
-        acc_z_peak_time = window['Timestamp'].iloc[max_peak_local]
-
-        # 加权融合（陀螺仪主导 70%，ACC.Z 辅助 30%）
-        fused = 0.3 * acc_z_peak_time + 0.7 * tc_time
-        nearest_idx = nearest_timestamp_index(idata, fused)
-        if nearest_idx is not None:
-            TO_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
-
-    TO_timestamps = sorted(set(TO_refined))
 
     # # --------- 1️⃣ method
     # MS_timestamps = []

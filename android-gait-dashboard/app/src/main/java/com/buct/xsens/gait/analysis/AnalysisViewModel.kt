@@ -181,7 +181,18 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                     "0",
                 )
             }
-            val parsed = withContext(Dispatchers.Default) { parseAnalysisResult(rawResult) }
+            val parsed = withContext(Dispatchers.Default) {
+                parseAnalysisResult(rawResult).map { result ->
+                    val normalizedJson = JSONObject(result.rawJson)
+                        .put("analysis_mode", state.analysisMode.code)
+                    normalizedJson.optJSONObject("summary")
+                        ?.put("analysis_mode", state.analysisMode.code)
+                    result.copy(
+                        mode = state.analysisMode,
+                        rawJson = normalizedJson.toString(),
+                    )
+                }
+            }
             parsed.fold(
                 onSuccess = { result ->
                     runCatching {

@@ -31,6 +31,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
@@ -53,6 +54,13 @@ data class AnalysisChartPoint(
     val sideLabel: String?,
 )
 
+data class AnalysisChartThreshold(
+    val value: Double,
+    val label: String,
+    val summary: String,
+    val color: Color,
+)
+
 @Composable
 fun AnalysisLineChart(
     leftPoints: List<AnalysisChartPoint>,
@@ -64,6 +72,7 @@ fun AnalysisLineChart(
     valueLabel: String,
     valueUnit: String,
     valueDecimals: Int,
+    threshold: AnalysisChartThreshold? = null,
     modifier: Modifier = Modifier,
 ) {
     val hasBothSides = leftPoints.isNotEmpty() && rightPoints.isNotEmpty()
@@ -79,8 +88,9 @@ fun AnalysisLineChart(
     val allPoints = series.flatMap { it.first }
     val minX = allPoints.minOfOrNull { it.x } ?: 0.0
     val maxX = allPoints.maxOfOrNull { it.x } ?: 1.0
-    val minY = allPoints.minOfOrNull { it.y } ?: 0.0
-    val maxY = allPoints.maxOfOrNull { it.y } ?: 1.0
+    val yValues = allPoints.map { it.y } + listOfNotNull(threshold?.value)
+    val minY = yValues.minOrNull() ?: 0.0
+    val maxY = yValues.maxOrNull() ?: 1.0
     val xRange = (maxX - minX).takeIf { it > 0.0 } ?: 1.0
     val yPadding = ((maxY - minY) * 0.08).takeIf { it > 0.0 } ?: 0.5
     val chartMinY = minY - yPadding
@@ -102,6 +112,17 @@ fun AnalysisLineChart(
                 ChartLegendItem("左脚", lineColor.copy(alpha = 0.5f), fillAlpha = 0f)
                 Spacer(Modifier.width(16.dp))
                 ChartLegendItem("右脚", lineColor, fillAlpha = 0.14f)
+            }
+        }
+        threshold?.let {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ChartThresholdLegend(it)
             }
         }
         ChartFrame(
@@ -146,18 +167,25 @@ fun AnalysisLineChart(
             },
         ) {
             drawAxes(xLabel, yLabel)
-            if (allPoints.size < 2) return@ChartFrame
-
-            series.forEach { (points, color, fillAlpha) ->
-                drawMetricSeries(
-                    points = points,
-                    color = color,
-                    fillAlpha = fillAlpha,
-                    minX = minX,
-                    xRange = xRange,
+            threshold?.let {
+                drawChartThreshold(
+                    threshold = it,
                     minY = chartMinY,
                     yRange = yRange,
                 )
+            }
+            if (allPoints.size >= 2) {
+                series.forEach { (points, color, fillAlpha) ->
+                    drawMetricSeries(
+                        points = points,
+                        color = color,
+                        fillAlpha = fillAlpha,
+                        minX = minX,
+                        xRange = xRange,
+                        minY = chartMinY,
+                        yRange = yRange,
+                    )
+                }
             }
             drawRangeLabels(minX, maxX, chartMinY, chartMaxY)
             selectedPoint?.let { point ->
@@ -174,6 +202,29 @@ fun AnalysisLineChart(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ChartThresholdLegend(threshold: AnalysisChartThreshold) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Canvas(modifier = Modifier.size(width = 28.dp, height = 12.dp)) {
+            drawLine(
+                color = threshold.color,
+                start = Offset(0f, size.height / 2f),
+                end = Offset(size.width, size.height / 2f),
+                strokeWidth = 2f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(7f, 5f)),
+            )
+        }
+        Text(
+            text = threshold.summary,
+            color = threshold.color,
+            style = MaterialTheme.typography.labelMedium,
+        )
     }
 }
 
@@ -240,6 +291,41 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawMetricSeries(
     coordinates.forEach { point ->
         drawCircle(color = color, radius = 3.4f, center = point)
     }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawChartThreshold(
+    threshold: AnalysisChartThreshold,
+    minY: Double,
+    yRange: Double,
+) {
+    val y = plotBottom -
+        ((threshold.value - minY) / yRange).toFloat() * plotHeight
+    drawLine(
+        color = threshold.color,
+        start = Offset(plotLeft, y),
+        end = Offset(plotLeft + plotWidth, y),
+        strokeWidth = 1.5.dp.toPx(),
+        pathEffect = PathEffect.dashPathEffect(
+            floatArrayOf(8.dp.toPx(), 6.dp.toPx()),
+        ),
+    )
+    val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.argb(
+            (threshold.color.alpha * 255).toInt(),
+            (threshold.color.red * 255).toInt(),
+            (threshold.color.green * 255).toInt(),
+            (threshold.color.blue * 255).toInt(),
+        )
+        textSize = 10.sp.toPx()
+        textAlign = Paint.Align.RIGHT
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    drawContext.canvas.nativeCanvas.drawText(
+        threshold.label,
+        plotLeft + plotWidth - 4.dp.toPx(),
+        y - 5.dp.toPx(),
+        labelPaint,
+    )
 }
 
 @Composable

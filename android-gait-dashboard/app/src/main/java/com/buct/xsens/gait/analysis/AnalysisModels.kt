@@ -18,7 +18,8 @@ enum class AnalysisSection {
 
 enum class AnalysisMode(val code: String, val label: String) {
     LongJump("long_jump", "跳远"),
-    GeneralGait("general_gait", "通用");
+    GeneralGait("general_gait", "通用"),
+    RaceWalk("race_walk", "竞走");
 
     companion object {
         fun fromCode(raw: String?): AnalysisMode =

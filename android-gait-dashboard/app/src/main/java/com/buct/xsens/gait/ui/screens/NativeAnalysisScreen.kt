@@ -103,6 +103,7 @@ import com.buct.xsens.gait.analysis.FootSide
 import com.buct.xsens.gait.analysis.GaitStride
 import com.buct.xsens.gait.analysis.LanShareUiConfig
 import com.buct.xsens.gait.ui.components.AnalysisChartPoint
+import com.buct.xsens.gait.ui.components.AnalysisChartThreshold
 import com.buct.xsens.gait.ui.components.AnalysisLineChart
 import com.buct.xsens.gait.ui.components.SignalEventChart
 import java.text.SimpleDateFormat
@@ -455,7 +456,7 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
     var metric by remember(result.mode, result.rawJson) { mutableStateOf(MetricKey.Velocity) }
     val metrics = remember(result.mode) {
         MetricKey.values().filter { key ->
-            result.mode == AnalysisMode.GeneralGait || key != MetricKey.DoubleSupport
+            result.mode != AnalysisMode.LongJump || key != MetricKey.DoubleSupport
         }
     }
     val chartPoints = remember(result, metric) {
@@ -487,6 +488,21 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
             pointsFor(null),
         )
     }
+    val chartThreshold = remember(result, metric) {
+        if (result.mode == AnalysisMode.RaceWalk && metric == MetricKey.Flight) {
+            val thresholdMs = 40.0
+            val exceededCount = result.strides.mapNotNull { it.flightTimeMs }
+                .count { it > thresholdMs }
+            AnalysisChartThreshold(
+                value = thresholdMs,
+                label = "40 ms",
+                summary = "40 ms 阈值 · 超过 $exceededCount 步",
+                color = Red,
+            )
+        } else {
+            null
+        }
+    }
 
     Panel(title = "分析结果") {
         AnalysisLineChart(
@@ -499,6 +515,7 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
             valueLabel = metric.label,
             valueUnit = metric.unit,
             valueDecimals = metric.decimals,
+            threshold = chartThreshold,
         )
         Spacer(Modifier.height(14.dp))
         Column(

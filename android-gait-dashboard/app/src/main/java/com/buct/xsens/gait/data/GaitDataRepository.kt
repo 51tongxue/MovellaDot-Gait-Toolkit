@@ -221,7 +221,7 @@ class GaitDataRepository(context: Context) {
                 return errorJson("分析结果无效，未保存 manifest")
             }
             val analysisMode = analysis.optString("analysis_mode", "long_jump")
-                .takeIf { it == "long_jump" || it == "general_gait" }
+                .takeIf { it in setOf("long_jump", "general_gait", "race_walk") }
                 ?: "long_jump"
 
             val sourceFilePaths = resolveSourceFilePaths(sourceFilePath, analysis)
@@ -479,7 +479,7 @@ class GaitDataRepository(context: Context) {
                     ),
                 )
                 .putNullableMetric("vgrf_peak_bw", stride.finiteDouble("vGRF_peak_BW"))
-            if (analysisMode == "general_gait") {
+            if (analysisMode != "long_jump") {
                 metric.putNullableMetric(
                     "double_support_time_s",
                     stride.metricDouble(

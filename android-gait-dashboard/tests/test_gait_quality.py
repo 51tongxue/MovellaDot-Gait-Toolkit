@@ -154,15 +154,37 @@ class GaitQualityTests(unittest.TestCase):
         self.assertIsNone(ic_time)
         self.assertFalse(is_zero_crossing)
 
-    def test_significant_negative_valley_is_initial_contact(self):
+    def test_initial_contact_uses_zero_crossing_before_negative_valley(self):
         ic_time, is_zero_crossing = _find_ic_time(
             np.asarray([420.0, 160.0, -80.0, -310.0, -120.0]),
             np.asarray([0.0, 10.0, 20.0, 30.0, 40.0]),
             gyro_noise_level=200.0,
         )
 
-        self.assertEqual(30.0, ic_time)
+        self.assertEqual(20.0, ic_time)
+        self.assertTrue(is_zero_crossing)
+
+    def test_zero_crossing_without_confirmed_negative_lobe_is_rejected(self):
+        ic_time, is_zero_crossing = _find_ic_time(
+            np.asarray([180.0, 35.0, -3.0, -5.0, -2.0, 20.0]),
+            np.asarray([0.0, 10.0, 20.0, 30.0, 40.0, 50.0]),
+            gyro_noise_level=200.0,
+        )
+
+        self.assertIsNone(ic_time)
         self.assertFalse(is_zero_crossing)
+
+    def test_later_valid_zero_crossing_is_used_when_first_is_unconfirmed(self):
+        ic_time, is_zero_crossing = _find_ic_time(
+            np.asarray([
+                120.0, 15.0, -3.0, 18.0, 40.0, -40.0, -120.0, -70.0,
+            ]),
+            np.asarray([0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]),
+            gyro_noise_level=200.0,
+        )
+
+        self.assertEqual(50.0, ic_time)
+        self.assertTrue(is_zero_crossing)
 
     def test_incremental_contact_chunks_match_offline_segmentation(self):
         events = make_events([1000, 10000], 7)

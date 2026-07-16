@@ -57,7 +57,7 @@ def _detect_format(idata):
 # 步态分析核心配置
 GRAVITY = 9.80665
 MS_PER_S = 1000.0
-GYRO_LOW_CUTOFF_HZ = 7
+GYRO_LOW_CUTOFF_HZ = 6
 ACC_LOW_CUTOFF_HZ = 6
 BASE_FS_HZ = 60          # 基准采样率（用于 Savgol 窗口缩放）
 BASE_SAVGOL_WINDOW = 15  # 基准 Savgol 窗口（60Hz，须为奇数）
@@ -1052,9 +1052,8 @@ def enforce_msw_minimum_interval_ms(idata, det, min_interval_ms):
 def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level):
     """在一个 MSW->下一 MSW 区间内寻找 IC。
 
-    IC 必须对应显著负向角速度波谷；纯正值区间中的局部低点不是 IC。
-    若区间末尾仍在下降、尚未形成完整波谷，仅允许在随后 50 ms 内确实进入
-    显著负值时使用正到负的零交叉。
+    IC 定义为 MSW 后首个有效的正到负零交叉。零交叉后的 50 ms 内必须进入
+    显著负向波形，负谷只用于确认事件形态，不再改变 IC 时刻。
     """
     signal_values = np.asarray(seg_signal, dtype=np.float64)
     timestamps = np.asarray(seg_timestamps, dtype=np.float64)
@@ -1062,36 +1061,31 @@ def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level):
         return None, False
 
     negative_threshold = -max(10.0, float(gyro_noise_level) * 0.10)
-    valleys, _ = find_peaks(-signal_values)
-    valid_valleys = [
-        int(index)
-        for index in valleys
-        if signal_values[index] <= negative_threshold
-    ]
-    if valid_valleys:
-        first_valley_index = valid_valleys[0]
-        return float(timestamps[first_valley_index]), False
-
     for index in range(signal_values.size - 1):
         if signal_values[index] <= 0 or signal_values[index + 1] > 0:
             continue
-        lookahead_end = timestamps[index] + IC_WINDOW_MS
-        lookahead_mask = (
+
+        crossing_time = float(timestamps[index + 1])
+
+        lookahead_end = crossing_time + IC_WINDOW_MS
+        lookahead_indices = np.flatnonzero(
             (timestamps >= timestamps[index + 1])
             & (timestamps <= lookahead_end)
         )
+        if lookahead_indices.size == 0:
+            continue
+        positive_offsets = np.flatnonzero(
+            signal_values[lookahead_indices] > 0
+        )
+        if positive_offsets.size > 0:
+            lookahead_indices = lookahead_indices[:positive_offsets[0]]
         if (
-            not np.any(lookahead_mask)
-            or float(np.min(signal_values[lookahead_mask])) > negative_threshold
+            lookahead_indices.size == 0
+            or float(np.min(signal_values[lookahead_indices])) > negative_threshold
         ):
             continue
-        denominator = signal_values[index + 1] - signal_values[index]
-        if abs(denominator) < 1e-9:
-            return float(timestamps[index]), True
-        crossing_time = timestamps[index] + (
-            timestamps[index + 1] - timestamps[index]
-        ) * (-signal_values[index]) / denominator
-        return float(crossing_time), True
+
+        return crossing_time, True
     return None, False
 
 
@@ -1276,7 +1270,7 @@ def recover_missing_gait_events_short_delay(
 ):
     """用一周期短延迟确认恢复漏检事件。
 
-    候选 IC 必须由局部 MSW 正峰和其后的负向波谷构成，并满足左右脚交替。
+    候选 IC 必须由局部 MSW 正峰、正到负零交叉和后续负向波形构成，并满足左右脚交替。
     TC 不做幅值阈值判断，而是按 IC -> TC -> MSW -> 下一 IC 的相位顺序，
     取当前支撑相内的主负极值。
     """
@@ -1813,41 +1807,6 @@ def gait_identification(idata, fs=BASE_FS_HZ):
     #     HS_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
 
     # HS_timestamps = sorted(set(HS_refined))
-
-    # ---------- TC 细化（ACC.Z 波峰 × 0.3 + 陀螺仪谷底 × 0.7）----------
-    # 对每个粗检 TC，在动态窗口（相邻 TC 间距 15%）内找 ACC.Z 最大正峰，
-    # 与陀螺仪给出的 TC 时刻加权融合，得到更精确的 TC
-    TO_refined = list(TO_timestamps)
-    for i, tc_time in enumerate(TO_timestamps):
-        # 动态窗口：用相邻 TC 间距的 15%，TC 不足两个时跳过细化
-        if len(TO_timestamps) < 2:
-            continue
-        if i < len(TO_timestamps) - 1:
-            window_size = (TO_timestamps[i + 1] - TO_timestamps[i]) * 0.15
-        else:
-            window_size = (TO_timestamps[i] - TO_timestamps[i - 1]) * 0.15
-
-        window = idata[(idata['Timestamp'] >= tc_time - window_size) &
-                       (idata['Timestamp'] <= tc_time + window_size)]
-        if window.empty:
-            continue
-
-        acc_z_vals = window['ACC.Z'].values
-        peaks, _ = find_peaks(acc_z_vals, distance=5)
-        if len(peaks) == 0:
-            continue
-
-        # 选窗口内最大 ACC.Z 正峰
-        max_peak_local = peaks[np.argmax(acc_z_vals[peaks])]
-        acc_z_peak_time = window['Timestamp'].iloc[max_peak_local]
-
-        # 加权融合（陀螺仪主导 70%，ACC.Z 辅助 30%）
-        fused = 0.3 * acc_z_peak_time + 0.7 * tc_time
-        nearest_idx = nearest_timestamp_index(idata, fused)
-        if nearest_idx is not None:
-            TO_refined[i] = int(idata.loc[nearest_idx, 'Timestamp'])
-
-    TO_timestamps = sorted(set(TO_refined))
 
     # # --------- 1️⃣ method
     # MS_timestamps = []
