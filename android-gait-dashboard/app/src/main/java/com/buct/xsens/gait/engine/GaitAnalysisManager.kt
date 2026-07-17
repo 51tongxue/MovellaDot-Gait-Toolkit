@@ -4,7 +4,6 @@ import android.content.Context
 import com.buct.xsens.dot.data.LongJumpDeviceRoles
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
-import android.webkit.JavascriptInterface
 import org.json.JSONObject
 import java.io.File
 
@@ -20,46 +19,6 @@ class GaitAnalysisManager(private val context: Context) {
         }
     }
 
-    /**
-     * 调用 Python 脚本进行步态分析
-     * @param csvPath CSV 文件绝对路径
-     * @param weight 体重 (kg)
-     * @return 分析结果的 JSON 字符串
-     */
-    @JavascriptInterface
-    fun analyzeGait(filePath: String, weightStr: String): String {
-        return analyzeGait(filePath, weightStr, "-1.0", "-1.0", "-1", "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGait(filePath: String, weightStr: String, startTimeStr: String, endTimeStr: String): String {
-        return analyzeGait(filePath, weightStr, startTimeStr, endTimeStr, "-1", "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGait(
-        filePath: String,
-        weightStr: String,
-        startTimeStr: String,
-        endTimeStr: String,
-        takeoffStepStr: String,
-    ): String {
-        return analyzeGait(filePath, weightStr, startTimeStr, endTimeStr, takeoffStepStr, "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGait(
-        filePath: String,
-        weightStr: String,
-        startTimeStr: String,
-        endTimeStr: String,
-        takeoffStepStr: String,
-        takeoffFootStr: String,
-    ): String {
-        return analyzeGait(filePath, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, "0")
-    }
-
-    @JavascriptInterface
     fun analyzeGait(
         filePath: String,
         weightStr: String,
@@ -119,66 +78,6 @@ class GaitAnalysisManager(private val context: Context) {
                     put("error", e.message ?: "Unknown Python error")
                 }.toString()
             }
-        }
-    }
-
-    /**
-     * 直接分析 CSV 字符串内容
-     */
-    @JavascriptInterface
-    fun analyzeGaitContent(content: String, weightStr: String): String {
-        return analyzeGaitContent(content, weightStr, "-1.0", "-1.0", "-1", "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGaitContent(content: String, weightStr: String, startTimeStr: String, endTimeStr: String): String {
-        return analyzeGaitContent(content, weightStr, startTimeStr, endTimeStr, "-1", "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGaitContent(
-        content: String,
-        weightStr: String,
-        startTimeStr: String,
-        endTimeStr: String,
-        takeoffStepStr: String,
-    ): String {
-        return analyzeGaitContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, "1", "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGaitContent(
-        content: String,
-        weightStr: String,
-        startTimeStr: String,
-        endTimeStr: String,
-        takeoffStepStr: String,
-        takeoffFootStr: String,
-    ): String {
-        return analyzeGaitContent(content, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, "0")
-    }
-
-    @JavascriptInterface
-    fun analyzeGaitContent(
-        content: String,
-        weightStr: String,
-        startTimeStr: String,
-        endTimeStr: String,
-        takeoffStepStr: String,
-        takeoffFootStr: String,
-        isTripleJumpStr: String,
-    ): String {
-        android.util.Log.d("GaitAnalysis", "Analyzing content, length: ${content.length}")
-        return try {
-            val tempFile = File(context.cacheDir, "temp_upload.csv")
-            tempFile.writeText(content)
-            analyzeGait(tempFile.absolutePath, weightStr, startTimeStr, endTimeStr, takeoffStepStr, takeoffFootStr, isTripleJumpStr)
-        } catch (e: Exception) {
-            android.util.Log.e("GaitAnalysis", "Content analysis error: ${e.message}", e)
-            JSONObject().apply {
-                put("ok", false)
-                put("error", "写入临时文件失败: ${e.message}")
-            }.toString()
         }
     }
 }

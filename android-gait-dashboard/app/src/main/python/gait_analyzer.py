@@ -1,8 +1,25 @@
 import pandas as pd
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, argrelextrema, savgol_filter, find_peaks
+from scipy.signal import (
+    butter,
+    sosfiltfilt,
+    savgol_filter,
+    find_peaks,
+)
 import json
 import os
+from offline_gait_event_detector import (
+    ACC_LOW_CUTOFF_HZ,
+    GAIT_CONFIRM_WINDOW_MS,
+    GYRO_LOW_CUTOFF_HZ,
+    OfflineGaitEventDetector,
+    OfflineGaitEventPipeline,
+    detect_offline_gait_events,
+)
+from offline_gait_metrics import (
+    calculate_bilateral_double_support as _calculate_bilateral_double_support,
+    calculate_stride_length as _calculate_stride_length,
+)
 
 # ---------------------------------------------------------------------------
 # 四元数辅助函数（用于离线格式的加速度坐标系转换）
@@ -57,16 +74,11 @@ def _detect_format(idata):
 # 步态分析核心配置
 GRAVITY = 9.80665
 MS_PER_S = 1000.0
-GYRO_LOW_CUTOFF_HZ = 6
-ACC_LOW_CUTOFF_HZ = 6
 BASE_FS_HZ = 60          # 基准采样率（用于 Savgol 窗口缩放）
-BASE_SAVGOL_WINDOW = 15  # 基准 Savgol 窗口（60Hz，须为奇数）
-# MSW_WINDOW_MS：仅用于 argrelextrema 的 order（局部极大邻域宽度），不保证相邻 MSW 的时间间隔
-MSW_WINDOW_MS = 400
-# 相邻 MSW（按时间）至少间隔多少 ms；过近则只保留 Gmax 更大的一侧，避免双支撑内毛刺被当成两次 MSW
+# 相邻 MSW（按时间）至少间隔多少 ms，避免双支撑内毛刺被当成两次 MSW。
 MSW_MIN_INTERVAL_MS = 400
-IC_WINDOW_MS = 50
-TC_OFFSET_AFTER_IC_MS = 50
+# TC 搜索要避开 IC 确认段，避免把确认谷重复标成 TC。
+TC_OFFSET_AFTER_IC_MS = GAIT_CONFIRM_WINDOW_MS + 50
 
 FS_ESTIMATE_MIN_HZ = 10
 FS_ESTIMATE_MAX_HZ = 2000
@@ -393,11 +405,33 @@ def _normalized_gait_cycle(idata, start_ms, end_ms):
     """提取一个已完成的同脚 IC->IC 周期并归一化。"""
     if idata is None or idata.empty or "Gmax(°/s)" not in idata.columns:
         return None
-    segment = idata[
-        (idata["Timestamp"] >= float(start_ms))
-        & (idata["Timestamp"] <= float(end_ms))
-    ]["Gmax(°/s)"].to_numpy(dtype=np.float64)
-    return _normalize_cycle_values(segment)
+    return _normalized_gait_cycle_arrays(
+        idata["Timestamp"].to_numpy(dtype=np.float64),
+        idata["Gmax(°/s)"].to_numpy(dtype=np.float64),
+        start_ms,
+        end_ms,
+    )
+
+
+def _normalized_gait_cycle_arrays(
+    timestamps_ms,
+    signal_values,
+    start_ms,
+    end_ms,
+):
+    timestamps = np.asarray(timestamps_ms, dtype=np.float64)
+    values = np.asarray(signal_values, dtype=np.float64)
+    start_index = int(np.searchsorted(
+        timestamps,
+        float(start_ms),
+        side="left",
+    ))
+    end_index = int(np.searchsorted(
+        timestamps,
+        float(end_ms),
+        side="right",
+    ))
+    return _normalize_cycle_values(values[start_index:end_index])
 
 
 def _cycle_similarity(reference, cycle):
@@ -495,14 +529,27 @@ def _build_bilateral_cycle_contacts(
 ):
     """为每个 IC 生成刚完成周期的因果质量，离线与实时状态机输入一致。"""
     side_data = {
-        "primary": (
-            primary_idata,
-            sorted(float(t) for t in primary_to),
-        ),
-        "contralateral": (
-            contralateral_idata,
-            sorted(float(t) for t in contralateral_to),
-        ),
+        "primary": {
+            "timestamps": primary_idata["Timestamp"].to_numpy(
+                dtype=np.float64
+            ),
+            "signal": primary_idata["Gmax(°/s)"].to_numpy(
+                dtype=np.float64
+            ),
+            "toe_off": np.sort(np.asarray(primary_to, dtype=np.float64)),
+        },
+        "contralateral": {
+            "timestamps": contralateral_idata["Timestamp"].to_numpy(
+                dtype=np.float64
+            ),
+            "signal": contralateral_idata["Gmax(°/s)"].to_numpy(
+                dtype=np.float64
+            ),
+            "toe_off": np.sort(np.asarray(
+                contralateral_to,
+                dtype=np.float64,
+            )),
+        },
     }
     contacts = sorted(
         [(float(t), "primary") for t in primary_hs]
@@ -517,15 +564,26 @@ def _build_bilateral_cycle_contacts(
         cycle_correlation = None
         if side in previous_ic:
             cycle_start = float(previous_ic[side])
-            idata, to_events = side_data[side]
-            cycle_to = [
-                to_time
-                for to_time in to_events
-                if cycle_start < to_time < timestamp_ms
-            ]
+            data = side_data[side]
+            toe_off = data["toe_off"]
+            toe_start = int(np.searchsorted(
+                toe_off,
+                cycle_start,
+                side="right",
+            ))
+            toe_end = int(np.searchsorted(
+                toe_off,
+                timestamp_ms,
+                side="left",
+            ))
             cycle = (
-                _normalized_gait_cycle(idata, cycle_start, timestamp_ms)
-                if len(cycle_to) == 1
+                _normalized_gait_cycle_arrays(
+                    data["timestamps"],
+                    data["signal"],
+                    cycle_start,
+                    timestamp_ms,
+                )
+                if toe_end - toe_start == 1
                 else None
             )
             if cycle is None:
@@ -772,19 +830,26 @@ def nearest_timestamp_index(idata, timestamp):
     if idata is None or len(idata) == 0 or 'Timestamp' not in idata.columns:
         return None
     timestamps = idata['Timestamp'].to_numpy(dtype=np.float64)
-    position = int(np.searchsorted(timestamps, float(timestamp), side='left'))
-    if position <= 0:
-        nearest_position = 0
-    elif position >= timestamps.size:
-        nearest_position = timestamps.size - 1
-    elif (
-        abs(timestamps[position] - float(timestamp))
-        < abs(timestamps[position - 1] - float(timestamp))
-    ):
-        nearest_position = position
-    else:
-        nearest_position = position - 1
+    nearest_position = int(
+        nearest_timestamp_positions(timestamps, [timestamp])[0]
+    )
     return idata.index[nearest_position]
+
+
+def nearest_timestamp_positions(timestamps, event_times):
+    """批量返回事件时间在有序采样时间轴上的最近位置。"""
+    samples = np.asarray(timestamps, dtype=np.float64)
+    events = np.asarray(event_times, dtype=np.float64)
+    if samples.size == 0 or events.size == 0:
+        return np.asarray([], dtype=np.int64)
+    right = np.searchsorted(samples, events, side='left')
+    right = np.clip(right, 0, samples.size - 1)
+    left = np.clip(right - 1, 0, samples.size - 1)
+    choose_right = (
+        np.abs(samples[right] - events)
+        < np.abs(samples[left] - events)
+    )
+    return np.where(choose_right, right, left).astype(np.int64)
 
 
 def estimate_initial_sample_time_interval(sample_times):
@@ -1021,71 +1086,20 @@ def _apply_filters_low(data, column, low_cutoff, fs):
     return data
 
 
-def enforce_msw_minimum_interval_ms(idata, det, min_interval_ms):
-    """
-    保证相邻 MSW 事件在时间轴上至少相隔 min_interval_ms。
-    argrelextrema 的 order 只定义「局部极大」邻域，不能禁止更近的第二个峰；
-    过近时保留 Gmax（滤波后 det）较大者。
-    """
-    mask = idata['MSW'].notna()
-    if mask.sum() <= 1:
-        return
-    rows = []
-    for idx in idata.index[mask]:
-        t = float(idata.at[idx, 'Timestamp'])
-        g = float(det.at[idx, 'Gmax(°/s)'])
-        rows.append((t, idx, g))
-    rows.sort(key=lambda x: x[0])
-    merged = [rows[0]]
-    for t, idx, g in rows[1:]:
-        pt, pidx, pg = merged[-1]
-        if t - pt >= min_interval_ms:
-            merged.append((t, idx, g))
-        elif g > pg:
-            merged[-1] = (t, idx, g)
-    loc = idata.columns.get_loc('MSW')
-    idata['MSW'] = np.nan
-    for t, idx, g in merged:
-        idata.loc[idx, 'MSW'] = g
-
-
-def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level):
-    """在一个 MSW->下一 MSW 区间内寻找 IC。
-
-    IC 定义为 MSW 后首个有效的正到负零交叉。零交叉后的 50 ms 内必须进入
-    显著负向波形，负谷只用于确认事件形态，不再改变 IC 时刻。
-    """
+def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level=None):
+    """在信号片段中按通用状态机寻找首个 IC。"""
     signal_values = np.asarray(seg_signal, dtype=np.float64)
     timestamps = np.asarray(seg_timestamps, dtype=np.float64)
     if signal_values.size < 3 or timestamps.size != signal_values.size:
         return None, False
 
-    negative_threshold = -max(10.0, float(gyro_noise_level) * 0.10)
-    for index in range(signal_values.size - 1):
-        if signal_values[index] <= 0 or signal_values[index + 1] > 0:
-            continue
-
-        crossing_time = float(timestamps[index + 1])
-
-        lookahead_end = crossing_time + IC_WINDOW_MS
-        lookahead_indices = np.flatnonzero(
-            (timestamps >= timestamps[index + 1])
-            & (timestamps <= lookahead_end)
-        )
-        if lookahead_indices.size == 0:
-            continue
-        positive_offsets = np.flatnonzero(
-            signal_values[lookahead_indices] > 0
-        )
-        if positive_offsets.size > 0:
-            lookahead_indices = lookahead_indices[:positive_offsets[0]]
-        if (
-            lookahead_indices.size == 0
-            or float(np.min(signal_values[lookahead_indices])) > negative_threshold
-        ):
-            continue
-
-        return crossing_time, True
+    events = detect_offline_gait_events(
+        signal_values,
+        timestamps,
+        min_same_foot_interval_ms=0.0,
+    )
+    if events:
+        return float(events[0]["ic_time"]), True
     return None, False
 
 
@@ -1285,10 +1299,19 @@ def recover_missing_gait_events_short_delay(
         "recovered_tc": [],
         "rejected_template_cycles": [],
     }
+    existing_ms = (
+        sorted(
+            float(timestamp)
+            for timestamp in idata[idata["MS"].notna()][
+                "Timestamp"
+            ].values
+        )
+        if "MS" in idata.columns
+        else []
+    )
     recovered_ic_swing_anchors = {}
-    rejected_cycle_ranges = []
     if len(hs) < 5 or len(opposite_hs) < 2:
-        return idata, hs, to_events, [], diagnostics
+        return idata, hs, to_events, existing_ms, diagnostics
 
     original_hs = list(hs)
     intervals = np.diff(np.asarray(original_hs, dtype=np.float64))
@@ -1297,8 +1320,9 @@ def recover_missing_gait_events_short_delay(
         & (intervals <= 2.0 * GAIT_STEP_INTERVAL_MAX_MS)
     ]
     if regular_intervals.size < 3:
-        return idata, hs, to_events, [], diagnostics
+        return idata, hs, to_events, existing_ms, diagnostics
 
+    suspicious_gaps = []
     for gap_index, (left_ms, right_ms) in enumerate(
         zip(original_hs, original_hs[1:])
     ):
@@ -1332,28 +1356,56 @@ def recover_missing_gait_events_short_delay(
             <= 1.35 * local_stride_ms
         ):
             continue
+        suspicious_gaps.append((
+            float(left_ms),
+            float(right_ms),
+            local_stride_ms,
+            missing_count,
+            expected_spacing,
+        ))
 
+    if not suspicious_gaps:
+        return idata, hs, to_events, existing_ms, diagnostics
+
+    timestamps = idata["Timestamp"].to_numpy(dtype=np.float64)
+    signal_values = idata["Gmax(°/s)"].to_numpy(dtype=np.float64)
+    opposite_array = np.asarray(opposite_hs, dtype=np.float64)
+    for (
+        left_ms,
+        right_ms,
+        local_stride_ms,
+        missing_count,
+        expected_spacing,
+    ) in suspicious_gaps:
         selected = []
         previous_boundary = float(left_ms)
         for slot in range(1, missing_count + 1):
             expected_time = float(left_ms + slot * expected_spacing)
             search_radius = local_stride_ms * GAIT_GAP_RECOVERY_SEARCH_RATIO
-            window = idata[
-                (idata['Timestamp'] >= expected_time - search_radius)
-                & (idata['Timestamp'] <= expected_time + search_radius)
-            ]
-            if len(window) < 5:
+            window_start = int(np.searchsorted(
+                timestamps,
+                expected_time - search_radius,
+                side="left",
+            ))
+            window_end = int(np.searchsorted(
+                timestamps,
+                expected_time + search_radius,
+                side="right",
+            ))
+            if window_end - window_start < 5:
                 selected = []
                 break
-            window_signal = window['Gmax(°/s)'].to_numpy(dtype=np.float64)
-            window_times = window['Timestamp'].to_numpy(dtype=np.float64)
-            valleys, _ = find_peaks(-window_signal)
+            window_signal = signal_values[window_start:window_end]
+            window_times = timestamps[window_start:window_end]
+            candidate_events = detect_offline_gait_events(
+                window_signal,
+                window_times,
+                min_same_foot_interval_ms=0.0,
+            )
             candidates = []
-            for valley_index in valleys:
-                candidate_time = float(window_times[valley_index])
-                candidate_value = float(window_signal[valley_index])
-                if candidate_value >= 0.0:
-                    continue
+            for event in candidate_events:
+                candidate_time = float(event["ic_time"])
+                candidate_value = float(event["negative_value"])
                 if candidate_time - previous_boundary < 0.55 * local_stride_ms:
                     continue
                 following_boundary = (
@@ -1364,49 +1416,28 @@ def recover_missing_gait_events_short_delay(
                 if following_boundary - candidate_time < 0.45 * local_stride_ms:
                     continue
 
-                pre_swing = idata[
-                    (idata['Timestamp'] >= candidate_time - 350.0)
-                    & (idata['Timestamp'] <= candidate_time - 40.0)
-                ]
-                if pre_swing.empty:
-                    continue
-                pre_signal = pre_swing['Gmax(°/s)'].to_numpy(
-                    dtype=np.float64
-                )
-                pre_times = pre_swing['Timestamp'].to_numpy(
-                    dtype=np.float64
-                )
-                swing_peaks, swing_properties = find_peaks(
-                    pre_signal,
-                    prominence=0.0,
-                )
-                if swing_peaks.size == 0:
-                    continue
-                best_peak_position = int(
-                    swing_peaks[
-                        np.argmax(swing_properties['prominences'])
-                    ]
-                )
-                swing_value = float(pre_signal[best_peak_position])
-                if swing_value <= 0.0:
-                    continue
-                swing_time = float(pre_times[best_peak_position])
+                swing_time = float(event["msw_time"])
+                swing_value = float(event["msw_value"])
 
-                previous_opposite = max(
-                    (
-                        timestamp
-                        for timestamp in opposite_hs
-                        if timestamp < candidate_time
-                    ),
-                    default=None,
+                opposite_position = int(np.searchsorted(
+                    opposite_array,
+                    candidate_time,
+                    side="left",
+                ))
+                previous_opposite = (
+                    float(opposite_array[opposite_position - 1])
+                    if opposite_position > 0
+                    else None
                 )
-                next_opposite = min(
-                    (
-                        timestamp
-                        for timestamp in opposite_hs
-                        if timestamp > candidate_time
-                    ),
-                    default=None,
+                next_position = int(np.searchsorted(
+                    opposite_array,
+                    candidate_time,
+                    side="right",
+                ))
+                next_opposite = (
+                    float(opposite_array[next_position])
+                    if next_position < opposite_array.size
+                    else None
                 )
                 if previous_opposite is None or next_opposite is None:
                     continue
@@ -1485,11 +1516,6 @@ def recover_missing_gait_events_short_delay(
                     or similarity
                     < GAIT_RECOVERY_TEMPLATE_MIN_CORRELATION
                 ):
-                    if previous_msw is not None:
-                        rejected_cycle_ranges.append((
-                            float(previous_msw),
-                            float(swing_time),
-                        ))
                     diagnostics["rejected_template_cycles"].append({
                         "start_ms": (
                             int(round(previous_msw))
@@ -1522,43 +1548,21 @@ def recover_missing_gait_events_short_delay(
             diagnostics["recovered_msw"].extend(
                 int(round(swing_time)) for _, swing_time in selected
             )
-
-    if rejected_cycle_ranges:
-        hs = [
-            timestamp
-            for timestamp in hs
-            if not any(
-                start_ms < timestamp < end_ms
-                for start_ms, end_ms in rejected_cycle_ranges
+            msw_after_recovery = sorted(
+                float(timestamp)
+                for timestamp in idata[idata['MSW'].notna()][
+                    'Timestamp'
+                ].values
+                if float(timestamp) > recovered_times[-1]
             )
-        ]
-        to_events = [
-            timestamp
-            for timestamp in to_events
-            if not any(
-                start_ms < timestamp < end_ms
-                for start_ms, end_ms in rejected_cycle_ranges
-            )
-        ]
+            if msw_after_recovery:
+                recovered_ic_swing_anchors.update({
+                    float(recovered_time): msw_after_recovery[0]
+                    for recovered_time in recovered_times
+                })
 
     hs = sorted(set(hs))
     if not diagnostics["recovered_ic"]:
-        existing_ms = (
-            sorted(
-                float(timestamp)
-                for timestamp in idata[idata['MS'].notna()]['Timestamp'].values
-            )
-            if 'MS' in idata.columns
-            else []
-        )
-        existing_ms = [
-            timestamp
-            for timestamp in existing_ms
-            if not any(
-                start_ms < timestamp < end_ms
-                for start_ms, end_ms in rejected_cycle_ranges
-            )
-        ]
         filtered_idata = sync_idata_ic_tc_to_event_lists(
             idata,
             hs,
@@ -1623,138 +1627,150 @@ def recover_missing_gait_events_short_delay(
 
 
 def gait_identification(idata, fs=BASE_FS_HZ):
-    """步态事件识别。fs 为实际采样率（Hz），窗口/order 参数随 fs 等比缩放。"""
-    # idata：含原始 ACC，用于写入事件列后返回给步幅积分
+    """离线零相位滤波、批量候选提取和事件识别。"""
     idata = idata.copy()
-
-    # MSW 峰值检测：argrelextrema order 由 MSW_WINDOW_MS 换算为采样点数（局部极大邻域，≠最小峰间距）
-    # 相邻 MSW 最小间隔见 MSW_MIN_INTERVAL_MS + enforce_msw_minimum_interval_ms
-    # order 含义：该点两侧各 order 个样本内必须是最大值，总窗口 = 2*order+1 个样本
-    order_n = max(3, round(fs * MSW_WINDOW_MS / 2000))
-    # Savgol 窗口仍按采样率等比缩放（须为奇数）
-    scale = fs / BASE_FS_HZ
-    savgol_win = max(3, round(BASE_SAVGOL_WINDOW * scale))
-    if savgol_win % 2 == 0:
-        savgol_win += 1
-
     det = idata.copy()
-    for col in ['Gmax(°/s)', 'ACC.X', 'ACC.Y', 'ACC.Z']:
-        if col in det.columns:
-            if col == 'Gmax(°/s)':
-                det = _apply_filters_low(det, col, GYRO_LOW_CUTOFF_HZ, fs)
-            else:
-                det = _apply_filters_low(det, col, ACC_LOW_CUTOFF_HZ, fs)
-    idata['Gmax(°/s)'] = det['Gmax(°/s)'].values
-    idata['gyroscopic_energy'] = np.sqrt(idata['Gyro.X'] ** 2 + idata['Gyro.Y'] ** 2 + idata['Gyro.Z'] ** 2)
-
-    gyro_noise_level = det['Gmax(°/s)'].std() * 0.75
-    MSW_dynamHS_threshold = gyro_noise_level
-    wl_gmax = min(savgol_win, len(det) // 2 * 2 + 1)
-    if wl_gmax < 3:
-        gmax_smooth = det['Gmax(°/s)'].values
-    else:
-        gmax_smooth = savgol_filter(det['Gmax(°/s)'].values, wl_gmax, 3)
-    extrema_idx = argrelextrema(gmax_smooth, np.greater_equal, order=order_n)[0]
-
-    idata['MSW'] = np.nan
-    for i in extrema_idx:
-        val = det['Gmax(°/s)'].iloc[i]
-        if val > MSW_dynamHS_threshold and val > 0:
-            idata.iloc[i, idata.columns.get_loc('MSW')] = val
-    enforce_msw_minimum_interval_ms(idata, det, MSW_MIN_INTERVAL_MS)
-    MSW_timestamps = idata[['Timestamp', 'MSW']].dropna()['Timestamp'].values
-
-    idata['IC'] = np.nan
-    idata['IC_raw'] = np.nan
-    idata['IC_is_zc'] = False
-
-    ic_windows = []
-    for i in range(len(MSW_timestamps) - 1):
-        ic_windows.append((MSW_timestamps[i], MSW_timestamps[i + 1]))
-
-    if len(MSW_timestamps) > 0:
-        ic_windows.append((MSW_timestamps[-1], idata['Timestamp'].iloc[-1]))
-
-    for w_start, w_end in ic_windows:
-        mask = (idata['Timestamp'] >= w_start) & (idata['Timestamp'] <= w_end)
-        ic_time, is_zc = _find_ic_time(
-            idata.loc[mask, 'Gmax(°/s)'].values,
-            idata.loc[mask, 'Timestamp'].values,
-            gyro_noise_level,
+    timestamps = det['Timestamp'].to_numpy(dtype=np.float64)
+    gyro_pipeline = OfflineGaitEventPipeline(
+        fs,
+        min_same_foot_interval_ms=MSW_MIN_INTERVAL_MS,
+    )
+    filtered_gyro, _ = gyro_pipeline.process(
+        timestamps,
+        det['Gmax(°/s)'].to_numpy(dtype=np.float64),
+        det['ACC.X'].to_numpy(dtype=np.float64),
+        det['ACC.Y'].to_numpy(dtype=np.float64),
+        det['ACC.Z'].to_numpy(dtype=np.float64),
+    )
+    det['Gmax(°/s)'] = filtered_gyro
+    if gyro_pipeline.filtered_acc is not None:
+        det[['ACC.X', 'ACC.Y', 'ACC.Z']] = (
+            gyro_pipeline.filtered_acc
         )
+    idata['Gmax(°/s)'] = det['Gmax(°/s)'].values
+    idata['gyroscopic_energy'] = np.linalg.norm(
+        idata[['Gyro.X', 'Gyro.Y', 'Gyro.Z']].to_numpy(
+            dtype=np.float64
+        ),
+        axis=1,
+    )
 
-        if ic_time is not None:
-            idx = nearest_timestamp_index(idata, ic_time)
-            if idx is not None:
-                idata.loc[idx, 'IC'] = idata.loc[idx, 'Gmax(°/s)']
-                idata.loc[idx, 'IC_is_zc'] = is_zc
+    ic_events = gyro_pipeline.detector.events
+    MSW_timestamps = np.asarray(
+        [event["msw_time"] for event in ic_events],
+        dtype=np.float64,
+    )
+    IC_timestamps = np.asarray(
+        [event["ic_time"] for event in ic_events],
+        dtype=np.float64,
+    )
+    event_count = len(idata)
+    gyro_values = idata['Gmax(°/s)'].to_numpy(dtype=np.float64)
+    tc_signal = (
+        savgol_filter(gyro_values, window_length=5, polyorder=2)
+        if gyro_values.size >= 5
+        else gyro_values
+    )
+    msw_column = np.full(event_count, np.nan, dtype=np.float64)
+    ic_column = np.full(event_count, np.nan, dtype=np.float64)
+    ic_is_zc = np.zeros(event_count, dtype=bool)
+    if ic_events:
+        msw_positions = nearest_timestamp_positions(
+            timestamps,
+            MSW_timestamps,
+        )
+        ic_positions = nearest_timestamp_positions(
+            timestamps,
+            IC_timestamps,
+        )
+        msw_column[msw_positions] = np.asarray([
+            event["msw_value"] for event in ic_events
+        ])
+        ic_column[ic_positions] = gyro_values[ic_positions]
+        ic_is_zc[ic_positions] = True
+    idata['MSW'] = msw_column
+    idata['IC'] = ic_column
+    idata['IC_raw'] = np.nan
+    idata['IC_is_zc'] = ic_is_zc
 
-    idata['TC'] = np.nan
-    idata['TC_raw'] = np.nan
-    idata['IC_alt'] = np.nan
-
-    def find_tc_time(seg_signal, seg_timestamps, is_ic_zc):
-        if len(seg_signal) < 3: return None, None
-
-        wl = min(5, len(seg_signal)//2*2+1)
-        wl = max(3, wl)
-        try:
-            filtered = savgol_filter(seg_signal, window_length=wl, polyorder=2)
-        except ValueError:
-            filtered = seg_signal
-
-        from scipy.signal import find_peaks
-        peaks, _ = find_peaks(-filtered)
-        valid_valleys = [v for v in peaks if filtered[v] < 0]
-
-        if not valid_valleys: return None, None
-
+    def find_tc_position(start_position, end_position, is_ic_zc):
+        if end_position - start_position < 2:
+            return None, None
+        smoothed = tc_signal[start_position:end_position + 1]
+        valleys, _ = find_peaks(-smoothed)
+        valid_valleys = valleys[smoothed[valleys] < 0.0]
+        if valid_valleys.size == 0:
+            return None, None
         if is_ic_zc:
-            ic_alt_time = seg_timestamps[valid_valleys[0]]
-            if len(valid_valleys) > 1:
-                tc_time = seg_timestamps[min(valid_valleys[1:], key=lambda x: filtered[x])]
-                return tc_time, ic_alt_time
-            else:
-                tc_time = seg_timestamps[valid_valleys[0]]
-                return tc_time, ic_alt_time
-        else:
-            tc_time = seg_timestamps[min(valid_valleys, key=lambda x: filtered[x])]
-            return tc_time, None
+            ic_alt_position = int(
+                start_position + valid_valleys[0]
+            )
+            tc_candidates = valid_valleys[1:]
+            if tc_candidates.size == 0:
+                return ic_alt_position, ic_alt_position
+            tc_local = int(
+                tc_candidates[np.argmin(smoothed[tc_candidates])]
+            )
+            return start_position + tc_local, ic_alt_position
+        tc_local = int(
+            valid_valleys[np.argmin(smoothed[valid_valleys])]
+        )
+        return start_position + tc_local, None
 
     tc_windows = []
     if len(MSW_timestamps) > 0:
-        tc_windows.append((idata['Timestamp'].iloc[0], MSW_timestamps[0], False))
-
-    IC_timestamps = idata[idata['IC'].notna()]['Timestamp'].values
+        first_msw_position = int(
+            nearest_timestamp_positions(
+                timestamps,
+                [MSW_timestamps[0]],
+            )[0]
+        )
+        tc_windows.append((0, max(0, first_msw_position - 1), False))
     for ic_time in IC_timestamps:
-        next_msws = MSW_timestamps[MSW_timestamps > ic_time]
-        if len(next_msws) > 0:
-            tc_windows.append((ic_time, next_msws[0], True))
-
-    for w_start, w_end, incl_end in tc_windows:
-        mask = (idata['Timestamp'] >= w_start) & (idata['Timestamp'] <= w_end if incl_end else idata['Timestamp'] < w_end)
-
-        is_ic_zc = False
-        idx_start = nearest_timestamp_index(idata, w_start)
-        if idx_start is None:
+        next_msw_index = int(
+            np.searchsorted(MSW_timestamps, ic_time, side='right')
+        )
+        if next_msw_index >= MSW_timestamps.size:
             continue
-        if pd.notna(idata.loc[idx_start, 'IC']):
-            is_ic_zc = idata.loc[idx_start, 'IC_is_zc']
+        start_position, end_position = nearest_timestamp_positions(
+            timestamps,
+            [ic_time, MSW_timestamps[next_msw_index]],
+        )
+        tc_windows.append((
+            int(start_position),
+            int(end_position),
+            True,
+        ))
 
-        tc_time, ic_alt_time = find_tc_time(idata.loc[mask, 'Gmax(°/s)'].values, idata.loc[mask, 'Timestamp'].values, is_ic_zc)
+    tc_positions = []
+    ic_alt_positions = []
+    for start_position, end_position, is_ic_zc in tc_windows:
+        tc_position, ic_alt_position = find_tc_position(
+            start_position,
+            end_position,
+            is_ic_zc,
+        )
+        if tc_position is not None:
+            tc_positions.append(tc_position)
+        if ic_alt_position is not None:
+            ic_alt_positions.append(ic_alt_position)
 
-        if tc_time is not None:
-            idx = nearest_timestamp_index(idata, tc_time)
-            if idx is not None:
-                idata.loc[idx, 'TC'] = idata.loc[idx, 'Gmax(°/s)']
+    tc_column = np.full(event_count, np.nan, dtype=np.float64)
+    ic_alt_column = np.full(event_count, np.nan, dtype=np.float64)
+    if tc_positions:
+        tc_positions = np.unique(np.asarray(tc_positions, dtype=np.int64))
+        tc_column[tc_positions] = gyro_values[tc_positions]
+    if ic_alt_positions:
+        ic_alt_positions = np.unique(
+            np.asarray(ic_alt_positions, dtype=np.int64)
+        )
+        ic_alt_column[ic_alt_positions] = gyro_values[ic_alt_positions]
+    idata['TC'] = tc_column
+    idata['TC_raw'] = np.nan
+    idata['IC_alt'] = ic_alt_column
 
-        if ic_alt_time is not None:
-            idx_alt = nearest_timestamp_index(idata, ic_alt_time)
-            if idx_alt is not None:
-                idata.loc[idx_alt, 'IC_alt'] = idata.loc[idx_alt, 'Gmax(°/s)']
-
-    HS_timestamps = sorted(idata[idata['IC'].notna()]['Timestamp'].values)
-    TO_timestamps = sorted(idata[idata['TC'].notna()]['Timestamp'].values)
+    HS_timestamps = timestamps[np.flatnonzero(~np.isnan(ic_column))]
+    TO_timestamps = timestamps[np.flatnonzero(~np.isnan(tc_column))]
 
     # # 记录原始 IC 供调试绘图
     # original_hs = list(HS_timestamps)
@@ -1881,15 +1897,19 @@ def gait_identification(idata, fs=BASE_FS_HZ):
         TO_timestamps,
     )
 
-    idata['MS'] = np.nan
+    ms_column = np.full(len(idata), np.nan, dtype=np.float64)
     if MS_timestamps:
-        t_arr = idata['Timestamp'].values
-        if len(t_arr) == 0:
+        if timestamps.size == 0:
             return HS_timestamps, TO_timestamps, [], idata, None
-        for t, val in zip(MS_timestamps, MS_values):
-            idx = nearest_timestamp_index(idata, t)
-            if idx is not None:
-                idata.loc[idx, 'MS'] = val
+        ms_positions = nearest_timestamp_positions(
+            timestamps,
+            MS_timestamps,
+        )
+        ms_column[ms_positions] = np.asarray(
+            MS_values,
+            dtype=np.float64,
+        )
+    idata['MS'] = ms_column
 
     # ic_fusion = {
     #     'original_hs': [int(x) for x in original_hs],
@@ -2153,31 +2173,12 @@ def calculate_bilateral_double_support(
     TC 为键，数值是该次主脚支撑期间与对侧所有支撑区间的交叠总时长（ms）。
     跑步时两侧支撑区间不相交，结果自然为 0。
     """
-    def support_intervals(hs_events, to_events):
-        hs_sorted = sorted(float(t) for t in hs_events)
-        to_sorted = sorted(float(t) for t in to_events)
-        intervals = []
-        for index, hs_time in enumerate(hs_sorted):
-            next_hs = hs_sorted[index + 1] if index + 1 < len(hs_sorted) else None
-            candidates = [
-                to_time
-                for to_time in to_sorted
-                if to_time > hs_time and (next_hs is None or to_time < next_hs)
-            ]
-            if candidates:
-                intervals.append((hs_time, candidates[0]))
-        return intervals
-
-    primary_intervals = support_intervals(primary_hs, primary_to)
-    contra_intervals = support_intervals(contralateral_hs, contralateral_to)
-    result = []
-    for primary_start, primary_end in primary_intervals:
-        overlap_ms = sum(
-            max(0.0, min(primary_end, contra_end) - max(primary_start, contra_start))
-            for contra_start, contra_end in contra_intervals
-        )
-        result.append((primary_end, overlap_ms))
-    return result
+    return _calculate_bilateral_double_support(
+        primary_hs,
+        primary_to,
+        contralateral_hs,
+        contralateral_to,
+    )
 
 
 def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
@@ -2190,141 +2191,13 @@ def calculate_stride_length(idata, HS_timestamps, TO_timestamps, MS_timestamps):
       - 再次梯形积分修正后速度 → 位移
       - 步幅 = sqrt(ΔX² + ΔY²)
     """
-    stride_length_info = []
-
-    # 1. 获取 MS 在 numpy 数组中的索引
-    ts_all = idata['Timestamp'].values
-    MS_indices = []
-    for t in MS_timestamps:
-        idx_arr = np.where(ts_all == t)[0]
-        if len(idx_arr) > 0:
-            MS_indices.append(idx_arr[0])
-
-    if len(MS_indices) < 1 or len(HS_timestamps) < 2:
-        return stride_length_info
-
-    ts_sec = ts_all / 1000.0
-    ax_all = (idata['ACC.X'] * GRAVITY).values
-    ay_all = (idata['ACC.Y'] * GRAVITY).values
-    az_all = (idata['ACC.Z'] * GRAVITY).values
-
-    vX_global = np.zeros(len(idata))
-    vY_global = np.zeros(len(idata))
-    vZ_global = np.zeros(len(idata))
-
-    # 2. MS 到 MS 之间的 ZUPT 修正积分
-    if len(MS_indices) >= 2:
-        for i in range(len(MS_indices) - 1):
-            start_idx = MS_indices[i]
-            end_idx   = MS_indices[i + 1]
-            n = end_idx - start_idx + 1
-            if n < 2:
-                continue
-
-            vX = [0.0]
-            vY = [0.0]
-            vZ = [0.0]
-
-            for j in range(1, n):
-                idx_curr = start_idx + j
-                idx_prev = start_idx + j - 1
-                dt = ts_sec[idx_curr] - ts_sec[idx_prev]
-                vX.append(vX[-1] + (ax_all[idx_curr] + ax_all[idx_prev]) / 2.0 * dt)
-                vY.append(vY[-1] + (ay_all[idx_curr] + ay_all[idx_prev]) / 2.0 * dt)
-                vZ.append(vZ[-1] + (az_all[idx_curr] + az_all[idx_prev]) / 2.0 * dt)
-
-            for j in range(n):
-                wj = j / (n - 1) if n > 1 else 0.0
-                idx_global = start_idx + j
-                vX_global[idx_global] = vX[j] - wj * vX[-1]
-                vY_global[idx_global] = vY[j] - wj * vY[-1]
-                vZ_global[idx_global] = vZ[j] - wj * vZ[-1]
-
-            # if i == len(MS_indices) - 2:
-            #     try:
-            #         import matplotlib.pyplot as plt
-            #         plot_t = ts_sec[start_idx:end_idx+1]
-            #         plot_vx = vX_global[start_idx:end_idx+1]
-            #         plot_vy = vY_global[start_idx:end_idx+1]
-            #         plot_vz = vZ_global[start_idx:end_idx+1]
-
-            #         plt.figure(figsize=(10, 5))
-            #         plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
-            #         plt.rcParams['axes.unicode_minus'] = False
-            #         plt.plot(plot_t, plot_vx, label='vX')
-            #         plt.plot(plot_t, plot_vy, label='vY')
-            #         plt.plot(plot_t, plot_vz, label='vZ')
-            #         plt.title(f"最后一个 MS ({plot_t[0]:.2f}s) 到 MS ({plot_t[-1]:.2f}s) 的三轴速度变化图")
-            #         plt.xlabel("时间 (s)")
-            #         plt.ylabel("速度 (m/s)")
-            #         plt.legend()
-            #         plt.grid(True)
-            #         plt.tight_layout()
-            #         plt.show(block=False)
-            #     except ImportError:
-            #         pass
-
-    # 3. 对第一个 MS 之前的数据进行逆向积分（假设起始速度为0）
-    first_ms_idx = MS_indices[0]
-    for i in range(first_ms_idx - 1, -1, -1):
-        dt = ts_sec[i + 1] - ts_sec[i]
-        vX_global[i] = vX_global[i + 1] - (ax_all[i + 1] + ax_all[i]) / 2.0 * dt
-        vY_global[i] = vY_global[i + 1] - (ay_all[i + 1] + ay_all[i]) / 2.0 * dt
-        vZ_global[i] = vZ_global[i + 1] - (az_all[i + 1] + az_all[i]) / 2.0 * dt
-
-    # 4. 对最后一个 MS 之后的数据进行正向积分（起始速度为0）
-    last_ms_idx = MS_indices[-1]
-    for i in range(last_ms_idx + 1, len(idata)):
-        dt = ts_sec[i] - ts_sec[i - 1]
-        vX_global[i] = vX_global[i - 1] + (ax_all[i] + ax_all[i - 1]) / 2.0 * dt
-        vY_global[i] = vY_global[i - 1] + (ay_all[i] + ay_all[i - 1]) / 2.0 * dt
-        vZ_global[i] = vZ_global[i - 1] + (az_all[i] + az_all[i - 1]) / 2.0 * dt
-
-    # 5. 在 HS 到 HS 之间进行位移积分计算步幅
-    HS = sorted(float(x) for x in HS_timestamps)
-    for i in range(len(HS) - 1):
-        hs_start = HS[i]
-        hs_end = HS[i+1]
-
-        # 寻找对应的 start_idx 和 end_idx
-        idx_start_arr = np.where(ts_all == hs_start)[0]
-        idx_end_arr = np.where(ts_all == hs_end)[0]
-        if len(idx_start_arr) == 0 or len(idx_end_arr) == 0:
-            continue
-
-        idx_start = idx_start_arr[0]
-        idx_end = idx_end_arr[0]
-
-        if idx_start >= idx_end:
-            continue
-
-        ts_seg = ts_sec[idx_start:idx_end+1]
-        vx_seg = vX_global[idx_start:idx_end+1]
-        vy_seg = vY_global[idx_start:idx_end+1]
-        vz_seg = vZ_global[idx_start:idx_end+1]
-
-        n_seg = len(ts_seg)
-        if n_seg < 2:
-            continue
-
-        lX = 0.0
-        lY = 0.0
-        lZ = 0.0
-        for j in range(1, n_seg):
-            dt = ts_seg[j] - ts_seg[j-1]
-            lX += (vx_seg[j] + vx_seg[j-1]) / 2.0 * dt
-            lY += (vy_seg[j] + vy_seg[j-1]) / 2.0 * dt
-            lZ += (vz_seg[j] + vz_seg[j-1]) / 2.0 * dt
-
-        stride_length = float(np.sqrt(lX**2 + lY**2 + lZ**2))
-
-        # 找到 HS 到 HS 之间的那一次 TO，作为标识
-        between_TOs = [t for t in TO_timestamps if hs_start < t < hs_end]
-        if between_TOs:
-            to_t = between_TOs[0]
-            stride_length_info.append((to_t, stride_length))
-
-    return stride_length_info
+    return _calculate_stride_length(
+        idata,
+        HS_timestamps,
+        TO_timestamps,
+        MS_timestamps,
+        GRAVITY,
+    )
 
 
 def calculate_vGRF(gait_status_info, flight_time_info, double_support_time_info, contact_time_info):
@@ -2442,19 +2315,20 @@ def truncate_signal_at_takeoff(idata, takeoff_to_ms):
 def sync_idata_ic_tc_to_event_lists(idata, HS_list, TO_list):
     """仅在与 HS_list、TO_list 对齐的最近邻采样行保留 IC/TC 标记（供前端曲线叠加）。"""
     idata = idata.copy()
-    idata['IC'] = np.nan
-    idata['TC'] = np.nan
     if idata.empty:
+        idata['IC'] = np.nan
+        idata['TC'] = np.nan
         return idata
-    gcol = 'Gmax(°/s)'
-    for t in HS_list:
-        idx = nearest_timestamp_index(idata, t)
-        if idx is not None:
-            idata.loc[idx, 'IC'] = idata.loc[idx, gcol]
-    for t in TO_list:
-        idx = nearest_timestamp_index(idata, t)
-        if idx is not None:
-            idata.loc[idx, 'TC'] = idata.loc[idx, gcol]
+    timestamps = idata['Timestamp'].to_numpy(dtype=np.float64)
+    gyro = idata['Gmax(°/s)'].to_numpy(dtype=np.float64)
+    ic_values = np.full(len(idata), np.nan, dtype=np.float64)
+    tc_values = np.full(len(idata), np.nan, dtype=np.float64)
+    ic_positions = nearest_timestamp_positions(timestamps, HS_list)
+    tc_positions = nearest_timestamp_positions(timestamps, TO_list)
+    ic_values[ic_positions] = gyro[ic_positions]
+    tc_values[tc_positions] = gyro[tc_positions]
+    idata['IC'] = ic_values
+    idata['TC'] = tc_values
     return idata
 
 
@@ -2468,14 +2342,18 @@ def sync_idata_msw_to_event_list(idata, MSW_timestamps_kept):
     orig_vals = idata.loc[mask, 'MSW'].values
     if len(orig_times) == 0:
         return idata
-    idata['MSW'] = np.nan
-    for t in MSW_timestamps_kept:
-        idx = nearest_timestamp_index(idata, t)
-        if idx is None:
-            continue
-        row_t = float(idata.loc[idx, 'Timestamp'])
-        j = int(np.argmin(np.abs(orig_times - row_t)))
-        idata.loc[idx, 'MSW'] = float(orig_vals[j])
+    values = np.full(len(idata), np.nan, dtype=np.float64)
+    timestamps = idata['Timestamp'].to_numpy(dtype=np.float64)
+    target_positions = nearest_timestamp_positions(
+        timestamps,
+        MSW_timestamps_kept,
+    )
+    source_positions = nearest_timestamp_positions(
+        orig_times,
+        timestamps[target_positions],
+    )
+    values[target_positions] = orig_vals[source_positions]
+    idata['MSW'] = values
     return idata
 
 
@@ -2489,14 +2367,18 @@ def sync_idata_ms_to_event_list(idata, MS_timestamps_kept):
     orig_vals = idata.loc[mask, 'MS'].values
     if len(orig_times) == 0:
         return idata
-    idata['MS'] = np.nan
-    for t in MS_timestamps_kept:
-        idx = nearest_timestamp_index(idata, t)
-        if idx is None:
-            continue
-        row_t = float(idata.loc[idx, 'Timestamp'])
-        j = int(np.argmin(np.abs(orig_times - row_t)))
-        idata.loc[idx, 'MS'] = float(orig_vals[j])
+    values = np.full(len(idata), np.nan, dtype=np.float64)
+    timestamps = idata['Timestamp'].to_numpy(dtype=np.float64)
+    target_positions = nearest_timestamp_positions(
+        timestamps,
+        MS_timestamps_kept,
+    )
+    source_positions = nearest_timestamp_positions(
+        orig_times,
+        timestamps[target_positions],
+    )
+    values[target_positions] = orig_vals[source_positions]
+    idata['MS'] = values
     return idata
 
 

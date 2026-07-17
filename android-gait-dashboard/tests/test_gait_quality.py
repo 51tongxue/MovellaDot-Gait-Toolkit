@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -12,11 +13,16 @@ sys.path.insert(0, str(PYTHON_SOURCE))
 from gait_analyzer import (
     BilateralGaitContactStateMachine,
     IncrementalBilateralGaitDetector,
+    OfflineGaitEventDetector,
+    OfflineGaitEventPipeline,
+    detect_offline_gait_events,
     _find_ic_time,
     _recover_missing_tc_events_by_phase,
     _recovery_cycle_template_similarity,
+    calculate_bilateral_double_support,
     calculate_bilateral_flight_time,
     calculate_gait_status,
+    calculate_stride_length,
     detect_bilateral_gait_bouts,
     recover_missing_gait_events_short_delay,
     segment_bilateral_contacts,
@@ -115,7 +121,85 @@ def make_event_aligned_signal(duration_ms=10000):
     })
 
 
+def make_offline_candidate(
+    start_ms,
+    peak_dps,
+    impact_g,
+):
+    return {
+        "msw_time": float(start_ms + 40.0),
+        "msw_value": float(peak_dps),
+        "ic_time": float(start_ms + 80.0),
+        "negative_value": float(-peak_dps * 0.5),
+        "impact_range": float(impact_g),
+        "jerk_peak": float(impact_g * 100.0),
+        "has_acc": True,
+    }
+
+
 class GaitQualityTests(unittest.TestCase):
+    def test_double_support_uses_real_bilateral_interval_overlap(self):
+        overlap = calculate_bilateral_double_support(
+            primary_hs=[0, 800, 1600],
+            primary_to=[500, 1300, 2100],
+            contralateral_hs=[300, 1100, 1900],
+            contralateral_to=[700, 1500, 2300],
+        )
+
+        self.assertEqual(
+            [(500.0, 200.0), (1300.0, 200.0), (2100.0, 200.0)],
+            overlap,
+        )
+
+    def test_vectorized_stride_length_preserves_zupt_result(self):
+        timestamps = np.arange(0.0, 1100.0, 100.0)
+        idata = pd.DataFrame({
+            "Timestamp": timestamps,
+            "ACC.X": [0, 0, 1, 2, 1, 0, -1, -2, -1, 0, 0],
+            "ACC.Y": np.zeros(timestamps.size),
+            "ACC.Z": np.zeros(timestamps.size),
+        })
+
+        strides = calculate_stride_length(
+            idata,
+            HS_timestamps=[200, 500, 800],
+            TO_timestamps=[350, 650],
+            MS_timestamps=[200, 800],
+        )
+
+        self.assertEqual([350.0, 650.0], [item[0] for item in strides])
+        np.testing.assert_allclose(
+            [item[1] for item in strides],
+            [0.612915625, 0.612915625],
+            rtol=1e-7,
+            atol=1e-9,
+        )
+
+    def test_recovery_fast_path_preserves_existing_mid_stance_events(self):
+        idata = make_event_aligned_signal(duration_ms=7000)
+        hs = [1000, 2000, 3000, 4000, 5000, 6000]
+        toe_off = [1600, 2600, 3600, 4600, 5600]
+        opposite_hs = [1500, 2500, 3500, 4500, 5500, 6500]
+        expected_ms = [1300, 2300, 3300, 4300, 5300]
+        idata["MS"] = np.nan
+        for timestamp in expected_ms:
+            index = int(np.argmin(
+                np.abs(idata["Timestamp"].to_numpy() - timestamp)
+            ))
+            idata.loc[index, "MS"] = 1.0
+
+        _, _, _, retained_ms, diagnostics = (
+            recover_missing_gait_events_short_delay(
+                idata,
+                hs,
+                toe_off,
+                opposite_hs,
+            )
+        )
+
+        self.assertEqual(expected_ms, retained_ms)
+        self.assertEqual([], diagnostics["recovered_ic"])
+
     def test_flight_time_uses_contralateral_ic_after_primary_tc(self):
         flight = calculate_bilateral_flight_time(
             primary_hs=[0, 800, 1600],
@@ -174,7 +258,7 @@ class GaitQualityTests(unittest.TestCase):
         self.assertIsNone(ic_time)
         self.assertFalse(is_zero_crossing)
 
-    def test_later_valid_zero_crossing_is_used_when_first_is_unconfirmed(self):
+    def test_short_rebound_does_not_discard_the_first_zero_crossing(self):
         ic_time, is_zero_crossing = _find_ic_time(
             np.asarray([
                 120.0, 15.0, -3.0, 18.0, 40.0, -40.0, -120.0, -70.0,
@@ -183,8 +267,211 @@ class GaitQualityTests(unittest.TestCase):
             gyro_noise_level=200.0,
         )
 
-        self.assertEqual(50.0, ic_time)
+        self.assertEqual(20.0, ic_time)
         self.assertTrue(is_zero_crossing)
+
+    def test_ic_survives_short_zero_crossing_rebound(self):
+        timestamps = np.arange(0.0, 260.0, 10.0)
+        signal = np.asarray([
+            30.0, 80.0, 140.0, 220.0, 180.0, 60.0,
+            -4.0, 5.0, -18.0, -55.0, -30.0,
+            40.0, 90.0, 120.0, 80.0, -70.0,
+            20.0, 80.0, 140.0, 200.0, 160.0, 30.0,
+            -5.0, -20.0, -60.0, -35.0,
+        ])
+
+        events = detect_offline_gait_events(
+            signal,
+            timestamps,
+            min_same_foot_interval_ms=0.0,
+        )
+
+        self.assertGreaterEqual(len(events), 2)
+        self.assertEqual(60.0, events[0]["ic_time"])
+
+    def test_ic_rejects_a_new_positive_lobe_during_confirmation(self):
+        timestamps = np.arange(0.0, 180.0, 10.0)
+        signal = np.asarray([
+            30.0, 80.0, 140.0, 220.0, 180.0, 60.0,
+            -4.0, 5.0, 20.0, 70.0, 140.0, 190.0,
+            150.0, 50.0, -30.0, -80.0, -50.0, 10.0,
+        ])
+
+        events = detect_offline_gait_events(
+            signal,
+            timestamps,
+            min_same_foot_interval_ms=0.0,
+        )
+
+        self.assertEqual(1, len(events))
+        self.assertEqual(140.0, events[0]["ic_time"])
+
+    def test_adaptive_msw_peak_threshold_rejects_low_amplitude_false_cycles(self):
+        timestamps = np.asarray([
+            0.0, 50.0, 80.0, 150.0,
+            500.0, 530.0, 560.0, 650.0,
+            1000.0, 1050.0, 1080.0, 1150.0,
+            1500.0, 1530.0, 1560.0, 1650.0,
+            2000.0, 2050.0, 2080.0, 2150.0,
+        ])
+        signal = np.asarray([
+            450.0, 0.0, -120.0, 0.0,
+            35.0, 0.0, -25.0, 0.0,
+            480.0, 0.0, -130.0, 0.0,
+            28.0, 0.0, -22.0, 0.0,
+            430.0, 0.0, -110.0, 0.0,
+        ])
+
+        events = detect_offline_gait_events(
+            signal,
+            timestamps,
+            min_same_foot_interval_ms=0.0,
+        )
+
+        self.assertEqual([50.0, 1050.0, 2050.0], [
+            event["ic_time"] for event in events
+        ])
+        self.assertTrue(all(
+            event["msw_value"] >= 400.0
+            for event in events
+        ))
+
+    def test_offline_pipeline_is_deterministic(self):
+        timestamps = np.arange(0.0, 3000.0, 10.0)
+        signal = (
+            180.0 * np.exp(-0.5 * ((timestamps - 700.0) / 90.0) ** 2)
+            - 150.0 * np.exp(-0.5 * ((timestamps - 820.0) / 55.0) ** 2)
+            + 180.0 * np.exp(-0.5 * ((timestamps - 1700.0) / 90.0) ** 2)
+            - 150.0 * np.exp(-0.5 * ((timestamps - 1820.0) / 55.0) ** 2)
+        )
+
+        first = OfflineGaitEventPipeline(
+            fs=100.0,
+            min_same_foot_interval_ms=0.0,
+        )
+        first_filtered, first_events = first.process(timestamps, signal)
+        second = OfflineGaitEventPipeline(
+            fs=100.0,
+            min_same_foot_interval_ms=0.0,
+        )
+        second_filtered, second_events = second.process(timestamps, signal)
+
+        self.assertTrue(np.allclose(first_filtered, second_filtered))
+        self.assertEqual(first_events, second_events)
+
+    def test_state_machine_rejects_contact_without_preceding_swing(self):
+        events = detect_offline_gait_events(
+            np.asarray([0.0, -40.0, -120.0, -30.0, 0.0]),
+            np.asarray([0.0, 20.0, 40.0, 80.0, 140.0]),
+            np.asarray([0.0, 0.5, 2.0, 0.0, 0.0]),
+            np.zeros(5),
+            np.zeros(5),
+            min_same_foot_interval_ms=0.0,
+        )
+
+        self.assertEqual([], events)
+
+    def test_startup_calibration_uses_swing_and_impact_clusters(self):
+        detector = OfflineGaitEventDetector(
+            min_same_foot_interval_ms=250.0
+        )
+        candidates = [
+            make_offline_candidate(0.0, 30.0, 0.30),
+            make_offline_candidate(700.0, 400.0, 4.00),
+            make_offline_candidate(1400.0, 35.0, 0.40),
+            make_offline_candidate(2100.0, 420.0, 4.20),
+        ]
+        events = detector.validate(candidates)
+
+        self.assertEqual([780.0, 2180.0], [
+            event["ic_time"] for event in events
+        ])
+        self.assertTrue(all(
+            event["msw_value"] >= 400.0
+            for event in events
+        ))
+
+    def test_regular_abrupt_speed_change_recalibrates_after_four_cycles(self):
+        detector = OfflineGaitEventDetector(
+            min_same_foot_interval_ms=250.0
+        )
+        cycles = [(400.0, 4.0)] * 4 + [(50.0, 0.5)] * 4
+        events = detector.validate([
+            make_offline_candidate(
+                cycle_index * 700.0,
+                peak_dps,
+                impact_g,
+            )
+            for cycle_index, (peak_dps, impact_g) in enumerate(cycles)
+        ])
+
+        self.assertEqual(8, len(events))
+        self.assertEqual([50.0] * 4, [
+            event["msw_value"] for event in events[-4:]
+        ])
+
+    def test_turn_like_peak_reduction_is_kept_when_contact_evidence_remains(self):
+        detector = OfflineGaitEventDetector(
+            min_same_foot_interval_ms=250.0
+        )
+        cycles = (
+            [(400.0, 4.0)] * 4
+            + [(60.0, 3.8), (55.0, 3.5)]
+            + [(390.0, 4.1)] * 2
+        )
+        events = detector.validate([
+            make_offline_candidate(
+                cycle_index * 700.0,
+                peak_dps,
+                impact_g,
+            )
+            for cycle_index, (peak_dps, impact_g) in enumerate(cycles)
+        ])
+
+        self.assertEqual(8, len(events))
+        self.assertEqual([60.0, 55.0], [
+            event["msw_value"] for event in events[4:6]
+        ])
+
+    def test_offline_pipeline_uses_acceleration_contact_evidence(self):
+        timestamps = np.arange(0.0, 4200.0, 10.0)
+        gyro_y = np.zeros(timestamps.size, dtype=np.float64)
+        acc_x = np.zeros(timestamps.size, dtype=np.float64)
+        for ic_time in (800.0, 1700.0, 2600.0, 3500.0):
+            gyro_y += (
+                320.0
+                * np.exp(
+                    -0.5
+                    * ((timestamps - (ic_time - 160.0)) / 55.0) ** 2
+                )
+                - 220.0
+                * np.exp(
+                    -0.5 * ((timestamps - ic_time) / 45.0) ** 2
+                )
+            )
+            acc_x += (
+                4.0
+                * np.exp(
+                    -0.5 * ((timestamps - (ic_time + 40.0)) / 25.0) ** 2
+                )
+            )
+
+        pipeline = OfflineGaitEventPipeline(
+            fs=100.0,
+            min_same_foot_interval_ms=250.0,
+        )
+        _, events = pipeline.process(
+            timestamps,
+            gyro_y,
+            acc_x,
+            np.zeros(timestamps.size),
+            np.zeros(timestamps.size),
+        )
+
+        self.assertEqual(4, len(events))
+        self.assertTrue(all(
+            event["impact_range"] > 0.0 for event in events
+        ))
 
     def test_incremental_contact_chunks_match_offline_segmentation(self):
         events = make_events([1000, 10000], 7)
@@ -327,14 +614,44 @@ class GaitQualityTests(unittest.TestCase):
             )
         )
 
-        self.assertIn(5000.0, recovered_hs)
+        self.assertIn(4930.0, recovered_hs)
         self.assertIn(5600.0, recovered_to)
-        self.assertEqual([5000], diagnostics["recovered_ic"])
+        self.assertEqual([4930], diagnostics["recovered_ic"])
         self.assertEqual([4800], diagnostics["recovered_msw"])
         self.assertEqual([5600], diagnostics["recovered_tc"])
         self.assertTrue(recovered_data["IC"].notna().any())
         self.assertTrue(recovered_data["TC"].notna().any())
         self.assertGreater(len(recovered_ms), 0)
+
+    def test_rejected_recovery_candidate_does_not_delete_existing_events(self):
+        data = make_event_aligned_signal()
+        hs = [1000, 2000, 3000, 4000, 6000, 7000, 8000, 9000]
+        to = [1600, 2600, 3600, 4600, 6600, 7600, 8600, 9600]
+        opposite_hs = [
+            500, 1500, 2500, 3500, 4500,
+            5500, 6500, 7500, 8500, 9500,
+        ]
+
+        with patch(
+            "gait_analyzer._recovery_cycle_template_similarity",
+            return_value=0.0,
+        ):
+            _, recovered_hs, recovered_to, _, diagnostics = (
+                recover_missing_gait_events_short_delay(
+                    data,
+                    hs,
+                    to,
+                    opposite_hs,
+                )
+            )
+
+        self.assertEqual(list(map(float, hs)), recovered_hs)
+        self.assertEqual(list(map(float, to)), recovered_to)
+        self.assertEqual([], diagnostics["recovered_ic"])
+        self.assertGreater(
+            len(diagnostics["rejected_template_cycles"]),
+            0,
+        )
 
     def test_phase_order_selects_main_tc_before_midswing(self):
         data = make_event_aligned_signal()
@@ -364,7 +681,7 @@ class GaitQualityTests(unittest.TestCase):
             )
         )
 
-        self.assertIn(5000.0, recovered_hs)
+        self.assertIn(4930.0, recovered_hs)
         self.assertNotIn(5600.0, recovered_to)
         self.assertIn(5750.0, recovered_to)
         self.assertEqual([5750], diagnostics["recovered_tc"])
