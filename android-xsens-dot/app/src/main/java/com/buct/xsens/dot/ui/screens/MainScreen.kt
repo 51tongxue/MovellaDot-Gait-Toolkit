@@ -1,5 +1,6 @@
 package com.buct.xsens.dot.ui.screens
 
+import android.content.res.Configuration
 import android.os.SystemClock
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -14,9 +15,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.DevicesOther
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.PowerSettingsNew
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -36,6 +40,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -51,8 +56,12 @@ import com.buct.xsens.dot.engine.DotBatteryStatus
 import com.buct.xsens.dot.engine.DotFirmwareStatus
 import com.buct.xsens.dot.engine.EraseTaskProgress
 import com.buct.xsens.dot.engine.ExportTaskProgress
+import com.buct.xsens.dot.engine.FileInfoReadPhase
+import com.buct.xsens.dot.engine.FileInfoReadStatus
 import com.buct.xsens.dot.engine.FlashRecordingPhase
+import com.buct.xsens.dot.engine.ParticipantHistorySession
 import com.buct.xsens.dot.engine.RecordingExportDecision
+import com.buct.xsens.dot.engine.pairParticipantHistoryFiles
 import com.buct.xsens.dot.ui.components.*
 import com.buct.xsens.dot.ui.theme.Accent
 import com.buct.xsens.dot.ui.theme.Bg
@@ -69,6 +78,8 @@ import com.xsens.dot.android.sdk.models.DotDevice
 import com.xsens.dot.android.sdk.models.DotRecordingFileInfo
 import com.xsens.dot.android.sdk.models.DotRecordingState
 import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @Composable
@@ -101,16 +112,25 @@ fun MainScreen(
     val syncOutputRate      by viewModel.recOutputRate.collectAsState()
     val collectionState     by viewModel.state.collectAsState()
     val offlineFileMap      by viewModel.recFileList.collectAsState()
-    val exportProgress      by viewModel.recExportProgress.collectAsState()
-    val exportDone          by viewModel.recExportDone.collectAsState()
+    val fileInfoReadStatuses by viewModel.recFileInfoReadStatuses.collectAsState()
+    val fileInfoReadActiveTargets by
+        viewModel.recFileInfoReadActiveTargets.collectAsState()
     val exportTaskProgress  by viewModel.recExportTaskProgress.collectAsState()
     val recordingExportDecisions by
         viewModel.recRecordingExportDecisions.collectAsState()
     val eraseTaskProgress   by viewModel.recEraseTaskProgress.collectAsState()
     val selectedFileKeys    by viewModel.selectedFileKeys.collectAsState()
+    val visibleHistoryParticipantSlots by
+        viewModel.visibleHistoryParticipantSlots.collectAsState()
+    val historyLoadingParticipantSlots by
+        viewModel.historyLoadingParticipantSlots.collectAsState()
+    val historyQueuedParticipantSlots by
+        viewModel.historyQueuedParticipantSlots.collectAsState()
+    val historyRequestErrors by viewModel.historyRequestErrors.collectAsState()
     val inRecordingMode     by viewModel.inRecordingMode.collectAsState()
     val captureWorkflowPreparing by viewModel.captureWorkflowPreparing.collectAsState()
     val participantPreparingSlots by viewModel.participantPreparingSlots.collectAsState()
+    val participantConnectingSlots by viewModel.participantConnectingSlots.collectAsState()
     val notifReady          by viewModel.recNotifReady.collectAsState()
     val recordingPhase      by viewModel.recRecordingPhase.collectAsState()
     val deviceRecordingPhases by viewModel.recDeviceRecordingPhases.collectAsState()
@@ -125,7 +145,6 @@ fun MainScreen(
     val isConnected = connectedDevices.isNotEmpty()
     val connectedCount = connectedDevices.size
     val participantCount = deviceRoleConfig.participants.size
-    val configuredTargetCount = participantCount * 2
     val canPowerOffDevices =
         !isSyncing &&
             !recordingLocked &&
@@ -158,6 +177,12 @@ fun MainScreen(
     }
     val syncTargetNormAddresses = remember(syncTargetAddresses) {
         syncTargetAddresses.map(::normalizeUiAddress).toSet()
+    }
+    val batteryStatusByNorm = remember(batteryStatus) {
+        batteryStatus.mapKeys { normalizeUiAddress(it.key) }
+    }
+    val firmwareStatusByNorm = remember(firmwareStatus) {
+        firmwareStatus.mapKeys { normalizeUiAddress(it.key) }
     }
     val flashInfoByNorm = remember(flashInfo) {
         flashInfo.mapKeys { normalizeUiAddress(it.key) }
@@ -201,7 +226,6 @@ fun MainScreen(
         }
     }
     val activeDeviceCount = if (activeDeviceNormAddresses.isNotEmpty()) activeDeviceNormAddresses.size else connectedCount
-    val hasActiveDeviceTarget = activeDeviceNormAddresses.isNotEmpty()
     val connectedDevicesAllSynced = activeDeviceCount >= 2 &&
         activeDeviceNormAddresses.isNotEmpty() &&
         activeDeviceNormAddresses.all { deviceSyncStates[it] == true }
@@ -270,12 +294,7 @@ fun MainScreen(
     }
     val syncStatusText =
         if (participantCount > 0) "$syncedParticipantCount/$participantCount 组" else "—"
-    val displayConnectedCount = if (hasActiveDeviceTarget) activeDeviceNormAddresses.count { it in connectedNormAddresses } else connectedCount
     val offlineTargetCount = offlineTargetNormAddresses.size
-    val workbenchTargetCount = when {
-        offlineTargetCount > 0 -> offlineTargetCount
-        else -> configuredTargetCount
-    }
     val connectedTargetCount = offlineTargetNormAddresses.count { it in connectedNormAddresses }
     val offlineHasAllNotifications = offlineTargetCount > 0 &&
         offlineTargetNormAddresses.all { it in notificationNormAddresses }
@@ -350,28 +369,6 @@ fun MainScreen(
         activeDeviceCount == 0 || (activeDeviceCount >= 2 && !effectiveIsSynced) -> CaptureStatusTone.Warning
         else -> CaptureStatusTone.Signal
     }
-    val availableOfflineFileMap = remember(
-        offlineFileMap,
-        connectedNormAddresses,
-        deviceRecordingPhases,
-    ) {
-        offlineFileMap.filterKeys { address ->
-            val norm = normalizeUiAddress(address)
-            val phase = deviceRecordingPhases[norm]
-            norm in connectedNormAddresses &&
-                phase !in setOf(
-                    FlashRecordingPhase.Starting,
-                    FlashRecordingPhase.Recording,
-                    FlashRecordingPhase.Stopping,
-                )
-        }
-    }
-    val availableOfflineFileKeys = remember(availableOfflineFileMap) {
-        availableOfflineFileMap
-            .flatMap { (addr, files) -> files.map { file -> "$addr-${file.fileId}" } }
-            .toSet()
-    }
-    val availableSelectedFileKeys = selectedFileKeys.intersect(availableOfflineFileKeys)
     val allConnectedDevicesIdle = connectedNormAddresses.isNotEmpty() &&
         connectedNormAddresses.all { address ->
             deviceRecordingPhases[address] !in setOf(
@@ -384,12 +381,204 @@ fun MainScreen(
     // 仅在同步进行中或同步完成后锁定，避免与 SDK 的同步状态冲突。
     val canEditSyncParams = !isSyncing && !effectiveIsSynced
     val sectionSpacing = 16.dp
+    val isLandscape =
+        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val historyOperationActive =
+        historyLoadingParticipantSlots.isNotEmpty() ||
+            historyQueuedParticipantSlots.isNotEmpty() ||
+            fileInfoReadActiveTargets.isNotEmpty()
 
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp)
-    ) {
+    if (isLandscape) {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (scanMessage != null) {
+                CaptureNoticeBar(
+                    text = scanMessage!!,
+                    onDismiss = { viewModel.clearScanMessage() },
+                )
+            }
+
+            LandscapeCaptureWorkbench(
+                participantCount = participantCount,
+                syncedParticipantCount = syncedParticipantCount,
+                sampleRateText = if (connectedDevices.isEmpty()) "—" else "${syncOutputRate} Hz",
+                isSyncing = isSyncing,
+                syncProgress = syncProgress,
+                syncTargetAddresses = syncTargetNormAddresses,
+                participants = deviceRoleConfig.participants,
+                connectedAddresses = connectedNormAddresses,
+                connectionTargetAddresses = connectionTargetAddresses,
+                manuallyDisconnectedAddresses = manuallyDisconnectedAddresses,
+                batteryStatus = batteryStatusByNorm,
+                rssiStatus = deviceRssi,
+                firmwareStatus = firmwareStatusByNorm,
+                flashInfo = flashInfoByNorm,
+                deviceSyncStates = deviceSyncStates,
+                deviceRecordingPhases = deviceRecordingPhases,
+                delayedStopConfirmations = delayedStopConfirmations,
+                linkStatuses = deviceLinkStatuses,
+                recordingExportDecisions = recordingExportDecisions.values.toList(),
+                participantPreparingSlots = participantPreparingSlots,
+                participantConnectingSlots = participantConnectingSlots,
+                visibleHistoryParticipantSlots = visibleHistoryParticipantSlots,
+                historyLoadingParticipantSlots = historyLoadingParticipantSlots,
+                historyQueuedParticipantSlots = historyQueuedParticipantSlots,
+                globalOperationLocked = eraseInProgress || captureWorkflowPreparing,
+                managementEnabled =
+                    !isScanning &&
+                        !isSyncing &&
+                        !recordingLocked &&
+                        !exportInProgress &&
+                        !eraseInProgress &&
+                        !historyOperationActive &&
+                        !captureWorkflowPreparing,
+                canAddParticipant =
+                    !isScanning &&
+                        !isSyncing &&
+                        !recordingLocked &&
+                        !exportInProgress &&
+                        !eraseInProgress &&
+                        !captureWorkflowPreparing &&
+                        participantCount < 3,
+                canPowerOffDevices = canPowerOffDevices,
+                exportInProgress = exportInProgress,
+                exportTaskProgress = exportTaskProgress,
+                eraseTaskProgress = eraseTaskProgress,
+                onNewAthlete = {
+                    editingAthlete = null
+                    athleteBindingTargetSlotId = deviceRoleConfig.participants
+                        .firstOrNull { it.athleteId.isBlank() }
+                        ?.slotId
+                    showAthleteEditor = true
+                },
+                onAddParticipant = viewModel::addParticipant,
+                onOpenDeviceManagement = {
+                    viewModel.closeAllParticipantHistories()
+                    groupManagementExpanded = true
+                },
+                onOpenAdvanced = {
+                    detailsExpanded = true
+                },
+                onPowerOffDevice = viewModel::powerOffDevice,
+                onDisconnectParticipant = viewModel::disconnectParticipant,
+                onConnectParticipant = viewModel::connectParticipant,
+                onStopParticipantSync = viewModel::stopParticipantSync,
+                onStartParticipantSync = viewModel::startParticipantSync,
+                onStartParticipantRecording = viewModel::startParticipantFlashRecording,
+                onStopParticipantRecording = viewModel::stopParticipantFlashRecording,
+                onReadParticipantFiles = viewModel::requestParticipantFiles,
+                onExportRecording = viewModel::exportRecordingDecision,
+                onDismissRecordingExport = viewModel::dismissRecordingExportDecision,
+                onRetryFailedExports = viewModel::retryFailedExports,
+            )
+
+            ParticipantHistoryPanels(
+                participants = deviceRoleConfig.participants,
+                visibleSlots = visibleHistoryParticipantSlots,
+                loadingSlots = historyLoadingParticipantSlots,
+                queuedSlots = historyQueuedParticipantSlots,
+                requestErrors = historyRequestErrors,
+                fileInfoReadStatuses = fileInfoReadStatuses,
+                connectedAddresses = connectedNormAddresses,
+                fileList = offlineFileMap,
+                selectedFileKeys = selectedFileKeys,
+                exportTaskProgress = exportTaskProgress,
+                operationReady = !exportInProgress && !isSyncing,
+                globalHistoryOperationActive = historyOperationActive,
+                onToggleFileSelection = viewModel::toggleFileSelection,
+                onSelectAll = viewModel::selectParticipantFiles,
+                onClear = viewModel::clearParticipantFileSelection,
+                onExport = viewModel::exportParticipantFiles,
+                onRetry = viewModel::retryParticipantFiles,
+                onStopExport = viewModel::stopExportFiles,
+            )
+        }
+
+        if (groupManagementExpanded) {
+            LandscapeSettingsDialog(
+                title = "设备管理",
+                onDismiss = { groupManagementExpanded = false },
+            ) {
+                ParticipantAssignmentPanel(
+                    config = deviceRoleConfig,
+                    athletes = availableAthletes,
+                    devices = scannedDevices,
+                    connectedAddresses = connectedNormAddresses,
+                    isScanning = isScanning,
+                    enabled =
+                        !isScanning &&
+                            !isSyncing &&
+                            !recordingLocked &&
+                            !exportInProgress &&
+                            !eraseInProgress &&
+                            !captureWorkflowPreparing,
+                    onSelectAthlete = viewModel::selectParticipantAthlete,
+                    onAssignDevice = viewModel::assignParticipantDevice,
+                    onAddParticipant = viewModel::addParticipant,
+                    onRemoveParticipant = viewModel::removeParticipant,
+                    onNewAthlete = { slotId ->
+                        editingAthlete = null
+                        athleteBindingTargetSlotId = slotId
+                        showAthleteEditor = true
+                    },
+                    onEditAthlete = { athleteId ->
+                        editingAthlete = availableAthletes.firstOrNull {
+                            it.athleteId == athleteId
+                        }
+                        athleteBindingTargetSlotId = null
+                        showAthleteEditor = editingAthlete != null
+                    },
+                    onScan = viewModel::startScan,
+                )
+            }
+        }
+
+        if (detailsExpanded) {
+            LandscapeSettingsDialog(
+                title = "高级设置",
+                onDismiss = { detailsExpanded = false },
+            ) {
+                CaptureAdvancedPanel(
+                    expanded = true,
+                    showHeader = false,
+                    showDeviceStatus = false,
+                    framed = false,
+                    connectedDevices = connectedDevices,
+                    recordingStates = recordingStates,
+                    recordingPhase = recordingPhase,
+                    linkStatuses = deviceLinkStatuses,
+                    rssiStatus = deviceRssi,
+                    flashInfo = flashInfo,
+                    notificationReady = notifReady,
+                    inRecordingMode = inRecordingMode,
+                    syncOutputRate = syncOutputRate,
+                    canEditSyncParams = canEditSyncParams,
+                    recordingLocked = recordingLocked,
+                    canEraseFlash =
+                        allConnectedDevicesIdle &&
+                            !isSyncing &&
+                            !exportInProgress &&
+                            !captureWorkflowPreparing,
+                    eraseTaskProgress = eraseTaskProgress,
+                    syncLog = emptyList(),
+                    onToggleExpanded = {},
+                    onSetRate = viewModel::setRecOutputRate,
+                    onEraseFlash = viewModel::eraseFlash,
+                )
+            }
+        }
+    } else {
+        Column(
+            modifier = modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
 
         if (scanMessage != null) {
             CaptureNoticeBar(
@@ -435,8 +624,6 @@ fun MainScreen(
         }
 
         CaptureWorkbenchPanel(
-            connectedCount = displayConnectedCount,
-            targetCount = workbenchTargetCount,
             participantCount = participantCount,
             syncText = syncStatusText,
             isSyncing = isSyncing,
@@ -446,19 +633,25 @@ fun MainScreen(
             connectedAddresses = connectedNormAddresses,
             connectionTargetAddresses = connectionTargetAddresses,
             manuallyDisconnectedAddresses = manuallyDisconnectedAddresses,
-            batteryStatus = batteryStatus,
+            batteryStatus = batteryStatusByNorm,
             rssiStatus = deviceRssi,
-            firmwareStatus = firmwareStatus,
+            firmwareStatus = firmwareStatusByNorm,
+            flashInfo = flashInfoByNorm,
             deviceSyncStates = deviceSyncStates,
             deviceRecordingPhases = deviceRecordingPhases,
             delayedStopConfirmations = delayedStopConfirmations,
             linkStatuses = deviceLinkStatuses,
             recordingExportDecisions = recordingExportDecisions.values.toList(),
             participantPreparingSlots = participantPreparingSlots,
+            participantConnectingSlots = participantConnectingSlots,
+            visibleHistoryParticipantSlots = visibleHistoryParticipantSlots,
+            historyLoadingParticipantSlots = historyLoadingParticipantSlots,
+            historyQueuedParticipantSlots = historyQueuedParticipantSlots,
             managementLocked =
                 recordingLocked ||
                     exportInProgress ||
                     eraseInProgress ||
+                    historyOperationActive ||
                     captureWorkflowPreparing,
             globalOperationLocked =
                 eraseInProgress ||
@@ -466,6 +659,9 @@ fun MainScreen(
             sampleRateText = if (connectedDevices.isEmpty()) "—" else "${syncOutputRate}Hz",
             groupManagementExpanded = groupManagementExpanded,
             onToggleGroupManagement = {
+                if (!groupManagementExpanded) {
+                    viewModel.closeAllParticipantHistories()
+                }
                 groupManagementExpanded = !groupManagementExpanded
             },
             canAddParticipant =
@@ -474,14 +670,16 @@ fun MainScreen(
                     !recordingLocked &&
                     !exportInProgress &&
                     !eraseInProgress &&
+                    !historyOperationActive &&
                     !captureWorkflowPreparing &&
                     participantCount < 3,
             athleteManagementEnabled =
                 !isScanning &&
                     !isSyncing &&
                     !recordingLocked &&
-                    !exportInProgress &&
+                !exportInProgress &&
                     !eraseInProgress &&
+                    !historyOperationActive &&
                     !captureWorkflowPreparing,
             onAddParticipant = viewModel::addParticipant,
             onNewAthlete = {
@@ -495,9 +693,6 @@ fun MainScreen(
             onPowerOffDevice = viewModel::powerOffDevice,
             exportInProgress = exportInProgress,
             exportTaskProgress = exportTaskProgress,
-            eraseTaskProgress = eraseTaskProgress,
-            showEraseControl = isConnected,
-            canEraseFlash = allConnectedDevicesIdle && !exportInProgress,
             onDisconnectParticipant = viewModel::disconnectParticipant,
             onConnectParticipant = viewModel::connectParticipant,
             onStopParticipantSync = viewModel::stopParticipantSync,
@@ -508,7 +703,6 @@ fun MainScreen(
             onExportRecording = viewModel::exportRecordingDecision,
             onDismissRecordingExport = viewModel::dismissRecordingExportDecision,
             onRetryFailedExports = viewModel::retryFailedExports,
-            onEraseFlash = { viewModel.eraseFlash() },
         )
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -518,12 +712,14 @@ fun MainScreen(
                 athletes = availableAthletes,
                 devices = scannedDevices,
                 connectedAddresses = connectedNormAddresses,
+                isScanning = isScanning,
                 enabled =
                     !isScanning &&
                         !isSyncing &&
                         !recordingLocked &&
                         !exportInProgress &&
                         !eraseInProgress &&
+                        !historyOperationActive &&
                         !captureWorkflowPreparing,
                 onSelectAthlete = viewModel::selectParticipantAthlete,
                 onAssignDevice = viewModel::assignParticipantDevice,
@@ -541,28 +737,31 @@ fun MainScreen(
                     athleteBindingTargetSlotId = null
                     showAthleteEditor = editingAthlete != null
                 },
+                onScan = viewModel::startScan,
             )
             Spacer(modifier = Modifier.height(10.dp))
         }
 
-        if (availableOfflineFileMap.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(10.dp))
-            CompactOfflineFilePicker(
-                fileList = availableOfflineFileMap,
-                selectedFileKeys = availableSelectedFileKeys,
-                exportDone = exportDone,
-                exportProgress = exportProgress,
-                exportTaskProgress = exportTaskProgress,
-                recordingLocked = false,
-                operationReady = !exportInProgress,
-                onToggleDeviceSelection = { viewModel.toggleDeviceSelection(it) },
-                onToggleFileSelection = { addr, fileId -> viewModel.toggleFileSelection(addr, fileId) },
-                onSelectAll = { viewModel.selectAllFiles() },
-                onClear = { viewModel.clearFileSelection() },
-                onExport = { viewModel.exportFiles() },
-                onStopExport = { viewModel.stopExportFiles() }
-            )
-        }
+        ParticipantHistoryPanels(
+            participants = deviceRoleConfig.participants,
+            visibleSlots = visibleHistoryParticipantSlots,
+            loadingSlots = historyLoadingParticipantSlots,
+            queuedSlots = historyQueuedParticipantSlots,
+            requestErrors = historyRequestErrors,
+            fileInfoReadStatuses = fileInfoReadStatuses,
+            connectedAddresses = connectedNormAddresses,
+            fileList = offlineFileMap,
+            selectedFileKeys = selectedFileKeys,
+            exportTaskProgress = exportTaskProgress,
+            operationReady = !exportInProgress && !isSyncing,
+            globalHistoryOperationActive = historyOperationActive,
+            onToggleFileSelection = viewModel::toggleFileSelection,
+            onSelectAll = viewModel::selectParticipantFiles,
+            onClear = viewModel::clearParticipantFileSelection,
+            onExport = viewModel::exportParticipantFiles,
+            onRetry = viewModel::retryParticipantFiles,
+            onStopExport = viewModel::stopExportFiles,
+        )
 
         Spacer(modifier = Modifier.height(12.dp))
         CaptureAdvancedPanel(
@@ -578,7 +777,11 @@ fun MainScreen(
             syncOutputRate = syncOutputRate,
             canEditSyncParams = canEditSyncParams,
             recordingLocked = recordingLocked,
-            operationReady = offlineOperationReady,
+            canEraseFlash =
+                allConnectedDevicesIdle &&
+                    !isSyncing &&
+                    !exportInProgress &&
+                    !captureWorkflowPreparing,
             eraseTaskProgress = eraseTaskProgress,
             syncLog = syncLog,
             onToggleExpanded = { detailsExpanded = !detailsExpanded },
@@ -588,6 +791,7 @@ fun MainScreen(
         Spacer(modifier = Modifier.height(18.dp))
 
 
+        }
     }
 
     if (showAthleteEditor) {
@@ -1200,7 +1404,7 @@ private const val SIGNAL_WEAK_EXIT_SAMPLES = 3
 
 private enum class CaptureStatusTone { Signal, Warning, Danger, Muted }
 
-private enum class CaptureButtonTone { Subtle, Success, Danger }
+private enum class CaptureButtonTone { Subtle, Success, Danger, DangerSubtle }
 
 private enum class DeviceLinkHealth {
     Connected,
@@ -1351,8 +1555,6 @@ private fun linkStatusColor(health: DeviceLinkHealth): Color =
 
 @Composable
 private fun CaptureWorkbenchPanel(
-    connectedCount: Int,
-    targetCount: Int,
     participantCount: Int,
     syncText: String,
     isSyncing: Boolean,
@@ -1365,12 +1567,17 @@ private fun CaptureWorkbenchPanel(
     batteryStatus: Map<String, DotBatteryStatus>,
     rssiStatus: Map<String, Int>,
     firmwareStatus: Map<String, DotFirmwareStatus>,
+    flashInfo: Map<String, Pair<Int, Int>>,
     deviceSyncStates: Map<String, Boolean>,
     deviceRecordingPhases: Map<String, FlashRecordingPhase>,
     delayedStopConfirmations: Set<String>,
     linkStatuses: Map<String, DeviceLinkStatus>,
     recordingExportDecisions: List<RecordingExportDecision>,
     participantPreparingSlots: Set<String>,
+    participantConnectingSlots: Set<String>,
+    visibleHistoryParticipantSlots: Set<String>,
+    historyLoadingParticipantSlots: Set<String>,
+    historyQueuedParticipantSlots: Set<String>,
     managementLocked: Boolean,
     globalOperationLocked: Boolean,
     sampleRateText: String,
@@ -1384,9 +1591,6 @@ private fun CaptureWorkbenchPanel(
     onPowerOffDevice: (String) -> Unit,
     exportInProgress: Boolean,
     exportTaskProgress: ExportTaskProgress,
-    eraseTaskProgress: EraseTaskProgress,
-    showEraseControl: Boolean,
-    canEraseFlash: Boolean,
     onDisconnectParticipant: (String) -> Unit,
     onConnectParticipant: (String) -> Unit,
     onStopParticipantSync: (String) -> Unit,
@@ -1397,36 +1601,13 @@ private fun CaptureWorkbenchPanel(
     onExportRecording: (String) -> Unit,
     onDismissRecordingExport: (String) -> Unit,
     onRetryFailedExports: () -> Unit,
-    onEraseFlash: () -> Unit,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "工作台",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            CaptureStatusChip(
-                text = "$connectedCount / $targetCount 已连接",
-                tone = when {
-                    targetCount > 0 && connectedCount == targetCount -> CaptureStatusTone.Signal
-                    connectedCount > 0 -> CaptureStatusTone.Warning
-                    else -> CaptureStatusTone.Muted
-                },
-            )
-        }
-
         CaptureStatusSummary(
             participantText = "$participantCount 名",
-            deviceText = "$connectedCount / $targetCount",
             syncText = syncText,
             sampleRateText = sampleRateText,
         )
@@ -1511,12 +1692,17 @@ private fun CaptureWorkbenchPanel(
             batteryStatus = batteryStatus,
             rssiStatus = rssiStatus,
             firmwareStatus = firmwareStatus,
+            flashInfo = flashInfo,
             deviceSyncStates = deviceSyncStates,
             deviceRecordingPhases = deviceRecordingPhases,
             delayedStopConfirmations = delayedStopConfirmations,
             linkStatuses = linkStatuses,
             recordingExportDecisions = recordingExportDecisions,
             participantPreparingSlots = participantPreparingSlots,
+            participantConnectingSlots = participantConnectingSlots,
+            visibleHistoryParticipantSlots = visibleHistoryParticipantSlots,
+            historyLoadingParticipantSlots = historyLoadingParticipantSlots,
+            historyQueuedParticipantSlots = historyQueuedParticipantSlots,
             isSyncing = isSyncing,
             syncProgress = syncProgress,
             syncTargetAddresses = syncTargetAddresses,
@@ -1535,23 +1721,875 @@ private fun CaptureWorkbenchPanel(
             onDismissRecordingExport = onDismissRecordingExport,
         )
 
-        if (showEraseControl) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                CaptureInlineButton(
-                    text = if (eraseTaskProgress.isErasing) "擦除中" else "擦除 Flash",
-                    enabled = canEraseFlash && !eraseTaskProgress.isErasing,
-                    tone = CaptureButtonTone.Danger,
-                    modifier = Modifier.width(150.dp),
-                    onClick = onEraseFlash
+    }
+}
+
+@Composable
+private fun LandscapeCaptureWorkbench(
+    participantCount: Int,
+    syncedParticipantCount: Int,
+    sampleRateText: String,
+    isSyncing: Boolean,
+    syncProgress: Int,
+    syncTargetAddresses: Set<String>,
+    participants: List<CaptureParticipantBinding>,
+    connectedAddresses: Set<String>,
+    connectionTargetAddresses: Set<String>,
+    manuallyDisconnectedAddresses: Set<String>,
+    batteryStatus: Map<String, DotBatteryStatus>,
+    rssiStatus: Map<String, Int>,
+    firmwareStatus: Map<String, DotFirmwareStatus>,
+    flashInfo: Map<String, Pair<Int, Int>>,
+    deviceSyncStates: Map<String, Boolean>,
+    deviceRecordingPhases: Map<String, FlashRecordingPhase>,
+    delayedStopConfirmations: Set<String>,
+    linkStatuses: Map<String, DeviceLinkStatus>,
+    recordingExportDecisions: List<RecordingExportDecision>,
+    participantPreparingSlots: Set<String>,
+    participantConnectingSlots: Set<String>,
+    visibleHistoryParticipantSlots: Set<String>,
+    historyLoadingParticipantSlots: Set<String>,
+    historyQueuedParticipantSlots: Set<String>,
+    globalOperationLocked: Boolean,
+    managementEnabled: Boolean,
+    canAddParticipant: Boolean,
+    canPowerOffDevices: Boolean,
+    exportInProgress: Boolean,
+    exportTaskProgress: ExportTaskProgress,
+    eraseTaskProgress: EraseTaskProgress,
+    onNewAthlete: () -> Unit,
+    onAddParticipant: () -> Unit,
+    onOpenDeviceManagement: () -> Unit,
+    onOpenAdvanced: () -> Unit,
+    onPowerOffDevice: (String) -> Unit,
+    onDisconnectParticipant: (String) -> Unit,
+    onConnectParticipant: (String) -> Unit,
+    onStopParticipantSync: (String) -> Unit,
+    onStartParticipantSync: (String) -> Unit,
+    onStartParticipantRecording: (String) -> Unit,
+    onStopParticipantRecording: (String) -> Unit,
+    onReadParticipantFiles: (String) -> Unit,
+    onExportRecording: (String) -> Unit,
+    onDismissRecordingExport: (String) -> Unit,
+    onRetryFailedExports: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(AppSurfaceColor, RoundedCornerShape(8.dp))
+                .border(1.dp, Border, RoundedCornerShape(8.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "工作台",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(28.dp)
+                    .background(Border),
+            )
+            LandscapeSummaryMetric("运动员", "$participantCount 名")
+            LandscapeSummaryMetric("同步", "$syncedParticipantCount / $participantCount 组")
+            LandscapeSummaryMetric("采样", sampleRateText)
+            Spacer(modifier = Modifier.weight(1f))
+            CaptureToolbarGroup {
+                CaptureToolbarButton(
+                    text = "新建运动员",
+                    enabled = managementEnabled,
+                    tone = CaptureButtonTone.Subtle,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Outlined.Add,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    },
+                    onClick = onNewAthlete,
+                )
+                CaptureToolbarButton(
+                    text = "设备管理",
+                    enabled = managementEnabled,
+                    tone = CaptureButtonTone.Subtle,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Outlined.DevicesOther,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    },
+                    onClick = onOpenDeviceManagement,
+                )
+                CaptureToolbarButton(
+                    text = "高级设置",
+                    enabled = !eraseTaskProgress.isErasing,
+                    tone = CaptureButtonTone.Subtle,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Outlined.Tune,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    },
+                    onClick = onOpenAdvanced,
                 )
             }
         }
 
-        if (eraseTaskProgress.totalDevices > 0) {
+        if (
+            exportTaskProgress.isExporting ||
+            exportTaskProgress.hasPendingFiles ||
+            exportTaskProgress.failedTargetFileKeys.isNotEmpty()
+        ) {
+            ExportProgressSummary(
+                progress = exportTaskProgress,
+                onRetryFailed = onRetryFailedExports,
+            )
+        }
+        if (eraseTaskProgress.isErasing) {
             EraseProgressSummary(eraseTaskProgress)
+        }
+
+        participants.forEachIndexed { index, participant ->
+            LandscapeParticipantCaptureRow(
+                index = index,
+                participant = participant,
+                sampleRateText = sampleRateText,
+                connectedAddresses = connectedAddresses,
+                connectionTargetAddresses = connectionTargetAddresses,
+                manuallyDisconnectedAddresses = manuallyDisconnectedAddresses,
+                batteryStatus = batteryStatus,
+                rssiStatus = rssiStatus,
+                firmwareStatus = firmwareStatus,
+                flashInfo = flashInfo,
+                deviceSyncStates = deviceSyncStates,
+                deviceRecordingPhases = deviceRecordingPhases,
+                delayedStopConfirmations = delayedStopConfirmations,
+                linkStatuses = linkStatuses,
+                recordingExportDecisions = recordingExportDecisions,
+                participantPreparingSlots = participantPreparingSlots,
+                participantConnectingSlots = participantConnectingSlots,
+                historyVisible = participant.slotId in visibleHistoryParticipantSlots,
+                historyLoading = participant.slotId in historyLoadingParticipantSlots,
+                historyQueued = participant.slotId in historyQueuedParticipantSlots,
+                isSyncing = isSyncing,
+                syncProgress = syncProgress,
+                syncTargetAddresses = syncTargetAddresses,
+                globalOperationLocked = globalOperationLocked,
+                exportInProgress = exportInProgress,
+                canPowerOffDevices = canPowerOffDevices,
+                onPowerOff = onPowerOffDevice,
+                onDisconnect = onDisconnectParticipant,
+                onConnect = onConnectParticipant,
+                onStopSync = onStopParticipantSync,
+                onStartSync = onStartParticipantSync,
+                onStartRecording = onStartParticipantRecording,
+                onStopRecording = onStopParticipantRecording,
+                onReadFiles = onReadParticipantFiles,
+                onExportRecording = onExportRecording,
+                onDismissRecordingExport = onDismissRecordingExport,
+            )
+        }
+
+        if (participants.isEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 132.dp)
+                    .background(AppSurfaceColor, RoundedCornerShape(8.dp))
+                    .border(1.dp, Border, RoundedCornerShape(8.dp))
+                    .padding(18.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                CaptureInlineButton(
+                    text = "添加采集分组",
+                    enabled = canAddParticipant,
+                    tone = CaptureButtonTone.Success,
+                    modifier = Modifier.width(180.dp),
+                    onClick = onAddParticipant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeSummaryMetric(label: String, value: String) {
+    Column(
+        modifier = Modifier.widthIn(min = 62.dp),
+        verticalArrangement = Arrangement.spacedBy(1.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = Muted,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun LandscapeParticipantCaptureRow(
+    index: Int,
+    participant: CaptureParticipantBinding,
+    sampleRateText: String,
+    connectedAddresses: Set<String>,
+    connectionTargetAddresses: Set<String>,
+    manuallyDisconnectedAddresses: Set<String>,
+    batteryStatus: Map<String, DotBatteryStatus>,
+    rssiStatus: Map<String, Int>,
+    firmwareStatus: Map<String, DotFirmwareStatus>,
+    flashInfo: Map<String, Pair<Int, Int>>,
+    deviceSyncStates: Map<String, Boolean>,
+    deviceRecordingPhases: Map<String, FlashRecordingPhase>,
+    delayedStopConfirmations: Set<String>,
+    linkStatuses: Map<String, DeviceLinkStatus>,
+    recordingExportDecisions: List<RecordingExportDecision>,
+    participantPreparingSlots: Set<String>,
+    participantConnectingSlots: Set<String>,
+    historyVisible: Boolean,
+    historyLoading: Boolean,
+    historyQueued: Boolean,
+    isSyncing: Boolean,
+    syncProgress: Int,
+    syncTargetAddresses: Set<String>,
+    globalOperationLocked: Boolean,
+    exportInProgress: Boolean,
+    canPowerOffDevices: Boolean,
+    onPowerOff: (String) -> Unit,
+    onDisconnect: (String) -> Unit,
+    onConnect: (String) -> Unit,
+    onStopSync: (String) -> Unit,
+    onStartSync: (String) -> Unit,
+    onStartRecording: (String) -> Unit,
+    onStopRecording: (String) -> Unit,
+    onReadFiles: (String) -> Unit,
+    onExportRecording: (String) -> Unit,
+    onDismissRecordingExport: (String) -> Unit,
+) {
+    val leftAddress = normalizeUiAddress(participant.leftDeviceId)
+    val rightAddress = normalizeUiAddress(participant.rightDeviceId)
+    val targets = setOf(leftAddress, rightAddress).filter { it.isNotBlank() }.toSet()
+    val connectedCount = targets.count { it in connectedAddresses }
+    val manuallyDisconnected =
+        targets.size == 2 && targets.all { it in manuallyDisconnectedAddresses }
+    val canExplicitConnect =
+        targets.size == 2 &&
+            connectedCount < 2 &&
+            (
+                manuallyDisconnected ||
+                    targets.any { it !in connectionTargetAddresses }
+                )
+    val groupSyncing =
+        isSyncing &&
+            syncTargetAddresses.isNotEmpty() &&
+            syncTargetAddresses == targets
+    val groupPreparing = participant.slotId in participantPreparingSlots
+    val groupConnecting = participant.slotId in participantConnectingSlots
+    val historyBusy = historyLoading || historyQueued
+    val recordingExportDecision = recordingExportDecisions
+        .filter { it.targetAddresses == targets }
+        .minByOrNull { it.id }
+    val phases = targets.map { deviceRecordingPhases[it] ?: FlashRecordingPhase.Idle }
+    val groupCommandBusy = phases.any {
+        it == FlashRecordingPhase.Starting || it == FlashRecordingPhase.Stopping
+    }
+    val groupPhase = when {
+        phases.any { it == FlashRecordingPhase.Starting } -> FlashRecordingPhase.Starting
+        phases.any { it == FlashRecordingPhase.Stopping } -> FlashRecordingPhase.Stopping
+        phases.any { it == FlashRecordingPhase.Recording } -> FlashRecordingPhase.Recording
+        else -> FlashRecordingPhase.Idle
+    }
+    val groupWaitingReconnect =
+        groupPhase != FlashRecordingPhase.Idle && connectedCount < targets.size
+    val groupStopConfirmationDelayed = targets.any { it in delayedStopConfirmations }
+    val groupSynced =
+        targets.size == 2 &&
+            (
+                groupPhase != FlashRecordingPhase.Idle ||
+                    targets.all { deviceSyncStates[it] == true }
+                )
+    val unsafeToStop = targets.any { target ->
+        linkStatuses[target]?.health in setOf(
+            DeviceLinkHealth.WeakSignal,
+            DeviceLinkHealth.WaitingReconnect,
+            DeviceLinkHealth.Error,
+        )
+    }
+    val canSafelyStop = canSafelyRequestStop(
+        groupPhase = groupPhase,
+        connectedCount = connectedCount,
+        targetCount = targets.size,
+        unsafeToStop = unsafeToStop,
+    )
+    val statusLabel = when {
+        groupPhase == FlashRecordingPhase.Starting -> "启动中"
+        groupPhase == FlashRecordingPhase.Recording && groupWaitingReconnect -> "等待回连"
+        groupPhase == FlashRecordingPhase.Recording && unsafeToStop -> "信号弱"
+        groupPhase == FlashRecordingPhase.Recording -> "录制中"
+        groupPhase == FlashRecordingPhase.Stopping ->
+            resolveStoppingStatusText(
+                waitingReconnect = groupWaitingReconnect,
+                confirmationDelayed = groupStopConfirmationDelayed,
+            )
+        groupSyncing -> "同步中 ${syncProgress.coerceIn(0, 100)}%"
+        groupConnecting -> "连接中"
+        groupPreparing -> "准备中"
+        groupSynced -> "可录制"
+        connectedCount == 2 -> "未同步"
+        connectedCount > 0 -> "连接中"
+        canExplicitConnect -> "未连接"
+        else -> "等待连接"
+    }
+    val statusTone = when {
+        groupPhase == FlashRecordingPhase.Recording && !unsafeToStop ->
+            CaptureStatusTone.Warning
+        groupPhase in setOf(
+            FlashRecordingPhase.Starting,
+            FlashRecordingPhase.Stopping,
+        ) || unsafeToStop || groupSyncing || groupConnecting || groupPreparing ->
+            CaptureStatusTone.Warning
+        groupSynced -> CaptureStatusTone.Signal
+        connectedCount == 2 -> CaptureStatusTone.Warning
+        else -> CaptureStatusTone.Muted
+    }
+    val accentColor = when (statusTone) {
+        CaptureStatusTone.Signal -> Green
+        CaptureStatusTone.Warning -> Orange
+        CaptureStatusTone.Danger -> Red
+        CaptureStatusTone.Muted -> Muted
+    }
+    val primaryAction = resolveParticipantPrimaryAction(
+        groupSynced = groupSynced,
+        groupPreparing = groupPreparing,
+        groupPhase = groupPhase,
+    )
+    val actionText = when (primaryAction) {
+        ParticipantPrimaryAction.Sync -> "同步"
+        ParticipantPrimaryAction.Preparing -> "准备中"
+        ParticipantPrimaryAction.Starting -> "启动中"
+        ParticipantPrimaryAction.Stop -> when {
+            groupWaitingReconnect -> "等待自动回连"
+            unsafeToStop -> "信号弱"
+            else -> "停止采集"
+        }
+        ParticipantPrimaryAction.Stopping ->
+            resolveStoppingStatusText(
+                waitingReconnect = groupWaitingReconnect,
+                confirmationDelayed = groupStopConfirmationDelayed,
+            )
+        ParticipantPrimaryAction.Start -> "开始采集"
+    }
+    val actionEnabled = when (primaryAction) {
+        ParticipantPrimaryAction.Sync ->
+            connectedCount == 2 &&
+                !historyBusy &&
+                !isSyncing &&
+                !globalOperationLocked &&
+                !exportInProgress &&
+                !groupCommandBusy
+        ParticipantPrimaryAction.Start ->
+            !groupPreparing &&
+                !historyBusy &&
+                recordingExportDecision == null &&
+                connectedCount == 2 &&
+                !globalOperationLocked &&
+                !groupCommandBusy &&
+                !exportInProgress
+        ParticipantPrimaryAction.Stop ->
+            canSafelyStop &&
+                !historyBusy &&
+                !globalOperationLocked &&
+                !groupCommandBusy
+        else -> false
+    }
+    val actionTone = when (primaryAction) {
+        ParticipantPrimaryAction.Sync -> CaptureButtonTone.Subtle
+        ParticipantPrimaryAction.Stop,
+        ParticipantPrimaryAction.Stopping -> CaptureButtonTone.Danger
+        else -> CaptureButtonTone.Success
+    }
+    val invokePrimaryAction = {
+        when (primaryAction) {
+            ParticipantPrimaryAction.Sync -> onStartSync(participant.slotId)
+            ParticipantPrimaryAction.Stop -> onStopRecording(participant.slotId)
+            ParticipantPrimaryAction.Start -> onStartRecording(participant.slotId)
+            else -> Unit
+        }
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 108.dp)
+            .background(AppSurfaceColor, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp)),
+    ) {
+        Box(
+            modifier = Modifier
+                .width(5.dp)
+                .fillMaxHeight()
+                .background(accentColor),
+        )
+        Column(
+            modifier = Modifier
+                .weight(1.05f)
+                .fillMaxHeight()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = (index + 1).toString().padStart(2, '0'),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Muted,
+                )
+                Text(
+                    text = participant.athleteName.ifBlank { "运动员 ${index + 1}" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                LandscapeStatusChip(text = statusLabel, tone = statusTone)
+            }
+            Text(
+                text = if (connectedCount > 0) {
+                    "左右脚 $connectedCount / 2 · $sampleRateText"
+                } else {
+                    "左右脚 $connectedCount / 2 · 采样率 —"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+                maxLines = 1,
+            )
+        }
+        LandscapeVerticalDivider()
+        LandscapeDeviceColumn(
+            sideLabel = "左脚",
+            deviceId = participant.leftDeviceId,
+            sideColor = Orange,
+            connected = leftAddress in connectedAddresses,
+            syncing = groupSyncing,
+            recording = deviceRecordingPhases[leftAddress] == FlashRecordingPhase.Recording,
+            battery = batteryStatus[leftAddress],
+            rssi = rssiStatus[leftAddress],
+            firmware = firmwareStatus[leftAddress],
+            flash = flashInfo[leftAddress],
+            powerOffEnabled = canPowerOffDevices && !historyBusy,
+            onPowerOff = { onPowerOff(participant.leftDeviceId) },
+            modifier = Modifier.weight(2.15f),
+        )
+        LandscapeVerticalDivider()
+        LandscapeDeviceColumn(
+            sideLabel = "右脚",
+            deviceId = participant.rightDeviceId,
+            sideColor = Green,
+            connected = rightAddress in connectedAddresses,
+            syncing = groupSyncing,
+            recording = deviceRecordingPhases[rightAddress] == FlashRecordingPhase.Recording,
+            battery = batteryStatus[rightAddress],
+            rssi = rssiStatus[rightAddress],
+            firmware = firmwareStatus[rightAddress],
+            flash = flashInfo[rightAddress],
+            powerOffEnabled = canPowerOffDevices && !historyBusy,
+            onPowerOff = { onPowerOff(participant.rightDeviceId) },
+            modifier = Modifier.weight(2.15f),
+        )
+        LandscapeVerticalDivider()
+        Column(
+            modifier = Modifier
+                .weight(2.35f)
+                .fillMaxHeight()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Text(
+                text = statusLabel,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = accentColor,
+                maxLines = 1,
+            )
+            if (groupSyncing) {
+                LinearProgressIndicator(
+                    progress = { syncProgress.coerceIn(0, 100) / 100f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp),
+                    color = Orange,
+                    trackColor = Border.copy(alpha = 0.55f),
+                )
+            }
+            when {
+                groupSyncing -> {
+                    CaptureInlineButton(
+                        text = "取消同步",
+                        enabled = true,
+                        tone = CaptureButtonTone.Subtle,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { onStopSync(participant.slotId) },
+                    )
+                }
+                groupConnecting && groupPhase == FlashRecordingPhase.Idle -> {
+                    CaptureInlineButton(
+                        text = "连接中",
+                        enabled = false,
+                        tone = CaptureButtonTone.Subtle,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {},
+                    )
+                }
+                canExplicitConnect && groupPhase == FlashRecordingPhase.Idle -> {
+                    CaptureInlineButton(
+                        text = "连接运动员设备",
+                        enabled =
+                            !globalOperationLocked &&
+                                !groupCommandBusy &&
+                                !exportInProgress &&
+                                !isSyncing,
+                        tone = CaptureButtonTone.Subtle,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { onConnect(participant.slotId) },
+                    )
+                }
+                connectedCount == 0 && groupPhase == FlashRecordingPhase.Idle -> {
+                    CaptureInlineButton(
+                        text = "等待自动回连",
+                        enabled = false,
+                        tone = CaptureButtonTone.Subtle,
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {},
+                    )
+                }
+                else -> {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        CaptureInlineButton(
+                            text = actionText,
+                            enabled = actionEnabled,
+                            tone = actionTone,
+                            modifier = Modifier.weight(1f),
+                            onClick = invokePrimaryAction,
+                        )
+                        if (connectedCount == 2 && groupPhase == FlashRecordingPhase.Idle) {
+                            CaptureInlineButton(
+                                text = when {
+                                    historyLoading -> "读取中"
+                                    historyQueued -> "等待读取"
+                                    historyVisible -> "收起历史"
+                                    else -> "历史文件"
+                                },
+                                enabled =
+                                    !historyBusy &&
+                                    !globalOperationLocked &&
+                                        !groupCommandBusy &&
+                                        !exportInProgress &&
+                                        !isSyncing,
+                                tone = CaptureButtonTone.Subtle,
+                                modifier = Modifier.width(92.dp),
+                                onClick = { onReadFiles(participant.slotId) },
+                            )
+                        }
+                        CaptureInlineButton(
+                            text = "断开",
+                            enabled =
+                                connectedCount > 0 &&
+                                    groupPhase == FlashRecordingPhase.Idle &&
+                                    !historyBusy &&
+                                    !globalOperationLocked &&
+                                    !groupCommandBusy &&
+                                    !exportInProgress &&
+                                    !isSyncing,
+                            tone = CaptureButtonTone.DangerSubtle,
+                            modifier = Modifier.width(76.dp),
+                            onClick = { onDisconnect(participant.slotId) },
+                        )
+                    }
+                    if (groupSynced && groupPhase == FlashRecordingPhase.Idle) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            TextButton(
+                                onClick = { onStopSync(participant.slotId) },
+                                enabled =
+                                    connectedCount == 2 &&
+                                        !historyBusy &&
+                                        !globalOperationLocked &&
+                                        !groupCommandBusy &&
+                                        !exportInProgress &&
+                                        !isSyncing,
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                            ) {
+                                Text(text = "解除同步", color = Muted)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (recordingExportDecision != null) {
+                ParticipantRecordingExportPanel(
+                    decision = recordingExportDecision,
+                    exportInProgress = exportInProgress,
+                    onExport = { onExportRecording(recordingExportDecision.id) },
+                    onDismiss = { onDismissRecordingExport(recordingExportDecision.id) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeStatusChip(
+    text: String,
+    tone: CaptureStatusTone,
+) {
+    val dotColor = when (tone) {
+        CaptureStatusTone.Signal -> Green
+        CaptureStatusTone.Warning -> Orange
+        CaptureStatusTone.Danger -> Red
+        CaptureStatusTone.Muted -> Muted
+    }
+    Row(
+        modifier = Modifier
+            .background(AppSurfaceColor, RoundedCornerShape(999.dp))
+            .border(1.dp, Border, RoundedCornerShape(999.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(5.dp)
+                .background(dotColor, RoundedCornerShape(999.dp)),
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun LandscapeVerticalDivider() {
+    Box(
+        modifier = Modifier
+            .padding(vertical = 10.dp)
+            .width(1.dp)
+            .fillMaxHeight()
+            .background(Border.copy(alpha = 0.8f)),
+    )
+}
+
+@Composable
+private fun LandscapeDeviceColumn(
+    sideLabel: String,
+    deviceId: String,
+    sideColor: Color,
+    connected: Boolean,
+    syncing: Boolean,
+    recording: Boolean,
+    battery: DotBatteryStatus?,
+    rssi: Int?,
+    firmware: DotFirmwareStatus?,
+    flash: Pair<Int, Int>?,
+    powerOffEnabled: Boolean,
+    onPowerOff: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val flashRatio = flash?.let { (used, total) ->
+        if (total > 0) (used.toFloat() / total.toFloat()).coerceIn(0f, 1f) else null
+    }
+    val flashPercent = flashRatio?.let { (it * 100f).toInt().coerceIn(0, 100) }
+    val batteryPercent = battery?.percentage?.coerceIn(0, 100)
+    val hasLiveContext = connected || syncing
+
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = sideLabel,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = sideColor,
+                )
+                androidx.compose.material3.IconButton(
+                    onClick = onPowerOff,
+                    enabled = connected && powerOffEnabled,
+                    modifier = Modifier.size(24.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.PowerSettingsNew,
+                        contentDescription = "关闭${sideLabel}设备",
+                        tint = if (connected && powerOffEnabled) Red else Muted.copy(alpha = 0.4f),
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+            }
+            Text(
+                text = deviceId.ifBlank { "未配置" },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (hasLiveContext) MaterialTheme.colorScheme.onSurface else Muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = when {
+                    recording -> "录制中 · ${rssi?.let { "$it dB" } ?: "信号 —"} · 固件 ${firmware?.version ?: "—"}"
+                    connected -> "已连接 · ${rssi?.let { "$it dB" } ?: "信号 —"} · 固件 ${firmware?.version ?: "—"}"
+                    syncing -> "同步回连中"
+                    deviceId.isBlank() -> "未配置设备"
+                    else -> "未连接 · 设备配置已保存"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            LandscapeDeviceMetric(
+                label = "电量",
+                value = batteryPercent?.let { "$it%" } ?: "—",
+                progress = batteryPercent?.div(100f),
+                color = sideColor,
+                modifier = Modifier.weight(1f),
+            )
+            LandscapeDeviceMetric(
+                label = "Flash",
+                value = flashPercent?.let {
+                    if (recording) "约 $it%" else "$it%"
+                } ?: "—",
+                progress = flashRatio,
+                color = if (recording) Orange else Muted,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun LandscapeDeviceMetric(
+    label: String,
+    value: String,
+    progress: Float?,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = Muted,
+            )
+            Text(
+                text = value,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = if (progress == null) Muted else MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .background(Border.copy(alpha = 0.7f), RoundedCornerShape(999.dp)),
+        ) {
+            if (progress != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(progress.coerceIn(0f, 1f))
+                        .fillMaxHeight()
+                        .background(color, RoundedCornerShape(999.dp)),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LandscapeSettingsDialog(
+    title: String,
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 680.dp)
+                .background(AppSurfaceColor, RoundedCornerShape(10.dp))
+                .border(1.dp, Border, RoundedCornerShape(10.dp))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                TextButton(onClick = onDismiss) {
+                    Text(text = "关闭", color = Muted)
+                }
+            }
+            HorizontalDivider(color = Border)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                content = content,
+            )
         }
     }
 }
@@ -1587,13 +2625,11 @@ private fun CaptureStatusMetric(
 @Composable
 private fun CaptureStatusSummary(
     participantText: String,
-    deviceText: String,
     syncText: String,
     sampleRateText: String,
 ) {
     val items = listOf(
         "运动员" to participantText,
-        "设备" to deviceText,
         "同步" to syncText,
         "采样" to sampleRateText,
     )
@@ -1604,6 +2640,19 @@ private fun CaptureStatusSummary(
             .border(1.dp, Border.copy(alpha = 0.75f), RoundedCornerShape(8.dp)),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        Text(
+            text = "工作台",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        Box(
+            modifier = Modifier
+                .width(1.dp)
+                .height(30.dp)
+                .background(Border.copy(alpha = 0.72f)),
+        )
         items.forEachIndexed { index, item ->
             CaptureStatusMetric(
                 label = item.first,
@@ -1631,12 +2680,17 @@ private fun ParticipantCaptureControlPanel(
     batteryStatus: Map<String, DotBatteryStatus>,
     rssiStatus: Map<String, Int>,
     firmwareStatus: Map<String, DotFirmwareStatus>,
+    flashInfo: Map<String, Pair<Int, Int>>,
     deviceSyncStates: Map<String, Boolean>,
     deviceRecordingPhases: Map<String, FlashRecordingPhase>,
     delayedStopConfirmations: Set<String>,
     linkStatuses: Map<String, DeviceLinkStatus>,
     recordingExportDecisions: List<RecordingExportDecision>,
     participantPreparingSlots: Set<String>,
+    participantConnectingSlots: Set<String>,
+    visibleHistoryParticipantSlots: Set<String>,
+    historyLoadingParticipantSlots: Set<String>,
+    historyQueuedParticipantSlots: Set<String>,
     isSyncing: Boolean,
     syncProgress: Int,
     syncTargetAddresses: Set<String>,
@@ -1678,6 +2732,11 @@ private fun ParticipantCaptureControlPanel(
                     syncTargetAddresses.isNotEmpty() &&
                     syncTargetAddresses == targets
             val groupPreparing = participant.slotId in participantPreparingSlots
+            val groupConnecting = participant.slotId in participantConnectingSlots
+            val historyVisible = participant.slotId in visibleHistoryParticipantSlots
+            val historyLoading = participant.slotId in historyLoadingParticipantSlots
+            val historyQueued = participant.slotId in historyQueuedParticipantSlots
+            val historyBusy = historyLoading || historyQueued
             val recordingExportDecision = recordingExportDecisions
                 .filter { it.targetAddresses == targets }
                 .minByOrNull { it.id }
@@ -1728,6 +2787,7 @@ private fun ParticipantCaptureControlPanel(
                         confirmationDelayed = groupStopConfirmationDelayed,
                     )
                 groupSyncing -> "同步中 $boundedProgress%"
+                groupConnecting -> "连接中"
                 groupPreparing -> "准备中"
                 groupSynced -> "已同步"
                 connectedCount == 2 -> "未同步"
@@ -1741,7 +2801,8 @@ private fun ParticipantCaptureControlPanel(
                 groupPhase in setOf(
                     FlashRecordingPhase.Starting,
                     FlashRecordingPhase.Stopping,
-                ) || unsafeToStop || groupSyncing || groupPreparing -> CaptureStatusTone.Warning
+                ) || unsafeToStop || groupSyncing || groupConnecting || groupPreparing ->
+                    CaptureStatusTone.Warning
                 groupSynced -> CaptureStatusTone.Signal
                 connectedCount == 2 -> CaptureStatusTone.Warning
                 else -> CaptureStatusTone.Muted
@@ -1812,10 +2873,14 @@ private fun ParticipantCaptureControlPanel(
                             sideColor = Orange,
                             connected = participant.leftDeviceId in connectedAddresses,
                             syncing = groupSyncing,
-                            battery = batteryStatus[participant.leftDeviceId],
-                            rssi = rssiStatus[participant.leftDeviceId],
-                            firmware = firmwareStatus[participant.leftDeviceId],
-                            powerOffEnabled = canPowerOffDevices,
+                            battery = batteryStatus[normalizeUiAddress(participant.leftDeviceId)],
+                            rssi = rssiStatus[normalizeUiAddress(participant.leftDeviceId)],
+                            firmware = firmwareStatus[normalizeUiAddress(participant.leftDeviceId)],
+                            flash = flashInfo[normalizeUiAddress(participant.leftDeviceId)],
+                            recording =
+                                deviceRecordingPhases[normalizeUiAddress(participant.leftDeviceId)] ==
+                                    FlashRecordingPhase.Recording,
+                            powerOffEnabled = canPowerOffDevices && !historyBusy,
                             onPowerOff = { onPowerOff(participant.leftDeviceId) },
                             modifier = Modifier.weight(1f),
                         )
@@ -1825,10 +2890,14 @@ private fun ParticipantCaptureControlPanel(
                             sideColor = Green,
                             connected = participant.rightDeviceId in connectedAddresses,
                             syncing = groupSyncing,
-                            battery = batteryStatus[participant.rightDeviceId],
-                            rssi = rssiStatus[participant.rightDeviceId],
-                            firmware = firmwareStatus[participant.rightDeviceId],
-                            powerOffEnabled = canPowerOffDevices,
+                            battery = batteryStatus[normalizeUiAddress(participant.rightDeviceId)],
+                            rssi = rssiStatus[normalizeUiAddress(participant.rightDeviceId)],
+                            firmware = firmwareStatus[normalizeUiAddress(participant.rightDeviceId)],
+                            flash = flashInfo[normalizeUiAddress(participant.rightDeviceId)],
+                            recording =
+                                deviceRecordingPhases[normalizeUiAddress(participant.rightDeviceId)] ==
+                                    FlashRecordingPhase.Recording,
+                            powerOffEnabled = canPowerOffDevices && !historyBusy,
                             onPowerOff = { onPowerOff(participant.rightDeviceId) },
                             modifier = Modifier.weight(1f),
                         )
@@ -1877,12 +2946,14 @@ private fun ParticipantCaptureControlPanel(
                     val actionEnabled = when (primaryAction) {
                         ParticipantPrimaryAction.Sync ->
                             connectedCount == 2 &&
+                                !historyBusy &&
                                 !isSyncing &&
                                 !globalOperationLocked &&
                                 !exportInProgress &&
                                 !groupCommandBusy
                         ParticipantPrimaryAction.Start ->
                             !groupPreparing &&
+                                !historyBusy &&
                                 recordingExportDecision == null &&
                                 connectedCount == 2 &&
                                 !globalOperationLocked &&
@@ -1890,6 +2961,7 @@ private fun ParticipantCaptureControlPanel(
                                 !exportInProgress
                         ParticipantPrimaryAction.Stop ->
                             canSafelyStop &&
+                                !historyBusy &&
                                 !globalOperationLocked &&
                                 !groupCommandBusy
                         else -> false
@@ -1933,6 +3005,17 @@ private fun ParticipantCaptureControlPanel(
                             )
                         }
                     } else if (
+                        groupConnecting &&
+                        groupPhase == FlashRecordingPhase.Idle
+                    ) {
+                        CaptureInlineButton(
+                            text = "连接中",
+                            enabled = false,
+                            tone = CaptureButtonTone.Subtle,
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {},
+                        )
+                    } else if (
                         canExplicitConnect &&
                         groupPhase == FlashRecordingPhase.Idle
                     ) {
@@ -1974,7 +3057,8 @@ private fun ParticipantCaptureControlPanel(
                             CaptureInlineButton(
                                 text = "断开",
                                 enabled =
-                                    !globalOperationLocked &&
+                                    !historyBusy &&
+                                        !globalOperationLocked &&
                                         !groupCommandBusy &&
                                         !exportInProgress &&
                                         !isSyncing,
@@ -1987,6 +3071,7 @@ private fun ParticipantCaptureControlPanel(
                                     text = "解除同步",
                                     enabled =
                                         connectedCount == 2 &&
+                                            !historyBusy &&
                                             !globalOperationLocked &&
                                             !groupCommandBusy &&
                                             !exportInProgress &&
@@ -1998,8 +3083,14 @@ private fun ParticipantCaptureControlPanel(
                             }
                             if (connectedCount == 2) {
                                 CaptureInlineButton(
-                                    text = "历史文件",
+                                    text = when {
+                                        historyLoading -> "读取中"
+                                        historyQueued -> "等待读取"
+                                        historyVisible -> "收起历史"
+                                        else -> "历史文件"
+                                    },
                                     enabled =
+                                        !historyBusy &&
                                         groupPhase == FlashRecordingPhase.Idle &&
                                         !globalOperationLocked &&
                                         !groupCommandBusy &&
@@ -2094,11 +3185,20 @@ private fun ParticipantDeviceTile(
     battery: DotBatteryStatus?,
     rssi: Int?,
     firmware: DotFirmwareStatus?,
+    flash: Pair<Int, Int>?,
+    recording: Boolean,
     powerOffEnabled: Boolean,
     onPowerOff: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hasLiveContext = connected || syncing
+    val flashPercent = flash?.let { (used, total) ->
+        if (total > 0) {
+            ((used.toFloat() / total.toFloat()).coerceIn(0f, 1f) * 100f).toInt()
+        } else {
+            null
+        }
+    }
     val shape = RoundedCornerShape(7.dp)
     Row(
         modifier = modifier
@@ -2144,7 +3244,8 @@ private fun ParticipantDeviceTile(
             )
             Text(
                 text = when {
-                    connected -> "固件 ${firmware?.version ?: "—"}"
+                    connected ->
+                        "${rssi?.let { "$it dB" } ?: "信号 —"} · 固件 ${firmware?.version ?: "—"}"
                     syncing -> "同步回连中"
                     else -> "未连接"
                 },
@@ -2158,12 +3259,24 @@ private fun ParticipantDeviceTile(
             horizontalAlignment = Alignment.End,
         ) {
             Text(
-                text = if (hasLiveContext) "${battery?.percentage ?: "—"}%" else "—",
+                text = if (hasLiveContext) {
+                    "电量 ${battery?.percentage?.let { "$it%" } ?: "—"}"
+                } else {
+                    "电量 —"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = Muted,
             )
             Text(
-                text = if (hasLiveContext && rssi != null) "$rssi dB" else "—",
+                text = if (hasLiveContext) {
+                    "Flash ${
+                        flashPercent?.let { percent ->
+                            if (recording) "约 $percent%" else "$percent%"
+                        } ?: "—"
+                    }"
+                } else {
+                    "Flash —"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = Muted,
             )
@@ -2193,6 +3306,9 @@ private fun ParticipantDeviceTile(
 @Composable
 private fun CaptureAdvancedPanel(
     expanded: Boolean,
+    showHeader: Boolean = true,
+    showDeviceStatus: Boolean = true,
+    framed: Boolean = true,
     connectedDevices: List<String>,
     recordingStates: Map<String, DotRecordingState>,
     recordingPhase: FlashRecordingPhase,
@@ -2204,44 +3320,69 @@ private fun CaptureAdvancedPanel(
     syncOutputRate: Int,
     canEditSyncParams: Boolean,
     recordingLocked: Boolean,
-    operationReady: Boolean,
+    canEraseFlash: Boolean,
     eraseTaskProgress: EraseTaskProgress,
     syncLog: List<String>,
     onToggleExpanded: () -> Unit,
     onSetRate: (Int) -> Unit,
     onEraseFlash: () -> Unit
 ) {
+    var showEraseConfirmation by remember { mutableStateOf(false) }
+    var storageManagementExpanded by rememberSaveable { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(AppSurfaceColor, RoundedCornerShape(10.dp))
-            .border(1.dp, Border, RoundedCornerShape(10.dp))
-            .padding(12.dp),
+            .then(
+                if (framed) {
+                    Modifier
+                        .background(AppSurfaceColor, RoundedCornerShape(10.dp))
+                        .border(1.dp, Border, RoundedCornerShape(10.dp))
+                        .padding(12.dp)
+                } else {
+                    Modifier
+                },
+            ),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onToggleExpanded),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "高级设置",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = if (expanded) "收起" else "展开",
-                style = MaterialTheme.typography.labelMedium,
-                color = Muted
-            )
+        if (showHeader) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleExpanded),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "高级设置",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (expanded) "收起" else "展开",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Muted
+                )
+            }
         }
 
         if (!expanded) return@Column
 
-        if (inRecordingMode && (flashInfo.isNotEmpty() || recordingStates.isNotEmpty() || notificationReady.isNotEmpty())) {
+        if (!showHeader) {
+            Text(
+                text = "采集参数",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+
+        if (
+            showDeviceStatus &&
+            inRecordingMode &&
+            (flashInfo.isNotEmpty() || recordingStates.isNotEmpty() || notificationReady.isNotEmpty())
+        ) {
             Text(
                 text = "离线存储 / SDK 状态",
                 style = MaterialTheme.typography.labelMedium,
@@ -2269,17 +3410,59 @@ private fun CaptureAdvancedPanel(
             )
         }
 
+        HorizontalDivider(color = Border.copy(alpha = 0.7f))
+        Text(
+            text = "存储空间",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.SemiBold,
+        )
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            CaptureInlineButton(
-                text = if (eraseTaskProgress.isErasing) "擦除中" else "擦除 Flash",
-                enabled = operationReady && !recordingLocked && !eraseTaskProgress.isErasing,
-                tone = CaptureButtonTone.Danger,
-                modifier = Modifier.fillMaxWidth(),
-                onClick = onEraseFlash
+            Text(
+                text = "管理已连接设备中的历史录制",
+                style = MaterialTheme.typography.bodySmall,
+                color = Muted,
+                modifier = Modifier.weight(1f),
             )
+            Spacer(modifier = Modifier.width(12.dp))
+            CaptureInlineButton(
+                text = if (storageManagementExpanded) "收起" else "存储管理",
+                enabled = !eraseTaskProgress.isErasing,
+                tone = CaptureButtonTone.Subtle,
+                modifier = Modifier.width(150.dp),
+                onClick = {
+                    storageManagementExpanded = !storageManagementExpanded
+                },
+            )
+        }
+        if (storageManagementExpanded) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AppCardColor, RoundedCornerShape(8.dp))
+                    .border(1.dp, Border.copy(alpha = 0.75f), RoundedCornerShape(8.dp))
+                    .padding(10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "清除全部历史录制",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Muted,
+                    modifier = Modifier.weight(1f),
+                )
+                CaptureInlineButton(
+                    text = if (eraseTaskProgress.isErasing) "擦除中" else "擦除 Flash",
+                    enabled = canEraseFlash && !recordingLocked && !eraseTaskProgress.isErasing,
+                    tone = CaptureButtonTone.Danger,
+                    modifier = Modifier.width(132.dp),
+                    onClick = { showEraseConfirmation = true },
+                )
+            }
         }
         if (eraseTaskProgress.totalDevices > 0) {
             EraseProgressSummary(eraseTaskProgress)
@@ -2288,6 +3471,40 @@ private fun CaptureAdvancedPanel(
         if (syncLog.isNotEmpty()) {
             CaptureCompactLog(logs = syncLog.takeLast(4))
         }
+    }
+
+    if (showEraseConfirmation) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showEraseConfirmation = false },
+            title = {
+                Text(
+                    text = "确认擦除 Flash",
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            },
+            text = {
+                Text(
+                    text = "将清除所有已连接设备中的历史录制文件，擦除后无法恢复。",
+                    color = Muted,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showEraseConfirmation = false
+                        onEraseFlash()
+                    },
+                ) {
+                    Text(text = "确认擦除", color = Red)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEraseConfirmation = false }) {
+                    Text(text = "取消")
+                }
+            },
+            containerColor = AppSurfaceColor,
+        )
     }
 }
 
@@ -2532,6 +3749,586 @@ private fun OfflineFileSelectorSummary(
 }
 
 @Composable
+private fun ParticipantHistoryPanels(
+    participants: List<CaptureParticipantBinding>,
+    visibleSlots: Set<String>,
+    loadingSlots: Set<String>,
+    queuedSlots: Set<String>,
+    requestErrors: Map<String, String>,
+    fileInfoReadStatuses: Map<String, FileInfoReadStatus>,
+    connectedAddresses: Set<String>,
+    fileList: Map<String, List<DotRecordingFileInfo>>,
+    selectedFileKeys: Set<String>,
+    exportTaskProgress: ExportTaskProgress,
+    operationReady: Boolean,
+    globalHistoryOperationActive: Boolean,
+    onToggleFileSelection: (String, Int) -> Unit,
+    onSelectAll: (String) -> Unit,
+    onClear: (String) -> Unit,
+    onExport: (String) -> Unit,
+    onRetry: (String) -> Unit,
+    onStopExport: () -> Unit,
+) {
+    val visibleParticipants = participants.filter { it.slotId in visibleSlots }
+    if (visibleParticipants.isEmpty()) return
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        visibleParticipants.forEachIndexed { index, participant ->
+            val leftAddress = normalizeUiAddress(participant.leftDeviceId)
+            val rightAddress = normalizeUiAddress(participant.rightDeviceId)
+            val targets = setOf(leftAddress, rightAddress)
+            val participantFiles = fileList.filterKeys { it in targets }
+            val participantKeys = participantFiles.flatMap { (address, files) ->
+                files.map { file -> "$address-${file.fileId}" }
+            }.toSet()
+            val scopedProgress = exportTaskProgress.forAddresses(targets)
+            val loading = participant.slotId in loadingSlots
+            val queued = participant.slotId in queuedSlots
+            val requestError = requestErrors[participant.slotId]
+            val fileCount = participantFiles.values.sumOf { it.size }
+            val allConnected = targets.all { it in connectedAddresses }
+            val leftStatus = fileInfoReadStatuses[leftAddress]
+            val rightStatus = fileInfoReadStatuses[rightAddress]
+            val hasDeviceFailure = listOf(leftStatus, rightStatus).any {
+                it?.phase == FileInfoReadPhase.Failed
+            }
+            val readIncomplete =
+                requestError != null ||
+                    hasDeviceFailure ||
+                    targets.any {
+                        fileInfoReadStatuses[it]?.phase !in setOf(
+                            FileInfoReadPhase.Ready,
+                            FileInfoReadPhase.Empty,
+                        )
+                    } ||
+                    !allConnected
+            val scopedExportActive =
+                scopedProgress.hasPendingFiles || scopedProgress.isExporting
+            val waitingForOtherExport =
+                exportTaskProgress.hasPendingFiles && !scopedExportActive
+            val participantOperationReady =
+                operationReady &&
+                    allConnected &&
+                    !loading &&
+                    !queued &&
+                    !globalHistoryOperationActive
+            val selectableAddresses = targets.filterTo(mutableSetOf()) {
+                it in connectedAddresses &&
+                    fileInfoReadStatuses[it]?.phase == FileInfoReadPhase.Ready
+            }
+
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "${(participants.indexOf(participant) + 1).toString().padStart(2, '0')}  ${
+                            participant.athleteName.ifBlank { "运动员 ${index + 1}" }
+                        }",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = when {
+                            queued -> "等待读取"
+                            loading -> "正在读取"
+                            waitingForOtherExport -> "等待其他组导出"
+                            fileCount > 0 -> "$fileCount 个文件"
+                            else -> "暂无文件"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (loading || queued || waitingForOtherExport) Orange else Muted,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    HistoryDeviceReadStatus(
+                        label = "左脚",
+                        address = leftAddress,
+                        fileCount = participantFiles[leftAddress].orEmpty().size,
+                        connected = leftAddress in connectedAddresses,
+                        queued = queued,
+                        loading = loading,
+                        status = leftStatus,
+                        modifier = Modifier.weight(1f),
+                    )
+                    HistoryDeviceReadStatus(
+                        label = "右脚",
+                        address = rightAddress,
+                        fileCount = participantFiles[rightAddress].orEmpty().size,
+                        connected = rightAddress in connectedAddresses,
+                        queued = queued,
+                        loading = loading,
+                        status = rightStatus,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+
+                if (requestError != null || hasDeviceFailure || !allConnected) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                if (allConnected) Orange.copy(alpha = 0.10f)
+                                else Red.copy(alpha = 0.10f),
+                                RoundedCornerShape(8.dp),
+                            )
+                            .border(
+                                1.dp,
+                                if (allConnected) Orange.copy(alpha = 0.45f)
+                                else Red.copy(alpha = 0.45f),
+                                RoundedCornerShape(8.dp),
+                            )
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            text = when {
+                                !allConnected -> "设备已断开，缓存文件仅供查看，回连后可导出"
+                                requestError != null -> requestError
+                                else -> "左右脚文件列表不完整，请重试或明确选择单侧文件"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (allConnected) Orange else Red,
+                            modifier = Modifier.weight(1f),
+                        )
+                        CaptureInlineButton(
+                            text = "重新读取",
+                            enabled = allConnected && !loading && !queued && operationReady,
+                            tone = CaptureButtonTone.Subtle,
+                            modifier = Modifier.width(104.dp),
+                            onClick = { onRetry(participant.slotId) },
+                        )
+                    }
+                }
+
+                when {
+                    queued -> {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(999.dp)),
+                            color = Orange,
+                            trackColor = Border.copy(alpha = 0.45f),
+                        )
+                    }
+                    loading -> {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(999.dp)),
+                            color = Orange,
+                            trackColor = Border.copy(alpha = 0.45f),
+                        )
+                    }
+                    fileCount == 0 && !hasDeviceFailure && requestError == null -> {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(AppSurfaceColor, RoundedCornerShape(8.dp))
+                                .border(1.dp, Border, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "左右脚设备中暂无历史录制文件",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Muted,
+                            )
+                        }
+                    }
+                    else -> {
+                        ParticipantHistorySessionPicker(
+                            leftAddress = leftAddress,
+                            rightAddress = rightAddress,
+                            leftFiles = participantFiles[leftAddress].orEmpty(),
+                            rightFiles = participantFiles[rightAddress].orEmpty(),
+                            selectedFileKeys = selectedFileKeys.intersect(participantKeys),
+                            exportTaskProgress = scopedProgress,
+                            operationReady = participantOperationReady,
+                            allowImplicitExportAll = !readIncomplete,
+                            waitingMessage = when {
+                                waitingForOtherExport -> "等待其他组导出完成"
+                                !allConnected -> "设备回连后可导出"
+                                readIncomplete && selectedFileKeys.intersect(participantKeys).isEmpty() ->
+                                    "文件列表不完整，请先明确选择需要导出的文件"
+                                else -> null
+                            },
+                            selectableAddresses = selectableAddresses,
+                            onToggleFileSelection = onToggleFileSelection,
+                            onSelectAll = { onSelectAll(participant.slotId) },
+                            onClear = { onClear(participant.slotId) },
+                            onExport = { onExport(participant.slotId) },
+                            onStopExport = onStopExport,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ParticipantHistorySessionPicker(
+    leftAddress: String,
+    rightAddress: String,
+    leftFiles: List<DotRecordingFileInfo>,
+    rightFiles: List<DotRecordingFileInfo>,
+    selectedFileKeys: Set<String>,
+    exportTaskProgress: ExportTaskProgress,
+    operationReady: Boolean,
+    allowImplicitExportAll: Boolean,
+    waitingMessage: String?,
+    selectableAddresses: Set<String>,
+    onToggleFileSelection: (String, Int) -> Unit,
+    onSelectAll: () -> Unit,
+    onClear: () -> Unit,
+    onExport: () -> Unit,
+    onStopExport: () -> Unit,
+) {
+    val sessions = remember(leftFiles, rightFiles) {
+        pairParticipantHistoryFiles(leftFiles, rightFiles)
+    }
+    val exporting = exportTaskProgress.hasPendingFiles
+    val exportButtonText = when {
+        selectedFileKeys.isNotEmpty() -> "导出所选 (${selectedFileKeys.size})"
+        allowImplicitExportAll -> "导出全部"
+        else -> "请选择文件"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(AppSurfaceColor, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (waitingMessage != null) {
+            Text(
+                text = waitingMessage,
+                style = MaterialTheme.typography.bodySmall,
+                color = Orange,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CaptureToolbarGroup {
+                CaptureToolbarButton(
+                    text = "全选",
+                    enabled = operationReady && selectableAddresses.isNotEmpty(),
+                    tone = CaptureButtonTone.Subtle,
+                    onClick = onSelectAll,
+                )
+                CaptureToolbarButton(
+                    text = "清空",
+                    enabled = operationReady && selectedFileKeys.isNotEmpty(),
+                    tone = CaptureButtonTone.Subtle,
+                    onClick = onClear,
+                )
+            }
+            if (exporting) {
+                CaptureToolbarButton(
+                    text = "停止",
+                    tone = CaptureButtonTone.Danger,
+                    onClick = onStopExport,
+                )
+            } else {
+                CaptureToolbarButton(
+                    text = exportButtonText,
+                    enabled =
+                        operationReady &&
+                            sessions.isNotEmpty() &&
+                            (allowImplicitExportAll || selectedFileKeys.isNotEmpty()),
+                    tone = CaptureButtonTone.Success,
+                    onClick = onExport,
+                )
+            }
+        }
+
+        if (exporting) {
+            val ratio = exportOverallProgressRatio(exportTaskProgress)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "正在导出",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Orange,
+                )
+                Text(
+                    text = formatExportPercent(ratio),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Orange,
+                )
+            }
+            LinearProgressIndicator(
+                progress = { ratio },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(999.dp)),
+                color = Orange,
+                trackColor = Border.copy(alpha = 0.45f),
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 260.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            sessions.forEach { session ->
+                HistorySessionRow(
+                    session = session,
+                    leftAddress = leftAddress,
+                    rightAddress = rightAddress,
+                    selectedFileKeys = selectedFileKeys,
+                    selectableAddresses = selectableAddresses,
+                    exportTaskProgress = exportTaskProgress,
+                    operationReady = operationReady,
+                    onToggleFileSelection = onToggleFileSelection,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistorySessionRow(
+    session: ParticipantHistorySession,
+    leftAddress: String,
+    rightAddress: String,
+    selectedFileKeys: Set<String>,
+    selectableAddresses: Set<String>,
+    exportTaskProgress: ExportTaskProgress,
+    operationReady: Boolean,
+    onToggleFileSelection: (String, Int) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Bg, RoundedCornerShape(8.dp))
+            .border(1.dp, Border.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = formatHistorySessionTimestamp(session.timestampMs),
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.width(170.dp),
+        )
+        HistorySessionFileCell(
+            label = "左脚",
+            address = leftAddress,
+            file = session.leftFile,
+            sideColor = Orange,
+            selectedFileKeys = selectedFileKeys,
+            selectable =
+                operationReady &&
+                    leftAddress in selectableAddresses,
+            exportTaskProgress = exportTaskProgress,
+            onToggleFileSelection = onToggleFileSelection,
+            modifier = Modifier.weight(1f),
+        )
+        HistorySessionFileCell(
+            label = "右脚",
+            address = rightAddress,
+            file = session.rightFile,
+            sideColor = Green,
+            selectedFileKeys = selectedFileKeys,
+            selectable =
+                operationReady &&
+                    rightAddress in selectableAddresses,
+            exportTaskProgress = exportTaskProgress,
+            onToggleFileSelection = onToggleFileSelection,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun HistorySessionFileCell(
+    label: String,
+    address: String,
+    file: DotRecordingFileInfo?,
+    sideColor: Color,
+    selectedFileKeys: Set<String>,
+    selectable: Boolean,
+    exportTaskProgress: ExportTaskProgress,
+    onToggleFileSelection: (String, Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val key = file?.let { "$address-${it.fileId}" }
+    val selected = key != null && key in selectedFileKeys
+    val active = key != null && key in exportTaskProgress.activeFileKeys
+    val completed = key != null && key in exportTaskProgress.completedFileKeys
+    val failed = key != null && key in exportTaskProgress.failedFileKeys
+    val background = when {
+        failed -> Red.copy(alpha = 0.10f)
+        active -> Orange.copy(alpha = 0.10f)
+        selected || completed -> Green.copy(alpha = 0.10f)
+        else -> Color.Transparent
+    }
+    val statusText = when {
+        file == null -> "缺失"
+        failed -> "失败"
+        completed -> "完成"
+        active -> "导出中"
+        !selectable -> "缓存"
+        selected -> "已选"
+        else -> formatStorageSize(file.dataSize.toLong())
+    }
+    Row(
+        modifier = modifier
+            .heightIn(min = 38.dp)
+            .background(background, RoundedCornerShape(7.dp))
+            .border(
+                1.dp,
+                if (file == null) Border.copy(alpha = 0.55f) else sideColor.copy(alpha = 0.32f),
+                RoundedCornerShape(7.dp),
+            )
+            .clickable(enabled = file != null && selectable) {
+                onToggleFileSelection(address, file!!.fileId)
+            }
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (file != null) {
+            CaptureSelectionBox(
+                state = if (selected) ToggleableState.On else ToggleableState.Off,
+            )
+        } else {
+            Spacer(modifier = Modifier.size(18.dp))
+        }
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = sideColor,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            text = statusText,
+            style = MaterialTheme.typography.labelSmall,
+            color = when {
+                failed -> Red
+                completed -> Green
+                active -> Orange
+                file == null || !selectable -> Muted
+                else -> MaterialTheme.colorScheme.onSurface
+            },
+            maxLines = 1,
+        )
+    }
+}
+
+private fun formatHistorySessionTimestamp(timestampMs: Long?): String =
+    timestampMs?.let {
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(it))
+    } ?: "时间未知"
+
+@Composable
+private fun HistoryDeviceReadStatus(
+    label: String,
+    address: String,
+    fileCount: Int,
+    connected: Boolean,
+    queued: Boolean,
+    loading: Boolean,
+    status: FileInfoReadStatus?,
+    modifier: Modifier = Modifier,
+) {
+    val (text, color) = when {
+        !connected -> "已断开" to Red
+        queued -> "等待" to Orange
+        loading || status?.phase == FileInfoReadPhase.Reading -> "读取中" to Orange
+        status?.phase == FileInfoReadPhase.Ready -> "$fileCount 个文件" to Green
+        status?.phase == FileInfoReadPhase.Empty -> "无文件" to Muted
+        status?.phase == FileInfoReadPhase.Failed -> "读取失败" to Red
+        else -> "未读取" to Muted
+    }
+    Row(
+        modifier = modifier
+            .background(AppSurfaceColor, RoundedCornerShape(7.dp))
+            .border(1.dp, Border.copy(alpha = 0.75f), RoundedCornerShape(7.dp))
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (label == "左脚") Orange else Green,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            text = address,
+            style = MaterialTheme.typography.labelSmall,
+            color = Muted,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelMedium,
+            color = color,
+            maxLines = 1,
+        )
+    }
+}
+
+private fun ExportTaskProgress.forAddresses(addresses: Set<String>): ExportTaskProgress {
+    fun belongsToAddress(key: String): Boolean =
+        addresses.any { address -> key.startsWith("$address-") }
+
+    val scopedTargetFrames = targetFramesByFile.filterKeys(::belongsToAddress)
+    val scopedTargetBytes = targetBytesByFile.filterKeys(::belongsToAddress)
+    val scopedTargetKeys = (scopedTargetFrames.keys + scopedTargetBytes.keys).toSet()
+    return copy(
+        isExporting = isExporting && targetAddresses.any { it in addresses },
+        totalFiles = scopedTargetKeys.size,
+        targetAddresses = targetAddresses.intersect(addresses),
+        activeFileKeys = activeFileKeys.filterTo(mutableSetOf(), ::belongsToAddress),
+        framesByFile = framesByFile.filterKeys(::belongsToAddress),
+        targetFramesByFile = scopedTargetFrames,
+        targetBytesByFile = scopedTargetBytes,
+        writtenBytesByFile = writtenBytesByFile.filterKeys(::belongsToAddress),
+        completedFileKeys = completedFileKeys.filterTo(mutableSetOf(), ::belongsToAddress),
+        failedFileKeys = failedFileKeys.filterTo(mutableSetOf(), ::belongsToAddress),
+    )
+}
+
+@Composable
 private fun CompactOfflineFilePicker(
     fileList: Map<String, List<DotRecordingFileInfo>>,
     selectedFileKeys: Set<String>,
@@ -2540,6 +4337,10 @@ private fun CompactOfflineFilePicker(
     exportTaskProgress: ExportTaskProgress,
     recordingLocked: Boolean,
     operationReady: Boolean,
+    allowImplicitExportAll: Boolean = true,
+    waitingMessage: String? = null,
+    deviceLabels: Map<String, String> = emptyMap(),
+    selectableAddresses: Set<String> = fileList.keys,
     onToggleDeviceSelection: (String) -> Unit,
     onToggleFileSelection: (String, Int) -> Unit,
     onSelectAll: () -> Unit,
@@ -2548,6 +4349,7 @@ private fun CompactOfflineFilePicker(
     onStopExport: () -> Unit
 ) {
     var expandedDevice by remember(fileList.keys.toSet()) { mutableStateOf<String?>(null) }
+    val selectionEnabled = operationReady && !recordingLocked
 
     Column(
         modifier = Modifier
@@ -2557,6 +4359,13 @@ private fun CompactOfflineFilePicker(
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        if (waitingMessage != null) {
+            Text(
+                text = waitingMessage,
+                style = MaterialTheme.typography.bodySmall,
+                color = Orange,
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2565,24 +4374,31 @@ private fun CompactOfflineFilePicker(
             CaptureToolbarGroup {
 	                CaptureToolbarButton(
 	                    text = "全选",
-	                    enabled = operationReady && !recordingLocked,
+	                    enabled = selectionEnabled,
                     tone = CaptureButtonTone.Subtle,
                     onClick = onSelectAll
                 )
 	                CaptureToolbarButton(
 	                    text = "清空",
-	                    enabled = operationReady && !recordingLocked,
+	                    enabled = selectionEnabled,
                     tone = CaptureButtonTone.Subtle,
                     onClick = onClear
                 )
             }
             val exporting = exportTaskProgress.hasPendingFiles
-            val exportButtonText = if (selectedFileKeys.isEmpty()) "导出全部" else "导出所选 (${selectedFileKeys.size})"
+            val exportButtonText = when {
+                selectedFileKeys.isNotEmpty() -> "导出所选 (${selectedFileKeys.size})"
+                allowImplicitExportAll -> "导出全部"
+                else -> "请选择文件"
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!exporting) {
 	                CaptureToolbarButton(
 	                    text = exportButtonText,
-                        enabled = operationReady && fileList.isNotEmpty() && !recordingLocked,
+                        enabled =
+                            selectionEnabled &&
+                                fileList.isNotEmpty() &&
+                                (allowImplicitExportAll || selectedFileKeys.isNotEmpty()),
                         tone = CaptureButtonTone.Success,
                         onClick = onExport
                     )
@@ -2605,6 +4421,8 @@ private fun CompactOfflineFilePicker(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             fileList.forEach { (addr: String, files: List<DotRecordingFileInfo>) ->
+                val deviceSelectionEnabled =
+                    selectionEnabled && addr in selectableAddresses
                 val deviceKeys = files.map { "$addr-${it.fileId}" }.toSet()
                 val selectedInDev = deviceKeys.count { it in selectedFileKeys }
                 val devState = when (selectedInDev) {
@@ -2639,7 +4457,11 @@ private fun CompactOfflineFilePicker(
                     ) {
                         CaptureSelectionBox(
                             state = devState,
-                            onClick = { onToggleDeviceSelection(addr) }
+                            onClick = if (deviceSelectionEnabled) {
+                                { onToggleDeviceSelection(addr) }
+                            } else {
+                                null
+                            }
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column(
@@ -2647,13 +4469,21 @@ private fun CompactOfflineFilePicker(
                             verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             Text(
-                                text = addr.replace(":", ""),
+                                text = buildString {
+                                    deviceLabels[addr]?.let {
+                                        append(it)
+                                        append(" · ")
+                                    }
+                                    append(addr.replace(":", ""))
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 text = if (selectedInDev > 0) {
                                     "${files.size} 个文件 · 已选 $selectedInDev"
+                                } else if (!deviceSelectionEnabled) {
+                                    "${files.size} 个文件 · 缓存，只读"
                                 } else {
                                     "${files.size} 个文件"
                                 },
@@ -2709,7 +4539,11 @@ private fun CompactOfflineFilePicker(
                                             },
                                             RoundedCornerShape(6.dp)
                                         )
-                                        .clickable { onToggleFileSelection(addr, file.fileId) }
+                                        .clickable(
+                                            enabled = deviceSelectionEnabled,
+                                        ) {
+                                            onToggleFileSelection(addr, file.fileId)
+                                        }
                                         .padding(horizontal = 8.dp, vertical = 6.dp),
                                     verticalArrangement = Arrangement.spacedBy(5.dp)
                                 ) {
@@ -2724,7 +4558,11 @@ private fun CompactOfflineFilePicker(
                                         Text(
                                             text = formatRecordingFileLabel(file.fileName),
                                             style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurface,
+                                            color = if (deviceSelectionEnabled) {
+                                                MaterialTheme.colorScheme.onSurface
+                                            } else {
+                                                Muted
+                                            },
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.weight(1f)
@@ -3099,7 +4937,8 @@ private fun CaptureToolbarButton(
     onClick: () -> Unit,
     tone: CaptureButtonTone,
     modifier: Modifier = Modifier,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    leadingIcon: (@Composable () -> Unit)? = null,
 ) {
     val shape = RoundedCornerShape(8.dp)
     val colors = when (tone) {
@@ -3121,6 +4960,12 @@ private fun CaptureToolbarButton(
             disabledContainerColor = Red.copy(alpha = 0.42f),
             disabledContentColor = Color.White.copy(alpha = 0.72f)
         )
+        CaptureButtonTone.DangerSubtle -> ButtonDefaults.buttonColors(
+            containerColor = Color.Transparent,
+            contentColor = Red,
+            disabledContainerColor = Color.Transparent,
+            disabledContentColor = Muted,
+        )
     }
     Button(
         onClick = onClick,
@@ -3133,12 +4978,17 @@ private fun CaptureToolbarButton(
             pressedElevation = 0.dp,
             disabledElevation = 0.dp
         ),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
     ) {
+        leadingIcon?.invoke()
+        if (leadingIcon != null) {
+            Spacer(modifier = Modifier.width(5.dp))
+        }
         Text(
             text = text,
             style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.Medium
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
         )
     }
 }
@@ -3325,11 +5175,14 @@ private fun CaptureInlineButton(
     onClick: () -> Unit,
     tone: CaptureButtonTone,
     modifier: Modifier = Modifier,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    leadingIcon: (@Composable () -> Unit)? = null,
 ) {
     val shape = RoundedCornerShape(8.dp)
     when (tone) {
-        CaptureButtonTone.Subtle -> {
+        CaptureButtonTone.Subtle,
+        CaptureButtonTone.DangerSubtle -> {
+            val dangerSubtle = tone == CaptureButtonTone.DangerSubtle
             androidx.compose.material3.OutlinedButton(
                 onClick = onClick,
                 enabled = enabled,
@@ -3337,19 +5190,26 @@ private fun CaptureInlineButton(
                 modifier = modifier.heightIn(min = 40.dp),
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = AppSurfaceColor,
-                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    contentColor = if (dangerSubtle) Red else MaterialTheme.colorScheme.onSurface,
                     disabledContainerColor = AppSurfaceColor.copy(alpha = 0.42f),
                     disabledContentColor = Muted
                 ),
                 border = ButtonDefaults.outlinedButtonBorder.copy(
-                    brush = androidx.compose.ui.graphics.SolidColor(Border)
+                    brush = androidx.compose.ui.graphics.SolidColor(
+                        if (dangerSubtle) Red.copy(alpha = 0.7f) else Border
+                    )
                 ),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
+                leadingIcon?.invoke()
+                if (leadingIcon != null) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
                 Text(
                     text = text,
                     style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Medium
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
                 )
             }
         }
@@ -3369,10 +5229,15 @@ private fun CaptureInlineButton(
                 ),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
             ) {
+                leadingIcon?.invoke()
+                if (leadingIcon != null) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
                 Text(
                     text = text,
                     style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Medium
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
                 )
             }
         }
@@ -3559,6 +5424,7 @@ private fun ParticipantAssignmentPanel(
     athletes: List<CaptureAthleteOption>,
     devices: List<ScannedDevice>,
     connectedAddresses: Set<String>,
+    isScanning: Boolean,
     enabled: Boolean,
     onSelectAthlete: (String, String) -> Unit,
     onAssignDevice: (String, String, String) -> Unit,
@@ -3566,6 +5432,7 @@ private fun ParticipantAssignmentPanel(
     onRemoveParticipant: (String) -> Unit,
     onNewAthlete: (String) -> Unit,
     onEditAthlete: (String) -> Unit,
+    onScan: () -> Unit,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -3582,11 +5449,30 @@ private fun ParticipantAssignmentPanel(
                 color = MaterialTheme.colorScheme.onSurface,
                 fontWeight = FontWeight.SemiBold,
             )
-            Text(
-                text = "${config.participants.size} 个采集分组 · 扫描到 ${devices.size} 台",
-                style = MaterialTheme.typography.bodySmall,
-                color = Muted,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = if (isScanning) "正在查找附近设备" else "已发现 ${devices.size} 台",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Muted,
+                )
+                CaptureInlineButton(
+                    text = if (isScanning) "扫描中" else "扫描/刷新设备",
+                    enabled = enabled && !isScanning,
+                    tone = CaptureButtonTone.Subtle,
+                    modifier = Modifier.width(158.dp),
+                    onClick = onScan,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    },
+                )
+            }
         }
         Column(
             modifier = Modifier

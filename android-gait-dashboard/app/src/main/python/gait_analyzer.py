@@ -14,6 +14,7 @@ from offline_gait_event_detector import (
     GYRO_LOW_CUTOFF_HZ,
     OfflineGaitEventDetector,
     OfflineGaitEventPipeline,
+    _separated_otsu_threshold,
     detect_offline_gait_events,
 )
 from offline_gait_metrics import (
@@ -99,6 +100,8 @@ GAIT_RECOVERY_TEMPLATE_MAX_LAG_RATIO = 0.08
 GAIT_GAP_RECOVERY_RATIO = 1.55
 GAIT_GAP_RECOVERY_MAX_MISSING = 2
 GAIT_GAP_RECOVERY_SEARCH_RATIO = 0.30
+SINGLE_LEG_CYCLE_INTERVAL_RATIO_MAX = 2.50
+UNPAIRED_RECORD_MIN_CYCLES_PER_SIDE = 3
 
 
 class BilateralGaitContactStateMachine:
@@ -1099,7 +1102,15 @@ def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level=None):
         min_same_foot_interval_ms=0.0,
     )
     if events:
-        return float(events[0]["ic_time"]), True
+        event = events[0]
+        segment_threshold = _separated_otsu_threshold(
+            np.abs(signal_values)
+        )
+        if (
+            segment_threshold is None
+            or -float(event["negative_value"]) >= segment_threshold
+        ):
+            return float(event["ic_time"]), True
     return None, False
 
 
@@ -2525,6 +2536,144 @@ def detect_bilateral_gait_bouts(
     return gait_bouts, diagnostics
 
 
+def _complete_single_leg_cycles(hs_events, to_events):
+    """返回相位完整且时长合理的单脚 IC->TC->下一 IC 周期。"""
+    hs = sorted(float(t) for t in hs_events)
+    toe_off = sorted(float(t) for t in to_events)
+    candidates = []
+    for cycle_start, cycle_end in zip(hs, hs[1:]):
+        cycle_ms = cycle_end - cycle_start
+        if cycle_ms < GAIT_STEP_INTERVAL_MIN_MS * 2.0:
+            continue
+        cycle_to = [
+            timestamp
+            for timestamp in toe_off
+            if cycle_start < timestamp < cycle_end
+        ]
+        if len(cycle_to) != 1:
+            continue
+        contact_ms = cycle_to[0] - cycle_start
+        if not 60.0 <= contact_ms <= cycle_ms * 0.90:
+            continue
+        candidates.append({
+            "start_ms": cycle_start,
+            "end_ms": cycle_end,
+            "to_ms": cycle_to[0],
+            "duration_ms": cycle_ms,
+        })
+
+    if not candidates:
+        return []
+    median_cycle_ms = float(np.median([
+        cycle["duration_ms"] for cycle in candidates
+    ]))
+    max_cycle_ms = max(
+        GAIT_STEP_INTERVAL_MAX_MS * 2.0,
+        median_cycle_ms * SINGLE_LEG_CYCLE_INTERVAL_RATIO_MAX,
+    )
+    return [
+        cycle
+        for cycle in candidates
+        if cycle["duration_ms"] <= max_cycle_ms
+    ]
+
+
+def _single_leg_events_for_cycles(
+    cycles,
+    hs_events,
+    to_events,
+    ms_events,
+    msw_events,
+):
+    """仅保留至少属于一个有效单脚周期的事件。"""
+    if not cycles:
+        return {"hs": [], "to": [], "ms": [], "msw": []}
+
+    def in_cycle(timestamp):
+        value = float(timestamp)
+        return any(
+            cycle["start_ms"] <= value <= cycle["end_ms"]
+            for cycle in cycles
+        )
+
+    cycle_hs = sorted({
+        int(round(timestamp))
+        for cycle in cycles
+        for timestamp in (cycle["start_ms"], cycle["end_ms"])
+    })
+    cycle_to = sorted({
+        int(round(cycle["to_ms"]))
+        for cycle in cycles
+    })
+    return {
+        "hs": cycle_hs,
+        "to": cycle_to,
+        "ms": sorted(
+            int(round(timestamp))
+            for timestamp in ms_events
+            if in_cycle(timestamp)
+        ),
+        "msw": sorted(
+            int(round(timestamp))
+            for timestamp in msw_events
+            if in_cycle(timestamp)
+        ),
+    }
+
+
+def calculate_single_leg_strides_with_pairing(
+    hs_events,
+    to_events,
+    ms_events,
+    idata,
+    cycles,
+    paired_strides,
+):
+    """计算全部完整单脚周期，并只为锁定周期附加双脚联合指标。"""
+    valid_to = {
+        int(round(cycle["to_ms"]))
+        for cycle in cycles
+    }
+    paired_by_to = {
+        int(round(stride["to_timestamp_ms"])): stride
+        for stride in paired_strides
+        if stride.get("to_timestamp_ms") is not None
+    }
+    single_leg_strides = calculate_spatio_temporal(
+        hs_events,
+        to_events,
+        ms_events,
+        idata,
+        is_long_jump=False,
+        contralateral_hs=None,
+        contralateral_to=None,
+    )
+    merged = []
+    for stride in single_leg_strides:
+        to_time = stride.get("to_timestamp_ms")
+        if to_time is None:
+            continue
+        to_key = int(round(to_time))
+        if to_key not in valid_to:
+            continue
+        paired = paired_by_to.get(to_key)
+        if paired is not None:
+            combined = dict(paired)
+            combined["bilaterally_paired"] = True
+            merged.append(combined)
+            continue
+
+        unpaired = dict(stride)
+        unpaired["double_support_time_ms"] = None
+        unpaired["flight_time_ms"] = None
+        unpaired["vGRF_peak_BW"] = None
+        unpaired["gait_status"] = "Unpaired"
+        unpaired["bilaterally_paired"] = False
+        merged.append(unpaired)
+    merged.sort(key=lambda stride: stride.get("to_timestamp_ms", 0))
+    return merged
+
+
 def calculate_spatio_temporal_by_bouts(
     hs_events,
     to_events,
@@ -2726,12 +2875,60 @@ def _parse_long_jump_is_takeoff_foot(val):
     return True
 
 
-def build_display_signals(idata, include_raw_gyro=False, max_points=1800):
-    """只压缩前端绘图数据，计算与事件识别仍使用完整采样序列。"""
+def build_display_signals(
+    idata,
+    include_raw_gyro=False,
+    max_points=1800,
+    event_timestamps=None,
+):
+    """压缩前端绘图数据，并保留所有步态事件对应的原始采样点。"""
     if idata is None or len(idata) == 0:
         return {}
     if len(idata) > max_points:
-        indices = np.unique(np.linspace(0, len(idata) - 1, max_points, dtype=np.int64))
+        timestamps = idata["Timestamp"].to_numpy(dtype=np.float64)
+        if isinstance(event_timestamps, dict):
+            timestamp_groups = event_timestamps.values()
+        elif event_timestamps is None:
+            timestamp_groups = []
+        else:
+            timestamp_groups = [event_timestamps]
+
+        event_times = []
+        for group in timestamp_groups:
+            if group is None or isinstance(group, dict):
+                continue
+            if np.isscalar(group):
+                group = [group]
+            for value in group:
+                try:
+                    event_time = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    np.isfinite(event_time)
+                    and timestamps[0] <= event_time <= timestamps[-1]
+                ):
+                    event_times.append(event_time)
+
+        event_indices = nearest_timestamp_positions(timestamps, event_times)
+        required_indices = np.unique(np.concatenate((
+            np.asarray([0, len(idata) - 1], dtype=np.int64),
+            event_indices,
+        )))
+        remaining_points = max(0, max_points - required_indices.size)
+        if remaining_points > 0:
+            uniform_indices = np.linspace(
+                0,
+                len(idata) - 1,
+                remaining_points,
+                dtype=np.int64,
+            )
+            indices = np.unique(np.concatenate((
+                required_indices,
+                uniform_indices,
+            )))
+        else:
+            indices = required_indices
         display = idata.iloc[indices]
     else:
         display = idata
@@ -2934,6 +3131,10 @@ def process_gait_data(
         gait_bouts = []
         gait_quality = None
         gait_recovery = None
+        detected_events = None
+        detected_contra_events = None
+        primary_single_cycles = []
+        contra_single_cycles = []
 
         # 判断是否需要三级跳专属逻辑（包含跳跃清洗伴飞校准）
         is_triple_jump_mode = getattr(is_triple_jump, '__bool__', lambda: True)() or (isinstance(is_triple_jump, str) and is_triple_jump in ['L', 'R'])
@@ -3037,43 +3238,8 @@ def process_gait_data(
                     HS_c = sorted(idata_contra[idata_contra['IC'].notna()]['Timestamp'].values)
                     TO_c = sorted(idata_contra[idata_contra['TC'].notna()]['Timestamp'].values)
                     MS_c = sorted(idata_contra[idata_contra['MS'].notna()]['Timestamp'].values) if 'MS' in idata_contra.columns else sorted(idata_contra[idata_contra['MSW'].notna()]['Timestamp'].values)
-                    if not is_long_jump_mode:
-                        (
-                            idata,
-                            HS,
-                            TO,
-                            MS,
-                            primary_recovery,
-                        ) = recover_missing_gait_events_short_delay(
-                            idata,
-                            HS,
-                            TO,
-                            HS_c,
-                        )
-                        (
-                            idata_contra,
-                            HS_c,
-                            TO_c,
-                            MS_c,
-                            contralateral_recovery,
-                        ) = recover_missing_gait_events_short_delay(
-                            idata_contra,
-                            HS_c,
-                            TO_c,
-                            HS,
-                        )
-                        gait_recovery = {
-                            "primary": primary_recovery,
-                            "contralateral": contralateral_recovery,
-                        }
-                        print(
-                            "GAIT_LOG_INFO: Short-delay event recovery "
-                            f"primary IC+{len(primary_recovery['recovered_ic'])}/"
-                            f"TC+{len(primary_recovery['recovered_tc'])}, "
-                            f"contralateral IC+"
-                            f"{len(contralateral_recovery['recovered_ic'])}/"
-                            f"TC+{len(contralateral_recovery['recovered_tc'])}"
-                        )
+                    # 正式分析不自动补回事件。漏检宁可保留为空，也不能根据
+                    # 局部周期或模板合成新的 IC、TC、MS，避免把误检写入结果。
                     MSW_c = idata_contra[idata_contra['MSW'].notna()]['Timestamp'].values.tolist()
                     strides_c = calculate_spatio_temporal(
                         HS_c,
@@ -3096,8 +3262,25 @@ def process_gait_data(
                             "ic_fusion": ic_fusion_c
                         },
                         "side_main": "L" if is_main_left else "R",
-                        "side_contra": "R" if is_main_left else "L"
+                            "side_contra": "R" if is_main_left else "L"
                     }
+                    if not is_long_jump_mode:
+                        detected_events = {
+                            "hs": [int(x) for x in HS],
+                            "to": [int(x) for x in TO],
+                            "ms": [int(x) for x in MS],
+                            "msw": [
+                                int(x)
+                                for x in idata[
+                                    idata["MSW"].notna()
+                                ]["Timestamp"].values
+                            ],
+                        }
+                        detected_contra_events = {
+                            key: list(value)
+                            for key, value in contra_data["events"].items()
+                            if key != "ic_fusion"
+                        }
                 except Exception as e:
                     print(f"GAIT_LOG_ERROR: Dual leg sync failed, falling back to single leg mode. Exception: {e}")
                     (
@@ -3127,6 +3310,14 @@ def process_gait_data(
 
         if not is_long_jump_mode:
             contra_events = contra_data["events"]
+            primary_single_cycles = _complete_single_leg_cycles(
+                HS,
+                TO,
+            )
+            contra_single_cycles = _complete_single_leg_cycles(
+                contra_events["hs"],
+                contra_events["to"],
+            )
             gait_bouts, gait_quality = detect_bilateral_gait_bouts(
                 idata,
                 HS,
@@ -3135,12 +3326,18 @@ def process_gait_data(
                 contra_events["hs"],
                 contra_events["to"],
             )
-            if gait_recovery is not None:
-                gait_quality["event_recovery"] = gait_recovery
-            if not gait_bouts:
+            if (
+                not gait_bouts
+                and (
+                    len(primary_single_cycles)
+                    < UNPAIRED_RECORD_MIN_CYCLES_PER_SIDE
+                    or len(contra_single_cycles)
+                    < UNPAIRED_RECORD_MIN_CYCLES_PER_SIDE
+                )
+            ):
                 return json.dumps({
                     "ok": False,
-                    "error": "未检测到连续步态，请重新选择有效行走数据",
+                    "error": "未检测到完整步态周期，请重新选择有效行走数据",
                     "gait_quality": gait_quality,
                 }, ensure_ascii=False)
 
@@ -3301,8 +3498,8 @@ def process_gait_data(
         MSW = idata[idata['MSW'].notna()]['Timestamp'].values.tolist()
 
         contra_events = contra_data.get('events') if contra_data is not None else None
-        if not is_long_jump_mode and gait_bouts:
-            strides = calculate_spatio_temporal_by_bouts(
+        if not is_long_jump_mode:
+            paired_strides = calculate_spatio_temporal_by_bouts(
                 HS_for_metrics,
                 TO_for_metrics,
                 MS_for_metrics,
@@ -3311,6 +3508,47 @@ def process_gait_data(
                 contralateral_hs=contra_events.get("hs"),
                 contralateral_to=contra_events.get("to"),
             )
+            paired_contra_strides = list(contra_data.get("strides", []))
+            strides = calculate_single_leg_strides_with_pairing(
+                detected_events["hs"],
+                detected_events["to"],
+                detected_events["ms"],
+                idata,
+                primary_single_cycles,
+                paired_strides,
+            )
+            contra_data["strides"] = (
+                calculate_single_leg_strides_with_pairing(
+                    detected_contra_events["hs"],
+                    detected_contra_events["to"],
+                    detected_contra_events["ms"],
+                    idata_contra,
+                    contra_single_cycles,
+                    paired_contra_strides,
+                )
+            )
+            analysis_events = _single_leg_events_for_cycles(
+                primary_single_cycles,
+                detected_events["hs"],
+                detected_events["to"],
+                detected_events["ms"],
+                detected_events["msw"],
+            )
+            analysis_contra_events = _single_leg_events_for_cycles(
+                contra_single_cycles,
+                detected_contra_events["hs"],
+                detected_contra_events["to"],
+                detected_contra_events["ms"],
+                detected_contra_events["msw"],
+            )
+            HS_for_metrics = analysis_events["hs"]
+            TO_for_metrics = analysis_events["to"]
+            MS_for_metrics = analysis_events["ms"]
+            MSW = analysis_events["msw"]
+            contra_data["events"]["hs"] = analysis_contra_events["hs"]
+            contra_data["events"]["to"] = analysis_contra_events["to"]
+            contra_data["events"]["ms"] = analysis_contra_events["ms"]
+            contra_data["events"]["msw"] = analysis_contra_events["msw"]
         else:
             strides = calculate_spatio_temporal(
                 HS_for_metrics,
@@ -3341,6 +3579,10 @@ def process_gait_data(
             return float(np.mean(vals)) if vals else None
 
         flight_time_mean = safe_optional_mean("flight_time_ms")
+        double_support_mean = safe_optional_mean(
+            "double_support_time_ms"
+        )
+        vgrf_mean = safe_optional_mean("vGRF_peak_BW")
         summary = {
             "analysis_mode": "long_jump" if is_long_jump_mode else "general_gait",
             "n_strides": len(strides),
@@ -3348,14 +3590,18 @@ def process_gait_data(
             "contact_time_ms": int(round(safe_mean("contact_time_ms"))),
             "double_support_time_ms": (
                 None
-                if is_long_jump_mode
-                else int(round(safe_mean("double_support_time_ms")))
+                if is_long_jump_mode or double_support_mean is None
+                else int(round(double_support_mean))
             ),
             "swing_time_ms": int(round(safe_mean("swing_time_ms"))),
             "step_frequency_spm": int(round(safe_mean("step_frequency_spm"))),
             "stride_length_m": round(safe_mean("stride_length_m"), 2),
             "stride_velocity_mps": round(safe_mean("stride_velocity_mps"), 2),
-            "vGRF_peak_BW": round(safe_mean("vGRF_peak_BW"), 2),
+            "vGRF_peak_BW": (
+                round(vgrf_mean, 2)
+                if vgrf_mean is not None
+                else None
+            ),
             "flight_time_ms": (
                 int(round(flight_time_mean))
                 if flight_time_mean is not None
@@ -3379,23 +3625,46 @@ def process_gait_data(
                 float(gait_quality["valid_duration_s"]), 3
             )
 
+        result_events = {
+            "hs":  [int(x) for x in HS_for_metrics],
+            "to":  [int(x) for x in TO_for_metrics],
+            "ms":  [int(x) for x in MS_for_metrics],
+            "msw": [int(x) for x in MSW],
+        }
+        primary_display_events = (
+            detected_events
+            if detected_events is not None
+            else result_events
+        )
         result = {
             "ok": True,
             "analysis_mode": "long_jump" if is_long_jump_mode else "general_gait",
             "summary": summary,
             "strides": strides,
-            "signals": build_display_signals(idata, include_raw_gyro=True),
-            "events": {
-                "hs":  [int(x) for x in HS_for_metrics],
-                "to":  [int(x) for x in TO_for_metrics],
-                "ms":  [int(x) for x in MS_for_metrics],
-                "msw": [int(x) for x in MSW]
-            }
+            "signals": build_display_signals(
+                idata,
+                include_raw_gyro=True,
+                event_timestamps=primary_display_events,
+            ),
+            "events": result_events,
         }
         if gait_quality is not None:
             result["gait_quality"] = gait_quality
+        if detected_events is not None:
+            result["detected_events"] = detected_events
 
         if contra_data:
+            if detected_contra_events is not None:
+                contra_data["detected_events"] = detected_contra_events
+            contra_display_events = (
+                detected_contra_events
+                if detected_contra_events is not None
+                else contra_data.get("events")
+            )
+            contra_data["signals"] = build_display_signals(
+                idata_contra,
+                event_timestamps=contra_display_events,
+            )
             result["contra_data"] = contra_data
 
         return json.dumps(result)

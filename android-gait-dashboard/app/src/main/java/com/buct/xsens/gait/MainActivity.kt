@@ -30,9 +30,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.safeDrawing
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Analytics
 import androidx.compose.material.icons.outlined.GraphicEq
@@ -45,6 +43,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -156,6 +155,17 @@ private fun UnifiedWorkbenchScreen() {
     val captureViewModel: CollectionViewModel = viewModel()
     val repository = remember { GaitDataRepository(captureViewModel.getApplication()) }
     val scope = rememberCoroutineScope()
+    val connectedDevices by captureViewModel.connectedDevices.collectAsState()
+    val deviceRoleConfig by captureViewModel.deviceRoleConfig.collectAsState()
+    val configuredDeviceCount = deviceRoleConfig.participants.size * 2
+    val connectedConfiguredCount = remember(connectedDevices, deviceRoleConfig) {
+        val connected = connectedDevices
+            .map { it.replace(":", "").uppercase() }
+            .toSet()
+        deviceRoleConfig.targetDeviceIds.count {
+            it.replace(":", "").uppercase() in connected
+        }
+    }
 
     LaunchedEffect(selectedTab) {
         if (selectedTab == WorkspaceTab.Capture) {
@@ -176,6 +186,9 @@ private fun UnifiedWorkbenchScreen() {
                 .windowInsetsPadding(WindowInsets.safeDrawing)
         ) {
             WorkbenchTopBar(
+                connectedCount = connectedConfiguredCount,
+                targetCount = configuredDeviceCount,
+                showConnectionStatus = selectedTab == WorkspaceTab.Capture,
                 modifier = Modifier
                     .fillMaxWidth()
                     .statusBarsPadding()
@@ -209,7 +222,6 @@ private fun UnifiedWorkbenchScreen() {
                             },
                             modifier = Modifier
                                 .fillMaxSize()
-                                .verticalScroll(rememberScrollState())
                                 .padding(bottom = 12.dp)
                         )
                     }
@@ -291,6 +303,9 @@ private fun CaptureAthleteOption.toAthleteEntity(): AthleteEntity {
 
 @Composable
 private fun WorkbenchTopBar(
+    connectedCount: Int,
+    targetCount: Int,
+    showConnectionStatus: Boolean,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -332,5 +347,35 @@ private fun WorkbenchTopBar(
             }
         }
 
+        if (showConnectionStatus) {
+            val fullyConnected = targetCount > 0 && connectedCount == targetCount
+            Row(
+                modifier = Modifier
+                    .background(AppSurfaceColor, RoundedCornerShape(999.dp))
+                    .border(1.dp, Border, RoundedCornerShape(999.dp))
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .background(
+                            if (fullyConnected) Green else Muted,
+                            RoundedCornerShape(999.dp),
+                        ),
+                )
+                Text(
+                    text = "$connectedCount / $targetCount 已连接",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = if (fullyConnected) "状态正常" else "等待设备",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (fullyConnected) Green else Muted,
+                )
+            }
+        }
     }
 }

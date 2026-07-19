@@ -19,8 +19,11 @@ import com.buct.xsens.dot.data.LongJumpDeviceRoles
 import com.buct.xsens.dot.data.ScannedDevice
 import com.buct.xsens.dot.data.SensorData
 import com.buct.xsens.dot.engine.CollectionEngine
+import com.buct.xsens.dot.engine.FileInfoReadPhase
 import com.buct.xsens.dot.engine.FlashRecordingPhase
 import com.buct.xsens.dot.engine.RecordingEngine
+import com.buct.xsens.dot.engine.areFileInfoReadTargetsTerminal
+import com.buct.xsens.dot.engine.canImplicitlyExportFileInfo
 import com.buct.xsens.dot.engine.participantHasActiveRecordingOperation
 import com.buct.xsens.dot.engine.shouldSetupRecordingManagerAfterConnection
 import com.buct.xsens.dot.service.BleStreamingService
@@ -101,6 +104,8 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     val recDelayedStopConfirmations = recEngine.delayedStopConfirmations
     val recRecordingStates = recEngine.recordingStates
     val recFileList        = recEngine.fileList
+    val recFileInfoReadStatuses = recEngine.fileInfoReadStatuses
+    val recFileInfoReadActiveTargets = recEngine.fileInfoReadActiveTargets
     val recExportProgress  = recEngine.exportProgress
     val recExportDone      = recEngine.exportDone
     val recExportTaskProgress = recEngine.exportTaskProgress
@@ -140,19 +145,39 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     // ── 文件选择（key = "$normalizedAddr-$fileId"）──
     private val _selectedFileKeys = MutableStateFlow<Set<String>>(emptySet())
     val selectedFileKeys: StateFlow<Set<String>> = _selectedFileKeys.asStateFlow()
+    private val _visibleHistoryParticipantSlots = MutableStateFlow<Set<String>>(emptySet())
+    val visibleHistoryParticipantSlots: StateFlow<Set<String>> =
+        _visibleHistoryParticipantSlots.asStateFlow()
+    private val _historyLoadingParticipantSlots = MutableStateFlow<Set<String>>(emptySet())
+    val historyLoadingParticipantSlots: StateFlow<Set<String>> =
+        _historyLoadingParticipantSlots.asStateFlow()
+    private val _historyQueuedParticipantSlots = MutableStateFlow<Set<String>>(emptySet())
+    val historyQueuedParticipantSlots: StateFlow<Set<String>> =
+        _historyQueuedParticipantSlots.asStateFlow()
+    private val _historyRequestErrors = MutableStateFlow<Map<String, String>>(emptyMap())
+    val historyRequestErrors: StateFlow<Map<String, String>> =
+        _historyRequestErrors.asStateFlow()
+    private data class ParticipantHistoryRequest(
+        val slotId: String,
+        val targets: Set<String>,
+        val configFingerprint: String,
+        val generation: Int,
+    )
+    private val historyRequestChannel =
+        Channel<ParticipantHistoryRequest>(Channel.UNLIMITED)
+    private val historyRequestGenerations = mutableMapOf<String, Int>()
 
     private fun fileDeviceReady(address: String): Boolean {
         val norm = LongJumpDeviceRoles.normalizeDeviceId(address)
         val connected = engine.connectedDevices.value
             .map(LongJumpDeviceRoles::normalizeDeviceId)
             .toSet()
-        val phase = recEngine.deviceRecordingPhases.value[norm]
-        return norm in connected &&
-            phase !in setOf(
-                FlashRecordingPhase.Starting,
-                FlashRecordingPhase.Recording,
-                FlashRecordingPhase.Stopping,
-            )
+        return isHistoryFileSelectionAllowed(
+            address = norm,
+            connectedAddresses = connected,
+            readStatus = recEngine.fileInfoReadStatuses.value[norm],
+            recordingPhase = recEngine.deviceRecordingPhases.value[norm],
+        )
     }
 
     private fun eligibleFileKeys(): Set<String> =
@@ -183,6 +208,77 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun clearFileSelection() { _selectedFileKeys.value = emptySet() }
+
+    private fun participantFileKeys(slotId: String): Set<String> {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return emptySet()
+        val targets = participantTargets(participant)
+        return recEngine.fileList.value
+            .filterKeys { it in targets && fileDeviceReady(it) }
+            .flatMap { (addr, files) -> files.map { file -> "$addr-${file.fileId}" } }
+            .toSet()
+    }
+
+    fun selectParticipantFiles(slotId: String) {
+        val keys = participantFileKeys(slotId)
+        _selectedFileKeys.update { current -> current + keys }
+    }
+
+    fun clearParticipantFileSelection(slotId: String) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val targets = participantTargets(participant)
+        _selectedFileKeys.update { current ->
+            current.filterNot { key ->
+                targets.any { target -> key.startsWith("$target-") }
+            }.toSet()
+        }
+    }
+
+    fun exportParticipantFiles(slotId: String) {
+        if (
+            _historyQueuedParticipantSlots.value.isNotEmpty() ||
+            _historyLoadingParticipantSlots.value.isNotEmpty() ||
+            recEngine.fileInfoReadActiveTargets.value.isNotEmpty()
+        ) {
+            Toast.makeText(
+                getApplication(),
+                "请等待历史文件读取队列完成，再开始导出",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val participantTargets = participantTargets(participant)
+        val eligible = participantFileKeys(slotId)
+        val selected = _selectedFileKeys.value.intersect(eligible)
+        val statuses = recEngine.fileInfoReadStatuses.value
+        val incomplete =
+            _historyRequestErrors.value[slotId] != null ||
+                !canImplicitlyExportFileInfo(statuses, participantTargets)
+        if (incomplete && selected.isEmpty()) {
+            Toast.makeText(
+                getApplication(),
+                "文件列表不完整，请先明确选择需要导出的文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val targets = selected.ifEmpty { eligible }
+        if (targets.isEmpty()) {
+            Toast.makeText(
+                getApplication(),
+                "该运动员没有可导出的文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        recEngine.exportSelected(targets)
+    }
 
     fun exportFiles() {
         val eligible = eligibleFileKeys()
@@ -219,6 +315,8 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
     private val _scanMessage = MutableStateFlow<String?>(null)
     val scanMessage: StateFlow<String?> = _scanMessage.asStateFlow()
+    private val _isManualScanning = MutableStateFlow(false)
+    val isManualScanning: StateFlow<Boolean> = _isManualScanning.asStateFlow()
 
     private val _capturePreparePending = MutableStateFlow(false)
     private val _captureWorkflowPreparing = MutableStateFlow(false)
@@ -226,8 +324,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     private val _participantPreparingSlots = MutableStateFlow<Set<String>>(emptySet())
     val participantPreparingSlots: StateFlow<Set<String>> =
         _participantPreparingSlots.asStateFlow()
+    private val _participantConnectingSlots = MutableStateFlow<Set<String>>(emptySet())
+    val participantConnectingSlots: StateFlow<Set<String>> =
+        _participantConnectingSlots.asStateFlow()
     private var capturePreflightGeneration = 0
-    private var participantConnectGeneration = 0
     private var participantSyncJob: Job? = null
     private var participantSyncSlotId: String? = null
     private val participantStopJobs = ConcurrentHashMap<String, Job>()
@@ -253,6 +353,18 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     init {
+        viewModelScope.launch {
+            for (request in historyRequestChannel) {
+                processParticipantHistoryRequest(request)
+            }
+        }
+        viewModelScope.launch {
+            isScanning.collect { scanning ->
+                if (!scanning) {
+                    _isManualScanning.value = false
+                }
+            }
+        }
         viewModelScope.launch {
             combine(scannedDevices, deviceRoleConfig) { devices, config ->
                 val targetIds = config.targetDeviceIds
@@ -377,6 +489,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun startScan() {
+        beginScan(manual = true)
+    }
+
+    private fun beginScan(manual: Boolean): Boolean {
         _scanMessage.value = null
         val perms = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -388,15 +504,23 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             ContextCompat.checkSelfPermission(getApplication(), it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isNotEmpty()) {
+            _isManualScanning.value = false
             _scanMessage.value = "请先在设置中授予蓝牙和定位权限，并开启定位服务"
-            return
+            return false
         }
-        _selectedForConnect.value = emptySet()
+        if (manual) {
+            _selectedForConnect.value = emptySet()
+        }
         engine.startScan()
+        _isManualScanning.value = manual && isScanning.value
+        return isScanning.value
     }
 
     fun clearScanMessage() { _scanMessage.value = null }
-    fun stopScan() = engine.stopScan()
+    fun stopScan() {
+        _isManualScanning.value = false
+        engine.stopScan()
+    }
 
     fun setAvailableAthletes(athletes: List<CaptureAthleteOption>) {
         val normalized = athletes
@@ -456,6 +580,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         if (participantConfigurationLocked(slotId)) return
         val current = _deviceRoleConfig.value
         if (current.participants.size <= 1) return
+        closeParticipantHistory(slotId)
         saveDeviceRoleConfig(
             current.copy(
                 participants = current.participants.filterNot { it.slotId == slotId }
@@ -474,6 +599,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             Toast.makeText(getApplication(), "该运动员已加入本次采集", Toast.LENGTH_SHORT).show()
             return
         }
+        closeParticipantHistory(slotId)
         saveDeviceRoleConfig(
             current.copy(
                 participants = current.participants.map { participant ->
@@ -520,6 +646,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             sideCode == "L" -> target.copy(leftDeviceId = selectedId)
             else -> target.copy(rightDeviceId = selectedId)
         }
+        closeParticipantHistory(slotId)
         saveDeviceRoleConfig(
             current.copy(
                 participants = current.participants.map {
@@ -547,6 +674,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             isSyncing.value ||
             collectionBusy ||
             _captureWorkflowPreparing.value ||
+            _historyQueuedParticipantSlots.value.isNotEmpty() ||
+            _historyLoadingParticipantSlots.value.isNotEmpty() ||
+            recEngine.fileInfoReadActiveTargets.value.isNotEmpty() ||
+            _participantConnectingSlots.value.isNotEmpty() ||
             _participantPreparingSlots.value.isNotEmpty() ||
             recEngine.recordingPhase.value != FlashRecordingPhase.Idle ||
             recEngine.recordingExportDecisions.value.isNotEmpty() ||
@@ -648,6 +779,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         if (participantConnectionOperationLocked(targets, slotId)) return
         val connected = connectedDevices.value.map(LongJumpDeviceRoles::normalizeDeviceId).toSet()
         if (targets.none { it in connected }) return
+        _participantConnectingSlots.value -= slotId
         _participantPreparingSlots.value -= slotId
         if (engine.disconnectDevices(targets) && engine.connectedDevices.value.isEmpty()) {
             stopBleService()
@@ -664,25 +796,51 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
             return
         }
-        val generation = ++participantConnectGeneration
-        if (connectParticipantFromScan(targets)) return
+        _participantConnectingSlots.value += slotId
+        if (connectParticipantFromScan(targets)) {
+            monitorParticipantConnection(slotId, targets)
+            return
+        }
 
-        startScan()
         viewModelScope.launch {
-            while (
-                generation == participantConnectGeneration &&
-                isScanning.value
-            ) {
-                delay(200)
+            val deadline = SystemClock.elapsedRealtime() + 12_000L
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (connectParticipantFromScan(targets)) {
+                    monitorParticipantConnection(slotId, targets)
+                    return@launch
+                }
+                if (!isScanning.value && !beginScan(manual = false)) {
+                    break
+                }
+                delay(100)
             }
-            if (generation != participantConnectGeneration) return@launch
             if (!connectParticipantFromScan(targets)) {
+                _participantConnectingSlots.value -= slotId
                 Toast.makeText(
                     getApplication(),
                     "${participant.athleteName}设备未扫描完整，请保持左右脚设备靠近后重试",
                     Toast.LENGTH_LONG,
                 ).show()
+            } else {
+                monitorParticipantConnection(slotId, targets)
             }
+        }
+    }
+
+    private fun monitorParticipantConnection(
+        slotId: String,
+        targets: Set<String>,
+    ) {
+        viewModelScope.launch {
+            val deadline = SystemClock.elapsedRealtime() + 20_000L
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val connected = connectedDevices.value
+                    .map(LongJumpDeviceRoles::normalizeDeviceId)
+                    .toSet()
+                if (targets.all { it in connected }) break
+                delay(200)
+            }
+            _participantConnectingSlots.value -= slotId
         }
     }
 
@@ -706,6 +864,8 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         val locked =
             isSyncing.value ||
                 _isRecording.value ||
+                participantHistoryOperationBusy(slotId) ||
+                slotId in _participantConnectingSlots.value ||
                 slotId in _participantPreparingSlots.value ||
                 participantHasActiveRecordingOperation(
                     recEngine.deviceRecordingPhases.value,
@@ -716,14 +876,44 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         if (locked) {
             Toast.makeText(
                 getApplication(),
-                "请先结束该运动员的准备或录制操作",
+                if (participantHistoryOperationBusy(slotId)) {
+                    "请等待该运动员的历史文件读取完成"
+                } else {
+                    "请先结束该运动员的准备或录制操作"
+                },
                 Toast.LENGTH_SHORT,
             ).show()
         }
         return locked
     }
 
+    private fun participantHistoryOperationBusy(slotId: String): Boolean =
+        isParticipantHistoryOperationBusy(
+            queued = slotId in _historyQueuedParticipantSlots.value,
+            loading = slotId in _historyLoadingParticipantSlots.value,
+            activeReadTargets = recEngine.fileInfoReadActiveTargets.value,
+            participantTargets = _deviceRoleConfig.value.participants
+                .firstOrNull { it.slotId == slotId }
+                ?.let(::participantTargets)
+                .orEmpty(),
+        )
+
     fun powerOffDevice(address: String) {
+        val normalizedAddress = LongJumpDeviceRoles.normalizeDeviceId(address)
+        val participant = _deviceRoleConfig.value.participants.firstOrNull {
+            normalizedAddress in participantTargets(it)
+        }
+        if (
+            participant != null &&
+            participantHistoryOperationBusy(participant.slotId)
+        ) {
+            Toast.makeText(
+                getApplication(),
+                "请等待历史文件读取完成，再关闭设备",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
         if (recEngine.recordingPhase.value != FlashRecordingPhase.Idle || _isRecording.value) {
             Toast.makeText(getApplication(), "请先停止采集，再关闭设备", Toast.LENGTH_SHORT).show()
             return
@@ -767,6 +957,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         val targets = participantTargets(participant)
         if (targets.size != 2) {
             Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (participantHistoryOperationBusy(slotId)) {
+            Toast.makeText(
+                getApplication(),
+                "请等待${participant.athleteName}的历史文件读取完成",
+                Toast.LENGTH_SHORT,
+            ).show()
             return
         }
         if (
@@ -864,6 +1062,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         val participant = _deviceRoleConfig.value.participants
             .firstOrNull { it.slotId == slotId }
             ?: return
+        if (participantHistoryOperationBusy(slotId)) {
+            Toast.makeText(
+                getApplication(),
+                "请等待历史文件读取完成，再解除同步",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
         stopSyncTargets(participantTargets(participant))
     }
 
@@ -1255,6 +1461,14 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             Toast.makeText(getApplication(), "该运动员左右脚配置不完整", Toast.LENGTH_SHORT).show()
             return
         }
+        if (participantHistoryOperationBusy(slotId)) {
+            Toast.makeText(
+                getApplication(),
+                "请等待历史文件读取完成，再开始采集",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
         if (!targets.all { target -> target in engine.connectedDevices.value.map(LongJumpDeviceRoles::normalizeDeviceId) }) {
             Toast.makeText(getApplication(), "${participant.athleteName}设备未全部连接", Toast.LENGTH_SHORT).show()
             return
@@ -1264,6 +1478,9 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
         if (slotId in _participantPreparingSlots.value) return
+        if (slotId in _visibleHistoryParticipantSlots.value) {
+            closeParticipantHistory(slotId)
+        }
 
         if (!participantRecordingSetupReady(targets)) {
             prepareAndStartParticipantRecording(participant, targets)
@@ -1423,10 +1640,45 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     fun requestFiles() = recEngine.requestFileInfo()
 
     fun requestParticipantFiles(slotId: String) {
+        if (slotId in _visibleHistoryParticipantSlots.value) {
+            closeParticipantHistory(slotId)
+            return
+        }
+        val targets = validateParticipantHistoryRequest(slotId) ?: return
+        clearParticipantFileSelection(slotId)
+        _visibleHistoryParticipantSlots.value += slotId
+        enqueueParticipantHistoryRequest(slotId, targets)
+    }
+
+    fun retryParticipantFiles(slotId: String) {
+        if (slotId !in _visibleHistoryParticipantSlots.value) return
+        if (participantHistoryOperationBusy(slotId)) return
+        val targets = validateParticipantHistoryRequest(slotId) ?: return
+        clearParticipantFileSelection(slotId)
+        enqueueParticipantHistoryRequest(slotId, targets)
+    }
+
+    private fun validateParticipantHistoryRequest(slotId: String): Set<String>? {
         val participant = _deviceRoleConfig.value.participants
             .firstOrNull { it.slotId == slotId }
-            ?: return
+            ?: return null
         val targets = participantTargets(participant)
+        if (isSyncing.value) {
+            Toast.makeText(
+                getApplication(),
+                "请等待同步完成，再读取历史文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return null
+        }
+        if (recEngine.exportTaskProgress.value.hasPendingFiles) {
+            Toast.makeText(
+                getApplication(),
+                "请等待当前导出完成，再读取历史文件",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return null
+        }
         val connected = engine.connectedDevices.value
             .map(LongJumpDeviceRoles::normalizeDeviceId)
             .toSet()
@@ -1436,7 +1688,7 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
                 "${participant.athleteName}设备未全部连接",
                 Toast.LENGTH_SHORT,
             ).show()
-            return
+            return null
         }
         val activeTargets = targets.filter { target ->
             recEngine.deviceRecordingPhases.value[target] in setOf(
@@ -1451,21 +1703,147 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
                 "请先结束该运动员的录制",
                 Toast.LENGTH_SHORT,
             ).show()
+            return null
+        }
+        return targets
+    }
+
+    private fun closeParticipantHistory(slotId: String) {
+        _visibleHistoryParticipantSlots.value -= slotId
+        _historyRequestErrors.value -= slotId
+        clearParticipantFileSelection(slotId)
+        if (slotId in _historyLoadingParticipantSlots.value) {
             return
         }
-        _selectedFileKeys.update { current ->
-            current.filterNot { key ->
-                targets.any { target -> key.startsWith("$target-") }
-            }.toSet()
-        }
-        if (!recEngine.requestFileInfo(targets)) {
-            Toast.makeText(
-                getApplication(),
-                "设备正忙，请稍后读取历史文件",
-                Toast.LENGTH_SHORT,
-            ).show()
+        historyRequestGenerations[slotId] =
+            (historyRequestGenerations[slotId] ?: 0) + 1
+        _historyQueuedParticipantSlots.value -= slotId
+    }
+
+    fun closeAllParticipantHistories() {
+        _visibleHistoryParticipantSlots.value.toList().forEach(::closeParticipantHistory)
+    }
+
+    private fun enqueueParticipantHistoryRequest(
+        slotId: String,
+        targets: Set<String>,
+    ) {
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+            ?: return
+        val generation = (historyRequestGenerations[slotId] ?: 0) + 1
+        historyRequestGenerations[slotId] = generation
+        _historyRequestErrors.value -= slotId
+        _historyLoadingParticipantSlots.value -= slotId
+        _historyQueuedParticipantSlots.value += slotId
+        historyRequestChannel.trySend(
+            ParticipantHistoryRequest(
+                slotId = slotId,
+                targets = targets,
+                configFingerprint = participantHistoryConfigFingerprint(participant),
+                generation = generation,
+            )
+        )
+        if (targets.isEmpty()) {
+            _historyQueuedParticipantSlots.value -= slotId
         }
     }
+
+    private suspend fun processParticipantHistoryRequest(
+        request: ParticipantHistoryRequest,
+    ) {
+        val slotId = request.slotId
+        fun requestCurrent(): Boolean =
+            historyRequestGenerations[slotId] == request.generation
+
+        if (!requestCurrent()) return
+
+        val participant = _deviceRoleConfig.value.participants
+            .firstOrNull { it.slotId == slotId }
+        val targets = request.targets
+        if (
+            participant == null ||
+            targets.size != 2 ||
+            participantHistoryConfigFingerprint(participant) != request.configFingerprint ||
+            participantTargets(participant) != targets
+        ) {
+            _historyQueuedParticipantSlots.value -= slotId
+            _historyRequestErrors.value +=
+                (slotId to "分组配置已变化，请重新读取")
+            return
+        }
+
+        val acceptDeadline = SystemClock.elapsedRealtime() + 10 * 60_000L
+        var accepted = false
+        while (requestCurrent() && SystemClock.elapsedRealtime() < acceptDeadline) {
+            val connected = engine.connectedDevices.value
+                .map(LongJumpDeviceRoles::normalizeDeviceId)
+                .toSet()
+            if (!connected.containsAll(targets)) {
+                _historyQueuedParticipantSlots.value -= slotId
+                _historyRequestErrors.value +=
+                    (slotId to "设备已断开，回连后可重新读取")
+                return
+            }
+            if (recEngine.requestFileInfo(targets)) {
+                accepted = true
+                break
+            }
+            delay(300)
+        }
+
+        if (!requestCurrent()) return
+        _historyQueuedParticipantSlots.value -= slotId
+        if (!accepted) {
+            _historyRequestErrors.value +=
+                (slotId to "等待设备操作完成超时，请重试")
+            return
+        }
+
+        _historyLoadingParticipantSlots.value += slotId
+        val completionDeadline = SystemClock.elapsedRealtime() + 15_000L
+        var disconnectReported = false
+        while (requestCurrent() && SystemClock.elapsedRealtime() < completionDeadline) {
+            val statuses = recEngine.fileInfoReadStatuses.value
+            val completed = areFileInfoReadTargetsTerminal(statuses, targets)
+            if (completed) break
+            val connected = engine.connectedDevices.value
+                .map(LongJumpDeviceRoles::normalizeDeviceId)
+                .toSet()
+            if (!connected.containsAll(targets) && !disconnectReported) {
+                disconnectReported = true
+                _historyRequestErrors.value +=
+                    (slotId to "读取过程中设备断开，回连后可重试")
+            }
+            delay(100)
+        }
+        val unfinished = targets.filter {
+            recEngine.fileInfoReadStatuses.value[it]?.phase == FileInfoReadPhase.Reading
+        }.toSet()
+        if (unfinished.isNotEmpty()) {
+            recEngine.expireFileInfoRead(
+                targets = unfinished,
+                message = "文件列表读取未完成",
+            )
+        }
+        if (historyRequestGenerations[slotId] == request.generation) {
+            _historyLoadingParticipantSlots.value -= slotId
+            val statuses = recEngine.fileInfoReadStatuses.value
+            if (targets.any { statuses[it]?.phase == FileInfoReadPhase.Failed }) {
+                _historyRequestErrors.value +=
+                    (slotId to "部分设备读取未完成，请重试")
+            }
+        }
+    }
+
+    private fun participantHistoryConfigFingerprint(
+        participant: CaptureParticipantBinding,
+    ): String = listOf(
+        participant.slotId,
+        participant.athleteId,
+        participant.leftDeviceId,
+        participant.rightDeviceId,
+    ).joinToString("|")
 
     fun stopExportFiles()     = recEngine.stopExporting()
 

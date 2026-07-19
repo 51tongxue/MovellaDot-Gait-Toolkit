@@ -84,6 +84,50 @@ data class ExportTaskProgress(
         get() = targetFileKeys.any { it !in finishedFileKeys }
 }
 
+enum class FileInfoReadPhase {
+    Idle,
+    Reading,
+    Ready,
+    Empty,
+    Failed,
+}
+
+data class FileInfoReadStatus(
+    val phase: FileInfoReadPhase = FileInfoReadPhase.Idle,
+    val message: String? = null,
+    val requestId: Int = 0,
+    val startedAtElapsedMs: Long? = null,
+    val completedAtElapsedMs: Long? = null,
+)
+
+internal val FileInfoReadStatus.hasFreshFiles: Boolean
+    get() = phase == FileInfoReadPhase.Ready
+
+internal fun areFileInfoReadTargetsTerminal(
+    statuses: Map<String, FileInfoReadStatus>,
+    targets: Set<String>,
+): Boolean =
+    targets.isNotEmpty() &&
+        targets.all { target ->
+            statuses[target]?.phase in setOf(
+                FileInfoReadPhase.Ready,
+                FileInfoReadPhase.Empty,
+                FileInfoReadPhase.Failed,
+            )
+        }
+
+internal fun canImplicitlyExportFileInfo(
+    statuses: Map<String, FileInfoReadStatus>,
+    targets: Set<String>,
+): Boolean =
+    targets.isNotEmpty() &&
+        targets.all { target ->
+            statuses[target]?.phase in setOf(
+                FileInfoReadPhase.Ready,
+                FileInfoReadPhase.Empty,
+            )
+        }
+
 data class RecordingExportDecision(
     val id: String,
     val sessionKey: String,
@@ -253,7 +297,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         private const val EXPORT_MAX_RETRIES = 2
         private const val EXPORT_UI_PUBLISH_INTERVAL_MS = 250L
         private const val EXPORT_WRITE_BUFFER_SIZE = 64 * 1024
-        private const val AUTO_FILE_INFO_TIMEOUT_MS = 8_000L
+        private const val FILE_INFO_SINGLE_REQUEST_TIMEOUT_MS = 10_000L
+        private const val FILE_INFO_NEXT_DEVICE_DELAY_MS = 250L
+        private const val FILE_INFO_BATCH_TIMEOUT_PADDING_MS = 3_000L
+        private const val FILE_INFO_CALLBACK_DRAIN_MS = 2_000L
+        private const val AUTO_FILE_INFO_REQUEST_ID = -1
         private const val FLASH_USAGE_REFRESH_INTERVAL_MS = 1_000L
         private const val FLASH_STORAGE_BLOCK_BYTES = 4_096L
         private const val STOP_RETRY_TICK_MS = 1_000L
@@ -428,6 +476,11 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         val fileInfo: DotRecordingFileInfo,
     )
 
+    private data class SerialFileInfoRequest(
+        val address: String,
+        val requestId: Int,
+    )
+
     // ── 导出字段选择 ──
     private val _selectedExportIds = MutableStateFlow(DEFAULT_EXPORT_IDS)
     val selectedExportIds: StateFlow<Set<Byte>> = _selectedExportIds.asStateFlow()
@@ -468,6 +521,19 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
 
     private val _fileList = MutableStateFlow<Map<String, List<DotRecordingFileInfo>>>(emptyMap())
     val fileList: StateFlow<Map<String, List<DotRecordingFileInfo>>> = _fileList.asStateFlow()
+    private val _fileInfoReadStatuses =
+        MutableStateFlow<Map<String, FileInfoReadStatus>>(emptyMap())
+    val fileInfoReadStatuses: StateFlow<Map<String, FileInfoReadStatus>> =
+        _fileInfoReadStatuses.asStateFlow()
+    private val _fileInfoReadActiveTargets = MutableStateFlow<Set<String>>(emptySet())
+    val fileInfoReadActiveTargets: StateFlow<Set<String>> =
+        _fileInfoReadActiveTargets.asStateFlow()
+    private val fileInfoReadEpochs = ConcurrentHashMap<String, Int>()
+    private val fileInfoCallbackLedger = FileInfoCallbackLedger(::normalizeAddress)
+    private val serialFileInfoLock = Any()
+    private val serialFileInfoQueue = ArrayDeque<SerialFileInfoRequest>()
+    @Volatile private var activeSerialFileInfoRequest: SerialFileInfoRequest? = null
+    private var fileInfoReadEpoch = 0
 
     private val _exportProgress = MutableStateFlow<Map<String, Int>>(emptyMap())
     val exportProgress: StateFlow<Map<String, Int>> = _exportProgress.asStateFlow()
@@ -1352,7 +1418,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         mainHandler.postDelayed({
             if (autoExportAfterStop !== session) return@postDelayed
             finishAutoExportFileInfoIfReady(force = true)
-        }, AUTO_FILE_INFO_TIMEOUT_MS)
+        }, fileInfoBatchTimeoutMs(session.targets.size))
     }
 
     private fun finishAutoExportFileInfoIfReady(force: Boolean = false) {
@@ -1361,6 +1427,12 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         if (!force && pendingAutoFileInfoTargets.isNotEmpty()) return
         if (force && pendingAutoFileInfoTargets.isNotEmpty()) {
             val missing = pendingAutoFileInfoTargets.toSet()
+            missing.forEach { address ->
+                removeOutstandingFileInfoRequest(
+                    address,
+                    AUTO_FILE_INFO_REQUEST_ID,
+                )
+            }
             pendingAutoFileInfoTargets.clear()
             pendingAutoFileInfoRequests.clear()
             autoExportAfterStop = null
@@ -1589,6 +1661,27 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             return false
         }
 
+        val activeFileReads = _fileInfoReadActiveTargets.value
+        if (targets.any { it in activeFileReads }) {
+            appendLog("目标设备正在读取文件列表，请稍候")
+            return false
+        }
+        val activeExportTargets = _exportTaskProgress.value.targetAddresses
+        if (
+            _exportTaskProgress.value.hasPendingFiles &&
+            targets.any { it in activeExportTargets }
+        ) {
+            appendLog("目标设备正在导出文件，请稍候")
+            return false
+        }
+        if (
+            _eraseTaskProgress.value.isErasing &&
+            command != RecordingCommand.Erase
+        ) {
+            appendLog("Flash 擦除尚未完成，请稍候")
+            return false
+        }
+
         if (command == RecordingCommand.Start) {
             val notReady = targets - _notificationReady.value
             if (notReady.isNotEmpty()) {
@@ -1648,6 +1741,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                             FlashRecordingPhase.Recording,
                         )
                     }
+                    RecordingCommand.RequestFiles ->
+                        markFileInfoReadFailed(op.targets, "设备状态查询超时")
                     else -> Unit
                 }
             }
@@ -1682,6 +1777,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
                     setDeviceRecordingPhase(op.targets, FlashRecordingPhase.Idle)
                 RecordingCommand.Stop ->
                     setDeviceRecordingPhase(op.targets, FlashRecordingPhase.Recording)
+                RecordingCommand.RequestFiles ->
+                    markFileInfoReadFailed(op.targets, "设备当前状态不允许读取文件")
                 else -> Unit
             }
             return
@@ -1726,6 +1823,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         _notificationReady.value = emptySet()
         _flashInfo.value = emptyMap()
         _fileList.value = emptyMap()
+        _fileInfoReadStatuses.value = emptyMap()
+        _fileInfoReadActiveTargets.value = emptySet()
         _exportProgress.value = emptyMap()
         _exportDone.value = emptySet()
         _log.value = emptyList()
@@ -1747,6 +1846,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         mainHandler.removeCallbacks(reliableStopRunnable)
         latestRecordingStates.clear()
         pendingStateChecks.clear()
+        clearSerialFileInfoRequests()
+        fileInfoCallbackLedger.clear()
         lastNotificationEnableRequestAt.clear()
         startAckTargets = emptySet()
         stopAckTargets = emptySet()
@@ -2042,6 +2143,7 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     }
 
     private fun doStartRecording(targets: Set<String>) {
+        invalidateFileInfoResults(targets, "录制后需重新读取文件列表")
         val sessionKey = recordingSessionKey(targets)
         val baselineKeys = fileKeysForTargets(targets)
         val sessionStartUtcMs = System.currentTimeMillis()
@@ -2219,19 +2321,268 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     }
 
     fun requestFileInfo() {
-        requestStateThenRun(RecordingCommand.RequestFiles)
+        requestFileInfo(connectedManagerKeys())
     }
 
-    fun requestFileInfo(targetAddresses: Set<String>): Boolean =
-        requestStateThenRun(
+    fun requestFileInfo(targetAddresses: Set<String>): Boolean {
+        val targets = targetAddresses.map(::normalizeAddress).toSet()
+        if (targets.isEmpty()) return false
+        if (targets.any(::hasOutstandingFileInfoRequest)) {
+            appendLog("正在等待上一轮文件列表回调释放，请稍候")
+            return false
+        }
+        val accepted = requestStateThenRun(
             command = RecordingCommand.RequestFiles,
-            explicitTargets = targetAddresses,
+            explicitTargets = targets,
         )
+        if (!accepted) return false
+
+        val epoch = ++fileInfoReadEpoch
+        val startedAt = SystemClock.elapsedRealtime()
+        targets.forEach { address -> fileInfoReadEpochs[address] = epoch }
+        _fileInfoReadActiveTargets.value += targets
+        _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also { statuses ->
+            targets.forEach { address ->
+                statuses[address] = FileInfoReadStatus(
+                    phase = FileInfoReadPhase.Reading,
+                    requestId = epoch,
+                    startedAtElapsedMs = startedAt,
+                )
+            }
+        }
+        mainHandler.postDelayed({
+            val timedOut = targets.filter { address ->
+                fileInfoReadEpochs[address] == epoch &&
+                    _fileInfoReadStatuses.value[address]?.phase == FileInfoReadPhase.Reading
+            }.toSet()
+            if (timedOut.isNotEmpty()) {
+                markFileInfoReadFailed(
+                    targets = timedOut,
+                    message = "读取文件列表超时",
+                    requestId = epoch,
+                )
+                appendLog("文件列表读取超时：${timedOut.joinToString()}")
+                mainHandler.postDelayed({
+                    timedOut.forEach { address ->
+                        removeOutstandingFileInfoRequest(address, epoch)
+                    }
+                }, FILE_INFO_CALLBACK_DRAIN_MS)
+            }
+        }, fileInfoBatchTimeoutMs(targets.size))
+        return true
+    }
+
+    fun expireFileInfoRead(
+        targets: Set<String>,
+        message: String,
+    ) {
+        markFileInfoReadFailed(
+            targets = targets.map(::normalizeAddress).toSet(),
+            message = message,
+        )
+    }
+
+    private fun markFileInfoReadFailed(
+        targets: Set<String>,
+        message: String,
+        requestId: Int? = null,
+    ) {
+        val completedAt = SystemClock.elapsedRealtime()
+        val failedTargets = mutableSetOf<String>()
+        _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also { statuses ->
+            targets.forEach { address ->
+                val current = statuses[address]
+                if (
+                    requestId != null &&
+                    current?.requestId != requestId
+                ) {
+                    return@forEach
+                }
+                statuses[address] = FileInfoReadStatus(
+                    phase = FileInfoReadPhase.Failed,
+                    message = message,
+                    requestId = current?.requestId ?: requestId ?: 0,
+                    startedAtElapsedMs = current?.startedAtElapsedMs,
+                    completedAtElapsedMs = completedAt,
+                )
+                failedTargets += address
+            }
+        }
+        _fileInfoReadActiveTargets.value -= failedTargets
+    }
 
     private fun doRequestFileInfo(targets: Set<String>) {
-        _fileList.value = _fileList.value - targets
-        targets.forEach { addr -> managers[addr]?.requestFileInfo() }
-        appendLog("正在获取 ${targets.size} 台设备的文件列表…")
+        val queuedTargets = mutableListOf<String>()
+        targets.sorted().forEach { addr ->
+            val requestId = _fileInfoReadStatuses.value[addr]?.requestId ?: return@forEach
+            val manager = managers[addr]
+            if (manager == null) {
+                markFileInfoReadFailed(
+                    targets = setOf(addr),
+                    message = "设备文件管理器不存在",
+                    requestId = requestId,
+                )
+                return@forEach
+            }
+            queuedTargets += addr
+            enqueueSerialFileInfoRequest(addr, requestId)
+        }
+        appendLog("正在依次读取 ${queuedTargets.size} 台设备的文件列表…")
+    }
+
+    private fun fileInfoBatchTimeoutMs(targetCount: Int): Long =
+        FILE_INFO_SINGLE_REQUEST_TIMEOUT_MS * targetCount.coerceAtLeast(1) +
+            FILE_INFO_NEXT_DEVICE_DELAY_MS * (targetCount - 1).coerceAtLeast(0) +
+            FILE_INFO_BATCH_TIMEOUT_PADDING_MS
+
+    private fun enqueueSerialFileInfoRequest(
+        address: String,
+        requestId: Int,
+    ) {
+        val request = SerialFileInfoRequest(
+            address = normalizeAddress(address),
+            requestId = requestId,
+        )
+        val shouldStart = synchronized(serialFileInfoLock) {
+            val duplicate =
+                activeSerialFileInfoRequest == request ||
+                    serialFileInfoQueue.any { it == request }
+            if (!duplicate) serialFileInfoQueue.addLast(request)
+            activeSerialFileInfoRequest == null
+        }
+        if (shouldStart) startNextSerialFileInfoRequest()
+    }
+
+    private fun isSerialFileInfoRequestStillNeeded(
+        request: SerialFileInfoRequest,
+    ): Boolean =
+        if (request.requestId == AUTO_FILE_INFO_REQUEST_ID) {
+            autoExportAfterStop != null &&
+                request.address in pendingAutoFileInfoTargets
+        } else {
+            request.address in _fileInfoReadActiveTargets.value &&
+                _fileInfoReadStatuses.value[request.address]?.let { status ->
+                    status.phase == FileInfoReadPhase.Reading &&
+                        status.requestId == request.requestId
+                } == true
+        }
+
+    private fun startNextSerialFileInfoRequest() {
+        var next: SerialFileInfoRequest? = null
+        synchronized(serialFileInfoLock) {
+            if (activeSerialFileInfoRequest != null) return
+            while (serialFileInfoQueue.isNotEmpty() && next == null) {
+                val candidate = serialFileInfoQueue.removeFirst()
+                if (isSerialFileInfoRequestStillNeeded(candidate)) {
+                    activeSerialFileInfoRequest = candidate
+                    next = candidate
+                }
+            }
+        }
+        val request = next ?: return
+        val manager = managers[request.address]
+        if (manager == null) {
+            failSerialFileInfoRequest(request, "设备文件管理器不存在")
+            releaseSerialFileInfoRequest(request)
+            return
+        }
+
+        enqueueOutstandingFileInfoRequest(request.address, request.requestId)
+        appendLog("[${manager.mDevice?.address ?: request.address}] 正在读取文件信息")
+        runCatching {
+            manager.requestFileInfo()
+        }.onFailure { error ->
+            removeOutstandingFileInfoRequest(request.address, request.requestId)
+            failSerialFileInfoRequest(
+                request,
+                "启动文件列表读取失败：${error.message ?: "未知错误"}",
+            )
+            releaseSerialFileInfoRequest(request)
+            return
+        }
+        mainHandler.postDelayed({
+            val timedOut = synchronized(serialFileInfoLock) {
+                if (activeSerialFileInfoRequest == request) {
+                    activeSerialFileInfoRequest = null
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!timedOut) return@postDelayed
+            removeOutstandingFileInfoRequest(request.address, request.requestId)
+            failSerialFileInfoRequest(request, "读取文件列表超时")
+            mainHandler.postDelayed(
+                ::startNextSerialFileInfoRequest,
+                FILE_INFO_CALLBACK_DRAIN_MS,
+            )
+        }, FILE_INFO_SINGLE_REQUEST_TIMEOUT_MS)
+    }
+
+    private fun failSerialFileInfoRequest(
+        request: SerialFileInfoRequest,
+        message: String,
+    ) {
+        if (request.requestId == AUTO_FILE_INFO_REQUEST_ID) {
+            pendingAutoFileInfoTargets.remove(request.address)
+            pendingAutoFileInfoRequests.remove(request.address)
+            appendLog("[${request.address}] $message")
+            finishAutoExportFileInfoIfReady()
+        } else {
+            markFileInfoReadFailed(
+                targets = setOf(request.address),
+                message = message,
+                requestId = request.requestId,
+            )
+        }
+    }
+
+    private fun releaseSerialFileInfoRequest(
+        request: SerialFileInfoRequest,
+    ) {
+        val released = synchronized(serialFileInfoLock) {
+            if (activeSerialFileInfoRequest == request) {
+                activeSerialFileInfoRequest = null
+                true
+            } else {
+                false
+            }
+        }
+        if (released) {
+            mainHandler.postDelayed(
+                ::startNextSerialFileInfoRequest,
+                FILE_INFO_NEXT_DEVICE_DELAY_MS,
+            )
+        }
+    }
+
+    private fun clearSerialFileInfoRequests() {
+        synchronized(serialFileInfoLock) {
+            serialFileInfoQueue.clear()
+            activeSerialFileInfoRequest = null
+        }
+    }
+
+    private fun hasOutstandingFileInfoRequest(address: String): Boolean {
+        return fileInfoCallbackLedger.hasOutstanding(address)
+    }
+
+    private fun enqueueOutstandingFileInfoRequest(
+        address: String,
+        requestId: Int,
+    ) {
+        fileInfoCallbackLedger.enqueue(address, requestId)
+    }
+
+    private fun popOutstandingFileInfoRequest(address: String): Int? {
+        return fileInfoCallbackLedger.pop(address)
+    }
+
+    private fun removeOutstandingFileInfoRequest(
+        address: String,
+        requestId: Int,
+    ) {
+        fileInfoCallbackLedger.remove(address, requestId)
     }
 
     /** 对所有设备并行导出全部文件。 */
@@ -2657,6 +3008,8 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         recordingStartedAtElapsedMs.clear()
         pendingAutoFileInfoTargets.clear()
         pendingAutoFileInfoRequests.clear()
+        clearSerialFileInfoRequests()
+        fileInfoCallbackLedger.clear()
         startAckTargets = emptySet()
         stopAckTargets = emptySet()
         recordingSessionUtcByDevice.clear()
@@ -2665,6 +3018,19 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         queuedAutoExportSessions.clear()
         _recordingExportDecisions.value = emptyMap()
         pendingOperation = null
+        val resetAt = SystemClock.elapsedRealtime()
+        _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.mapValues { (_, status) ->
+            if (status.phase == FileInfoReadPhase.Reading) {
+                status.copy(
+                    phase = FileInfoReadPhase.Failed,
+                    message = "设备引擎已重置",
+                    completedAtElapsedMs = resetAt,
+                )
+            } else {
+                status
+            }
+        }
+        _fileInfoReadActiveTargets.value = emptySet()
         _notificationReady.value = emptySet()
         _flashInfo.value = emptyMap()
         _recordingStates.value = emptyMap()
@@ -2721,7 +3087,10 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
         ) {
             mainHandler.postDelayed({
                 if (norm in pendingAutoFileInfoTargets && autoExportAfterStop != null) {
-                    managers[norm]?.requestFileInfo()
+                    enqueueSerialFileInfoRequest(
+                        norm,
+                        AUTO_FILE_INFO_REQUEST_ID,
+                    )
                 }
             }, 150L)
         }
@@ -2743,7 +3112,17 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
             )
         }
         if (isSuccess) {
-            _fileList.value = _fileList.value.toMutableMap().also { it.remove(norm) }
+            val completedAt = SystemClock.elapsedRealtime()
+            _fileList.value = _fileList.value.toMutableMap().also { it[norm] = emptyList() }
+            _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also {
+                val current = it[norm]
+                it[norm] = FileInfoReadStatus(
+                    phase = FileInfoReadPhase.Empty,
+                    requestId = current?.requestId ?: 0,
+                    startedAtElapsedMs = current?.startedAtElapsedMs,
+                    completedAtElapsedMs = completedAt,
+                )
+            }
             managers[norm]?.requestFlashInfo()
         }
     }
@@ -2875,22 +3254,100 @@ class RecordingEngine(private val context: Context) : DotRecordingCallback {
     ) {
         val addr = address ?: return
         val norm = normalizeAddress(addr)
-        if (isSuccess && !list.isNullOrEmpty()) {
-            _fileList.value = _fileList.value.toMutableMap().also { it[norm] = list.toList() }
-            appendLog("[$addr] 共 ${list.size} 个录制文件")
-            list.forEach { f ->
-                appendLog("  ↳ ${f.fileName}  ${f.dataSize / 1024}KB")
+        val callbackRequestId = popOutstandingFileInfoRequest(norm)
+        val manualReadActive =
+            norm in _fileInfoReadActiveTargets.value &&
+                _fileInfoReadStatuses.value[norm]?.phase == FileInfoReadPhase.Reading &&
+                callbackRequestId == _fileInfoReadStatuses.value[norm]?.requestId
+        val autoReadActive =
+            norm in pendingAutoFileInfoTargets &&
+                callbackRequestId == AUTO_FILE_INFO_REQUEST_ID
+        if (!manualReadActive && !autoReadActive) {
+            callbackRequestId?.let { requestId ->
+                releaseSerialFileInfoRequest(
+                    SerialFileInfoRequest(norm, requestId),
+                )
+            }
+            appendLog("[$addr] 忽略已结束请求的文件列表回调")
+            return
+        }
+        val currentStatus = _fileInfoReadStatuses.value[norm]
+        val completedAt = SystemClock.elapsedRealtime()
+        val fileSnapshots = list?.let(::snapshotRecordingFileInfos).orEmpty()
+        if (isSuccess && fileSnapshots.isNotEmpty()) {
+            _fileList.value = _fileList.value.toMutableMap().also {
+                it[norm] = fileSnapshots
+            }
+            if (manualReadActive) {
+                _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also {
+                    it[norm] = FileInfoReadStatus(
+                        phase = FileInfoReadPhase.Ready,
+                        requestId = currentStatus?.requestId ?: 0,
+                        startedAtElapsedMs = currentStatus?.startedAtElapsedMs,
+                        completedAtElapsedMs = completedAt,
+                    )
+                }
+            }
+            appendLog("[$addr] 共 ${fileSnapshots.size} 个录制文件")
+            fileSnapshots.forEach { f ->
+                appendLog(
+                    "  ↳ id=${f.fileId} ${f.fileName} " +
+                        "${f.dataSize / 1024}KB ts=${f.startRecordingTimestamp}",
+                )
             }
         } else {
             appendLog("[$addr] ${if (isSuccess) "无录制文件" else "获取文件列表失败"}")
             if (isSuccess) {
                 _fileList.value = _fileList.value.toMutableMap().also { it[norm] = emptyList() }
+                if (manualReadActive) {
+                    _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also {
+                        it[norm] = FileInfoReadStatus(
+                            phase = FileInfoReadPhase.Empty,
+                            requestId = currentStatus?.requestId ?: 0,
+                            startedAtElapsedMs = currentStatus?.startedAtElapsedMs,
+                            completedAtElapsedMs = completedAt,
+                        )
+                    }
+                }
+            } else if (manualReadActive) {
+                markFileInfoReadFailed(
+                    targets = setOf(norm),
+                    message = "设备返回文件列表失败",
+                    requestId = currentStatus?.requestId,
+                )
             }
+        }
+        if (manualReadActive) {
+            _fileInfoReadActiveTargets.value -= norm
+        }
+        callbackRequestId?.let { requestId ->
+            releaseSerialFileInfoRequest(
+                SerialFileInfoRequest(norm, requestId),
+            )
         }
         if (norm in pendingAutoFileInfoTargets) {
             pendingAutoFileInfoTargets.remove(norm)
             pendingAutoFileInfoRequests.remove(norm)
             finishAutoExportFileInfoIfReady()
+        }
+    }
+
+    private fun invalidateFileInfoResults(
+        targets: Set<String>,
+        message: String,
+    ) {
+        val normalizedTargets = targets.map(::normalizeAddress).toSet()
+        _fileInfoReadStatuses.value = _fileInfoReadStatuses.value.toMutableMap().also { statuses ->
+            normalizedTargets.forEach { address ->
+                val current = statuses[address]
+                statuses[address] = FileInfoReadStatus(
+                    phase = FileInfoReadPhase.Idle,
+                    message = message,
+                    requestId = current?.requestId ?: 0,
+                    startedAtElapsedMs = current?.startedAtElapsedMs,
+                    completedAtElapsedMs = current?.completedAtElapsedMs,
+                )
+            }
         }
     }
 

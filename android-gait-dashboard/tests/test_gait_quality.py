@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -15,15 +16,19 @@ from gait_analyzer import (
     IncrementalBilateralGaitDetector,
     OfflineGaitEventDetector,
     OfflineGaitEventPipeline,
+    _complete_single_leg_cycles,
     detect_offline_gait_events,
     _find_ic_time,
     _recover_missing_tc_events_by_phase,
     _recovery_cycle_template_similarity,
+    build_display_signals,
     calculate_bilateral_double_support,
     calculate_bilateral_flight_time,
     calculate_gait_status,
+    calculate_single_leg_strides_with_pairing,
     calculate_stride_length,
     detect_bilateral_gait_bouts,
+    process_gait_data,
     recover_missing_gait_events_short_delay,
     segment_bilateral_contacts,
 )
@@ -138,6 +143,32 @@ def make_offline_candidate(
 
 
 class GaitQualityTests(unittest.TestCase):
+    def test_display_signal_downsampling_preserves_event_samples(self):
+        timestamps = np.arange(0, 10001, dtype=np.int64)
+        event_time = 4321
+        signal = timestamps.astype(np.float64) * -0.25
+        zeros = np.zeros(timestamps.size, dtype=np.float64)
+        idata = pd.DataFrame({
+            "Timestamp": timestamps,
+            "ACC.X": zeros,
+            "ACC.Y": zeros,
+            "ACC.Z": zeros,
+            "Gmax(°/s)": signal,
+            "Gyro.X": zeros,
+            "Gyro.Y": signal,
+            "Gyro.Z": zeros,
+        })
+
+        display = build_display_signals(
+            idata,
+            max_points=100,
+            event_timestamps={"hs": [event_time]},
+        )
+
+        event_index = display["timestamps"].index(event_time)
+        self.assertEqual(signal[event_time], display["gyro_y"][event_index])
+        self.assertLessEqual(len(display["timestamps"]), 100)
+
     def test_double_support_uses_real_bilateral_interval_overlap(self):
         overlap = calculate_bilateral_double_support(
             primary_hs=[0, 800, 1600],
@@ -336,6 +367,72 @@ class GaitQualityTests(unittest.TestCase):
             for event in events
         ))
 
+    def test_contralateral_impact_cannot_promote_a_nonstructural_swing_lobe(self):
+        timestamps = np.asarray([
+            0.0, 50.0, 80.0, 150.0,
+            500.0, 530.0, 560.0, 650.0,
+            1000.0, 1050.0, 1080.0, 1150.0,
+            1500.0, 1530.0, 1560.0, 1650.0,
+            2000.0, 2050.0, 2080.0, 2150.0,
+        ])
+        signal = np.asarray([
+            450.0, 0.0, -120.0, 0.0,
+            35.0, 0.0, -25.0, 0.0,
+            480.0, 0.0, -130.0, 0.0,
+            28.0, 0.0, -22.0, 0.0,
+            430.0, 0.0, -110.0, 0.0,
+        ])
+        impact = np.zeros(timestamps.size, dtype=np.float64)
+        impact[[5, 13]] = 8.0
+
+        events = detect_offline_gait_events(
+            signal,
+            timestamps,
+            acc_x=impact,
+            acc_y=np.zeros_like(impact),
+            acc_z=np.zeros_like(impact),
+            min_same_foot_interval_ms=0.0,
+        )
+
+        self.assertEqual([50.0, 1050.0, 2050.0], [
+            event["ic_time"] for event in events
+        ])
+
+    def test_event_times_are_invariant_to_gyro_amplitude_scale(self):
+        timestamps = np.arange(0.0, 3600.0, 10.0)
+        signal = np.zeros(timestamps.size, dtype=np.float64)
+        for ic_time in (700.0, 1600.0, 2500.0, 3400.0):
+            signal += (
+                240.0
+                * np.exp(
+                    -0.5
+                    * ((timestamps - (ic_time - 180.0)) / 55.0) ** 2
+                )
+                - 180.0
+                * np.exp(
+                    -0.5
+                    * ((timestamps - ic_time) / 45.0) ** 2
+                )
+            )
+
+        event_times = []
+        for scale in (0.0001, 1.0, 100.0):
+            events = detect_offline_gait_events(
+                signal * scale,
+                timestamps,
+                min_same_foot_interval_ms=250.0,
+            )
+            event_times.append([
+                event["ic_time"] for event in events
+            ])
+
+        self.assertEqual(event_times[0], event_times[1])
+        self.assertEqual(event_times[1], event_times[2])
+        self.assertEqual(
+            [630.0, 1530.0, 2430.0, 3330.0],
+            event_times[1],
+        )
+
     def test_offline_pipeline_is_deterministic(self):
         timestamps = np.arange(0.0, 3000.0, 10.0)
         signal = (
@@ -409,6 +506,63 @@ class GaitQualityTests(unittest.TestCase):
         self.assertEqual([50.0] * 4, [
             event["msw_value"] for event in events[-4:]
         ])
+
+    def test_startup_gaps_do_not_raise_the_later_minimum_interval(self):
+        detector = OfflineGaitEventDetector(
+            min_same_foot_interval_ms=250.0
+        )
+        ic_times = [
+            0.0,
+            2000.0,
+            6000.0,
+            8200.0,
+            8891.0,
+            9450.0,
+            9950.0,
+        ]
+        events = detector.validate([
+            make_offline_candidate(
+                ic_time - 80.0,
+                peak_dps=400.0,
+                impact_g=4.0,
+            )
+            for ic_time in ic_times
+        ])
+
+        self.assertEqual(ic_times, [
+            event["ic_time"] for event in events
+        ])
+
+    def test_formal_analysis_does_not_synthesize_missing_events(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "D422CD007E6E_20260409_165408.csv"
+        )
+        with patch(
+            "gait_analyzer.recover_missing_gait_events_short_delay",
+            side_effect=AssertionError(
+                "正式分析不应调用自动事件恢复"
+            ),
+        ):
+            result = json.loads(process_gait_data(
+                str(source),
+                long_jump_takeoff_step=-1,
+            ))
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("event_recovery", result["gait_quality"])
+        self.assertIn("detected_events", result)
+        self.assertIn("detected_events", result["contra_data"])
+        self.assertTrue(
+            set(result["events"]["msw"])
+            .issubset(result["detected_events"]["msw"])
+        )
+        self.assertTrue(
+            set(result["contra_data"]["events"]["msw"])
+            .issubset(
+                result["contra_data"]["detected_events"]["msw"]
+            )
+        )
 
     def test_turn_like_peak_reduction_is_kept_when_contact_evidence_remains(self):
         detector = OfflineGaitEventDetector(
@@ -848,6 +1002,67 @@ class GaitQualityTests(unittest.TestCase):
         self.assertEqual(1, len(bouts))
         self.assertEqual(1, diagnostics["valid_bout_count"])
         self.assertGreater(bouts[0]["median_cycle_correlation"], 0.9)
+
+    def test_five_complete_cycles_are_a_valid_short_gait_record(self):
+        events = make_events([1000], 5)
+        bouts, diagnostics = detect_bilateral_gait_bouts(
+            make_signal(7000),
+            events[0],
+            events[1],
+            make_signal(7000, phase=np.pi),
+            events[2],
+            events[3],
+        )
+
+        self.assertEqual(1, len(bouts))
+        self.assertEqual(10, bouts[0]["contact_count"])
+        self.assertEqual(1.0, bouts[0]["primary_complete_cycle_ratio"])
+        self.assertEqual(
+            1.0,
+            bouts[0]["contralateral_complete_cycle_ratio"],
+        )
+        self.assertEqual(1, diagnostics["valid_bout_count"])
+
+    def test_unpaired_complete_cycle_keeps_single_leg_metrics_only(self):
+        idata = make_event_aligned_signal(duration_ms=5000)
+        idata["ACC.Z"] = 0.0
+        hs = [1000, 2000, 3000, 4000]
+        toe_off = [1600, 2600, 3600]
+        mid_stance = [1300, 2300, 3300]
+        cycles = _complete_single_leg_cycles(hs, toe_off)
+        paired_strides = [{
+            "hs_timestamp_ms": 1000,
+            "to_timestamp_ms": 1600,
+            "stride_time_s": 1.0,
+            "contact_time_ms": 600,
+            "double_support_time_ms": 120,
+            "swing_time_ms": 400,
+            "step_frequency_spm": 120,
+            "stride_length_m": 1.2,
+            "stride_velocity_mps": 1.2,
+            "vGRF_peak_BW": 1.8,
+            "flight_time_ms": None,
+            "gait_status": "Walk",
+        }]
+
+        strides = calculate_single_leg_strides_with_pairing(
+            hs,
+            toe_off,
+            mid_stance,
+            idata,
+            cycles,
+            paired_strides,
+        )
+
+        self.assertEqual(3, len(strides))
+        self.assertTrue(strides[0]["bilaterally_paired"])
+        unpaired = strides[1]
+        self.assertFalse(unpaired["bilaterally_paired"])
+        self.assertEqual(600, unpaired["contact_time_ms"])
+        self.assertEqual(400, unpaired["swing_time_ms"])
+        self.assertIsNone(unpaired["double_support_time_ms"])
+        self.assertIsNone(unpaired["flight_time_ms"])
+        self.assertIsNone(unpaired["vGRF_peak_BW"])
 
     def test_turn_gap_splits_stable_gait_bouts(self):
         events = make_events([1000, 10000], 7)

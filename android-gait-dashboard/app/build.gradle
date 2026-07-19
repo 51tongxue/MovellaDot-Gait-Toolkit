@@ -88,4 +88,5 @@ dependencies {
     implementation files('../../android-xsens-dot/app/libs/Movella_DOT_SDK_Core_Android_v2025.1.1-release.aar')
 
     implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    testImplementation 'junit:junit:4.13.2'
 }

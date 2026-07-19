@@ -35,12 +35,14 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.buct.xsens.dot.ui.theme.Border
 import com.buct.xsens.dot.ui.theme.Green
 import com.buct.xsens.dot.ui.theme.Muted
 import com.buct.xsens.dot.ui.theme.Surface
+import com.buct.xsens.dot.ui.theme.Text as AppText
 import com.buct.xsens.gait.analysis.GaitEvents
 import com.buct.xsens.gait.analysis.SideSignalResult
 import kotlin.math.abs
@@ -73,6 +75,9 @@ fun AnalysisLineChart(
     valueUnit: String,
     valueDecimals: Int,
     threshold: AnalysisChartThreshold? = null,
+    chartHeight: Dp = 220.dp,
+    headerLabel: String? = null,
+    selectionResetKey: Int = 0,
     modifier: Modifier = Modifier,
 ) {
     val hasBothSides = leftPoints.isNotEmpty() && rightPoints.isNotEmpty()
@@ -96,22 +101,31 @@ fun AnalysisLineChart(
     val chartMinY = minY - yPadding
     val chartMaxY = maxY + yPadding
     val yRange = chartMaxY - chartMinY
-    var selectedPoint by remember(allPoints) {
+    var selectedPoint by remember(allPoints, selectionResetKey) {
         mutableStateOf<AnalysisChartPoint?>(null)
     }
 
     Column(modifier = modifier) {
-        if (hasBothSides) {
+        if (headerLabel != null || hasBothSides) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = 8.dp),
-                horizontalArrangement = Arrangement.End,
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                ChartLegendItem("左脚", lineColor.copy(alpha = 0.5f), fillAlpha = 0f)
-                Spacer(Modifier.width(16.dp))
-                ChartLegendItem("右脚", lineColor, fillAlpha = 0.14f)
+                if (headerLabel != null) {
+                    Text(
+                        text = headerLabel,
+                        color = AppText,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                if (hasBothSides) {
+                    ChartLegendItem("左脚", lineColor.copy(alpha = 0.5f), fillAlpha = 0f)
+                    ChartLegendItem("右脚", lineColor, fillAlpha = 0.14f)
+                }
             }
         }
         threshold?.let {
@@ -127,6 +141,7 @@ fun AnalysisLineChart(
         }
         ChartFrame(
             modifier = Modifier,
+            height = chartHeight,
             canvasModifier = Modifier.pointerInput(
                 allPoints,
                 minX,
@@ -146,6 +161,7 @@ fun AnalysisLineChart(
                         minY = chartMinY,
                         yRange = yRange,
                     )
+                    down.consume()
                     do {
                         val event = awaitPointerEvent()
                         val change = event.changes.firstOrNull() ?: break
@@ -332,12 +348,35 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawChartThreshold(
 fun SignalEventChart(
     primary: SideSignalResult?,
     secondary: SideSignalResult?,
+    rangeStartS: Double? = null,
+    rangeEndS: Double? = null,
     modifier: Modifier = Modifier,
 ) {
     ChartFrame(modifier = modifier.height(250.dp)) {
         drawAxes("时间 (s)", "角速度 (°/s)")
+        val rangeStartMs = rangeStartS?.times(1000.0)
+        val rangeEndMs = rangeEndS?.times(1000.0)
         val series = listOfNotNull(primary, secondary).mapNotNull { side ->
-            side.signal?.let { Triple(side, it.timestampsMs, it.gyroY) }
+            side.signal?.let { signal ->
+                val count = minOf(
+                    signal.timestampsMs.size,
+                    signal.gyroY.size,
+                )
+                val indices = (0 until count).filter { index ->
+                    val timestamp = signal.timestampsMs[index]
+                    (rangeStartMs == null || timestamp >= rangeStartMs) &&
+                        (rangeEndMs == null || timestamp <= rangeEndMs)
+                }
+                if (indices.size < 2) {
+                    null
+                } else {
+                    Triple(
+                        side,
+                        indices.map(signal.timestampsMs::get),
+                        indices.map(signal.gyroY::get),
+                    )
+                }
+            }
         }
         if (series.isEmpty()) return@ChartFrame
         val minX = series.minOf { it.second.minOrNull() ?: 0.0 }
@@ -370,13 +409,14 @@ fun SignalEventChart(
 @Composable
 private fun ChartFrame(
     modifier: Modifier,
+    height: Dp = 220.dp,
     canvasModifier: Modifier = Modifier,
     content: androidx.compose.ui.graphics.drawscope.DrawScope.() -> Unit,
 ) {
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(220.dp)
+            .height(height)
             .background(Surface, RoundedCornerShape(8.dp))
             .border(1.dp, Border, RoundedCornerShape(8.dp))
             .padding(8.dp)
@@ -406,13 +446,20 @@ private fun androidx.compose.ui.unit.Density.findNearestChartPoint(
     val bottom = canvasHeight - 38.dp.toPx()
     val width = max(1f, canvasWidth - left - 10.dp.toPx())
     val height = max(1f, bottom - top)
-    return points.minByOrNull { point ->
+    var nearestPoint: AnalysisChartPoint? = null
+    var nearestDistanceSquared = Float.MAX_VALUE
+    points.forEach { point ->
         val pointX = left + ((point.x - minX) / xRange).toFloat() * width
         val pointY = bottom - ((point.y - minY) / yRange).toFloat() * height
         val dx = pointX - touch.x
         val dy = pointY - touch.y
-        dx * dx + dy * dy
+        val distanceSquared = dx * dx + dy * dy
+        if (distanceSquared < nearestDistanceSquared) {
+            nearestDistanceSquared = distanceSquared
+            nearestPoint = point
+        }
     }
+    return nearestPoint.takeIf { nearestDistanceSquared <= 36.dp.toPx() * 36.dp.toPx() }
 }
 
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawChartSelection(
@@ -603,6 +650,9 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawEventMarkers(
     )
     markerGroups.forEach { (eventTimes, color) ->
         eventTimes.forEach eventLoop@{ eventTime ->
+            if (eventTime < minX || eventTime > minX + xRange) {
+                return@eventLoop
+            }
             val index = timestamps.binarySearchNearest(eventTime)
             if (index !in values.indices) return@eventLoop
             val x = plotLeft + ((eventTime - minX) / xRange).toFloat() * plotWidth

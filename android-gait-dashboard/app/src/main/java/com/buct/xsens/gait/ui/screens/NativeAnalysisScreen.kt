@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -58,6 +59,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -163,12 +165,11 @@ fun NativeAnalysisScreen(
                 state = state,
                 onSelectMode = viewModel::setAnalysisMode,
                 onSelectAthlete = viewModel::selectAthlete,
-                onAttemptNoChange = viewModel::updateAttemptNo,
                 onSelectData = {
                     viewModel.refreshCapturedAttempts()
                     showDataDialog = true
                 },
-                onAnalyze = { viewModel.analyze(false) },
+                onAnalyze = viewModel::analyze,
             )
 
             AnalysisSection.Advanced -> AdvancedAnalysisContent(
@@ -176,7 +177,7 @@ fun NativeAnalysisScreen(
                 onStartChange = viewModel::updateRangeStart,
                 onEndChange = viewModel::updateRangeEnd,
                 onClearRange = viewModel::clearRange,
-                onApplyRange = { viewModel.analyze(true) },
+                onApplyRange = viewModel::applyRange,
                 onLanConfigChange = viewModel::updateLanConfig,
                 onSaveLan = viewModel::saveLanConfig,
                 onTestLan = viewModel::testLanConnection,
@@ -251,41 +252,147 @@ private fun MainAnalysisContent(
     state: AnalysisUiState,
     onSelectMode: (AnalysisMode) -> Unit,
     onSelectAthlete: (String) -> Unit,
-    onAttemptNoChange: (String) -> Unit,
     onSelectData: () -> Unit,
     onAnalyze: () -> Unit,
 ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        item {
-            AnalysisPreparationPanel(
-                state = state,
-                onSelectMode = onSelectMode,
-                onSelectAthlete = onSelectAthlete,
-                onAttemptNoChange = onAttemptNoChange,
-                onSelectData = onSelectData,
-                onAnalyze = onAnalyze,
-            )
-        }
-        if (state.isAnalyzing) {
-            item {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth(),
-                    color = Green,
-                    trackColor = Border,
+    val result = state.result
+    var metric by remember(result?.mode, result?.rawJson) {
+        mutableStateOf(MetricKey.Velocity)
+    }
+    var chartSelectionResetKey by remember { mutableIntStateOf(0) }
+    fun clearChartSelection() {
+        chartSelectionResetKey += 1
+    }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val useLandscapeWorkspace = maxWidth >= 900.dp && result != null
+        if (useLandscapeWorkspace && result != null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                AnalysisPreparationPanel(
+                    state = state,
+                    onSelectMode = {
+                        clearChartSelection()
+                        onSelectMode(it)
+                    },
+                    onSelectAthlete = {
+                        clearChartSelection()
+                        onSelectAthlete(it)
+                    },
+                    onSelectData = {
+                        clearChartSelection()
+                        onSelectData()
+                    },
+                    onAnalyze = {
+                        clearChartSelection()
+                        onAnalyze()
+                    },
                 )
+                if (state.isAnalyzing) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Green,
+                        trackColor = Border,
+                    )
+                }
+                if (state.errorMessage.isNotBlank()) {
+                    MessageBand(state.errorMessage, error = true)
+                } else if (state.statusMessage.isNotBlank()) {
+                    MessageBand(state.statusMessage, error = false)
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    AnalysisResultChartPanel(
+                        result = result,
+                        metric = metric,
+                        compact = true,
+                        selectionResetKey = chartSelectionResetKey,
+                        modifier = Modifier
+                            .weight(1.25f)
+                            .fillMaxHeight(),
+                    )
+                    AnalysisMetricTable(
+                        result = result,
+                        metric = metric,
+                        onSelectMetric = {
+                            clearChartSelection()
+                            metric = it
+                        },
+                        scrollable = true,
+                        modifier = Modifier
+                            .weight(1.05f)
+                            .fillMaxHeight(),
+                    )
+                }
             }
-        }
-        if (state.errorMessage.isNotBlank()) {
-            item { MessageBand(state.errorMessage, error = true) }
-        } else if (state.statusMessage.isNotBlank()) {
-            item { MessageBand(state.statusMessage, error = false) }
-        }
-        state.result?.let { result ->
-            item { AnalysisResultPanel(result) }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item {
+                    AnalysisPreparationPanel(
+                        state = state,
+                        onSelectMode = {
+                            clearChartSelection()
+                            onSelectMode(it)
+                        },
+                        onSelectAthlete = {
+                            clearChartSelection()
+                            onSelectAthlete(it)
+                        },
+                        onSelectData = {
+                            clearChartSelection()
+                            onSelectData()
+                        },
+                        onAnalyze = {
+                            clearChartSelection()
+                            onAnalyze()
+                        },
+                    )
+                }
+                if (state.isAnalyzing) {
+                    item {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Green,
+                            trackColor = Border,
+                        )
+                    }
+                }
+                if (state.errorMessage.isNotBlank()) {
+                    item { MessageBand(state.errorMessage, error = true) }
+                } else if (state.statusMessage.isNotBlank()) {
+                    item { MessageBand(state.statusMessage, error = false) }
+                }
+                result?.let { analysisResult ->
+                    item {
+                        AnalysisResultChartPanel(
+                            result = analysisResult,
+                            metric = metric,
+                            selectionResetKey = chartSelectionResetKey,
+                        )
+                    }
+                    item {
+                        AnalysisMetricTable(
+                            result = analysisResult,
+                            metric = metric,
+                            onSelectMetric = {
+                                clearChartSelection()
+                                metric = it
+                            },
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -295,109 +402,100 @@ private fun AnalysisPreparationPanel(
     state: AnalysisUiState,
     onSelectMode: (AnalysisMode) -> Unit,
     onSelectAthlete: (String) -> Unit,
-    onAttemptNoChange: (String) -> Unit,
     onSelectData: () -> Unit,
     onAnalyze: () -> Unit,
 ) {
     val selectedAttempt = state.selectedAttempt
-    Panel(title = "分析模式") {
-        AnalysisModeSelector(
-            selected = state.analysisMode,
-            onSelect = onSelectMode,
-            enabled = !state.isAnalyzing,
-        )
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 14.dp),
-            color = Border,
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+    BoxWithConstraints {
+        val stacked = maxWidth < 900.dp
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Card, RoundedCornerShape(12.dp))
+                .border(1.dp, Border, RoundedCornerShape(12.dp))
+                .padding(if (stacked) 20.dp else 12.dp),
         ) {
-            PreparationLabel("运动员")
-            AthleteDropdown(
-                athletes = state.athletes,
-                selectedId = state.selectedAthleteId,
-                onSelect = onSelectAthlete,
-                modifier = Modifier.weight(1f),
-            )
-            OutlinedTextField(
-                value = state.attemptNo,
-                onValueChange = onAttemptNoChange,
-                label = {
-                    Text(
-                        if (state.analysisMode == AnalysisMode.LongJump) "试跳编号" else "记录编号"
+            if (stacked) {
+                Text(
+                    text = "分析准备",
+                    color = Muted,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Spacer(Modifier.height(12.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    PreparationField(label = "分析模式") {
+                        AnalysisModeSelector(
+                            selected = state.analysisMode,
+                            onSelect = onSelectMode,
+                            enabled = !state.isAnalyzing,
+                        )
+                    }
+                    PreparationField(label = "运动员") {
+                        AthleteDropdown(
+                            athletes = state.athletes,
+                            selectedId = state.selectedAthleteId,
+                            onSelect = onSelectAthlete,
+                        )
+                    }
+                    PreparationField(label = "训练数据") {
+                        TrainingDataSelector(
+                            selectedAttempt = selectedAttempt,
+                            enabled = !state.isAnalyzing,
+                            onClick = onSelectData,
+                        )
+                    }
+                    SuccessButton(
+                        text = if (state.isAnalyzing) "分析中" else "开始分析",
+                        onClick = onAnalyze,
+                        enabled = state.canAnalyze,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 52.dp),
                     )
-                },
-                singleLine = true,
-                modifier = Modifier.width(112.dp),
-                colors = analysisTextFieldColors(),
-            )
-        }
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 14.dp),
-            color = Border,
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            PreparationLabel("训练数据")
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = 54.dp)
-                    .clickable(
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        text = "分析准备",
+                        color = Muted,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.width(68.dp),
+                        maxLines = 1,
+                    )
+                    AnalysisModeSelector(
+                        selected = state.analysisMode,
+                        onSelect = onSelectMode,
+                        enabled = !state.isAnalyzing,
+                        modifier = Modifier.weight(0.95f),
+                    )
+                    AthleteDropdown(
+                        athletes = state.athletes,
+                        selectedId = state.selectedAthleteId,
+                        onSelect = onSelectAthlete,
+                        showDominantLeg = false,
+                        modifier = Modifier.weight(0.65f),
+                    )
+                    TrainingDataSelector(
+                        selectedAttempt = selectedAttempt,
                         enabled = !state.isAnalyzing,
                         onClick = onSelectData,
-                    ),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.CalendarMonth,
-                    contentDescription = null,
-                    tint = Green,
-                    modifier = Modifier.size(24.dp),
-                )
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = selectedAttempt?.let {
-                            "${it.dateLabel}  ${it.timeLabel}"
-                        } ?: "选择采集记录",
-                        color = AppText,
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.SemiBold,
+                        compact = true,
+                        modifier = Modifier.weight(1.45f),
                     )
-                    if (selectedAttempt != null) {
-                        Spacer(Modifier.height(5.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            SideTag(FootSide.Left, selectedAttempt.leftPath != null)
-                            SideTag(FootSide.Right, selectedAttempt.rightPath != null)
-                        }
-                    }
-                }
-                if (selectedAttempt != null) {
-                    Text(
-                        text = "更换",
-                        color = Muted,
-                        style = MaterialTheme.typography.bodySmall,
+                    SuccessButton(
+                        text = if (state.isAnalyzing) "分析中" else "开始分析",
+                        onClick = onAnalyze,
+                        enabled = state.canAnalyze,
+                        modifier = Modifier
+                            .width(140.dp)
+                            .heightIn(min = 58.dp),
                     )
                 }
-                Icon(
-                    imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
-                    contentDescription = null,
-                    tint = Muted,
-                )
             }
-            SuccessButton(
-                text = if (state.isAnalyzing) "分析中" else "开始分析",
-                onClick = onAnalyze,
-                enabled = state.canAnalyze,
-                modifier = Modifier.width(160.dp),
-            )
         }
     }
 }
@@ -407,11 +505,12 @@ private fun AnalysisModeSelector(
     selected: AnalysisMode,
     onSelect: (AnalysisMode) -> Unit,
     enabled: Boolean,
+    modifier: Modifier = Modifier,
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .height(44.dp)
+            .height(54.dp)
             .background(AppSurface, RoundedCornerShape(8.dp))
             .border(1.dp, Border, RoundedCornerShape(8.dp))
             .padding(3.dp),
@@ -441,24 +540,130 @@ private fun AnalysisModeSelector(
 }
 
 @Composable
+private fun PreparationField(
+    label: String,
+    content: @Composable () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Text(
+            text = label,
+            color = Muted,
+            style = MaterialTheme.typography.labelLarge,
+        )
+        content()
+    }
+}
+
+@Composable
 private fun PreparationLabel(text: String) {
     Text(
         text = text,
         color = Muted,
         style = MaterialTheme.typography.labelLarge,
-        modifier = Modifier.width(72.dp),
+        modifier = Modifier.width(68.dp),
         maxLines = 1,
     )
 }
 
 @Composable
-private fun AnalysisResultPanel(result: AnalysisResult) {
-    var metric by remember(result.mode, result.rawJson) { mutableStateOf(MetricKey.Velocity) }
-    val metrics = remember(result.mode) {
-        MetricKey.values().filter { key ->
-            result.mode != AnalysisMode.LongJump || key != MetricKey.DoubleSupport
+private fun TrainingDataSelector(
+    selectedAttempt: CapturedAttempt?,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+) {
+    Row(
+        modifier = modifier
+            .heightIn(min = 58.dp)
+            .background(AppSurface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.CalendarMonth,
+            contentDescription = null,
+            tint = Green,
+            modifier = Modifier.size(22.dp),
+        )
+        if (compact) {
+            Text(
+                text = selectedAttempt?.let {
+                    "${it.dateLabel.toCompactDate()} ${it.timeLabel}"
+                } ?: "选择采集记录",
+                color = if (selectedAttempt == null) Muted else AppText,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (selectedAttempt == null) {
+                    FontWeight.Normal
+                } else {
+                    FontWeight.SemiBold
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (selectedAttempt != null) {
+                CompactSideTag(FootSide.Left, selectedAttempt.leftPath != null)
+                CompactSideTag(FootSide.Right, selectedAttempt.rightPath != null)
+            }
+        } else {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = selectedAttempt?.let {
+                        "${it.dateLabel}  ${it.timeLabel}"
+                    } ?: "选择采集记录",
+                    color = if (selectedAttempt == null) Muted else AppText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (selectedAttempt == null) {
+                        FontWeight.Normal
+                    } else {
+                        FontWeight.SemiBold
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (selectedAttempt != null) {
+                    Spacer(Modifier.height(5.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SideTag(FootSide.Left, selectedAttempt.leftPath != null)
+                        SideTag(FootSide.Right, selectedAttempt.rightPath != null)
+                    }
+                }
+            }
         }
+        if (!compact || selectedAttempt == null) {
+            Text(
+                text = if (selectedAttempt == null) "选择" else "更换",
+                color = Green,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Icon(
+            imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+            contentDescription = null,
+            tint = Muted,
+            modifier = Modifier.size(20.dp),
+        )
     }
+}
+
+private fun String.toCompactDate(): String =
+    replace(Regex("^\\d{4}年"), "")
+        .replace("月", "-")
+        .removeSuffix("日")
+
+@Composable
+private fun AnalysisResultChartPanel(
+    result: AnalysisResult,
+    metric: MetricKey,
+    modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    selectionResetKey: Int = 0,
+) {
     val chartPoints = remember(result, metric) {
         val rawPoints = result.strides.mapIndexedNotNull { index, stride ->
             metric.value(stride)?.let { value ->
@@ -504,7 +709,13 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
         }
     }
 
-    Panel(title = "分析结果") {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Card, RoundedCornerShape(12.dp))
+            .border(1.dp, Border, RoundedCornerShape(12.dp))
+            .padding(if (compact) 12.dp else 20.dp),
+    ) {
         AnalysisLineChart(
             leftPoints = chartPoints.first,
             rightPoints = chartPoints.second,
@@ -516,11 +727,39 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
             valueUnit = metric.unit,
             valueDecimals = metric.decimals,
             threshold = chartThreshold,
+            chartHeight = if (compact) 170.dp else 220.dp,
+            headerLabel = "${metric.label}趋势",
+            selectionResetKey = selectionResetKey,
         )
-        Spacer(Modifier.height(14.dp))
+    }
+}
+
+@Composable
+private fun AnalysisMetricTable(
+    result: AnalysisResult,
+    metric: MetricKey,
+    onSelectMetric: (MetricKey) -> Unit,
+    modifier: Modifier = Modifier,
+    scrollable: Boolean = false,
+) {
+    val averageWidth = if (scrollable) 78.dp else 112.dp
+    val symmetryWidth = if (scrollable) 150.dp else 252.dp
+    val metrics = remember(result.mode) {
+        MetricKey.values().filter { key ->
+            result.mode != AnalysisMode.LongJump || key != MetricKey.DoubleSupport
+        }
+    }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Card, RoundedCornerShape(12.dp))
+            .border(1.dp, Border, RoundedCornerShape(12.dp))
+            .padding(if (scrollable) 12.dp else 20.dp),
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .then(if (scrollable) Modifier.fillMaxHeight() else Modifier)
                 .border(1.dp, Border, RoundedCornerShape(8.dp)),
         ) {
             Row(
@@ -542,28 +781,47 @@ private fun AnalysisResultPanel(result: AnalysisResult) {
                     color = Muted,
                     style = MaterialTheme.typography.labelMedium,
                     textAlign = TextAlign.End,
-                    modifier = Modifier.width(112.dp),
+                    modifier = Modifier.width(averageWidth),
                 )
                 Text(
                     text = "左右对称性",
                     color = Muted,
                     style = MaterialTheme.typography.labelMedium,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier.width(252.dp),
+                    modifier = Modifier.width(symmetryWidth),
                 )
             }
             HorizontalDivider(color = Border)
-            metrics.forEachIndexed { index, item ->
-                MetricSelectorRow(
-                    item = item,
-                    selected = item == metric,
-                    value = summaryValue(result, item),
-                    leftValue = metricSideAverage(result, item, FootSide.Left),
-                    rightValue = metricSideAverage(result, item, FootSide.Right),
-                    onClick = { metric = item },
-                )
-                if (index != metrics.lastIndex) {
-                    HorizontalDivider(color = Border)
+            if (scrollable) {
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    itemsIndexed(metrics) { index, item ->
+                        MetricSelectorRow(
+                            item = item,
+                            selected = item == metric,
+                            value = summaryValue(result, item),
+                            leftValue = metricSideAverage(result, item, FootSide.Left),
+                            rightValue = metricSideAverage(result, item, FootSide.Right),
+                            onClick = { onSelectMetric(item) },
+                            compact = true,
+                        )
+                        if (index != metrics.lastIndex) {
+                            HorizontalDivider(color = Border)
+                        }
+                    }
+                }
+            } else {
+                metrics.forEachIndexed { index, item ->
+                    MetricSelectorRow(
+                        item = item,
+                        selected = item == metric,
+                        value = summaryValue(result, item),
+                        leftValue = metricSideAverage(result, item, FootSide.Left),
+                        rightValue = metricSideAverage(result, item, FootSide.Right),
+                        onClick = { onSelectMetric(item) },
+                    )
+                    if (index != metrics.lastIndex) {
+                        HorizontalDivider(color = Border)
+                    }
                 }
             }
         }
@@ -616,7 +874,7 @@ private fun AdvancedAnalysisContent(
                     SuccessButton(
                         "应用范围",
                         onApplyRange,
-                        enabled = state.canAnalyze,
+                        enabled = state.result != null && !state.isAnalyzing,
                     )
                 }
             }
@@ -629,6 +887,8 @@ private fun AdvancedAnalysisContent(
                     SignalEventChart(
                         primary = signalResult.primarySignal,
                         secondary = signalResult.secondarySignal,
+                        rangeStartS = state.appliedRangeStartS,
+                        rangeEndS = state.appliedRangeEndS,
                     )
                 }
             }
@@ -642,8 +902,8 @@ private fun AdvancedAnalysisContent(
                 onUpload = onUploadCurrent,
             )
         }
-        if (state.errorMessage.isNotBlank()) {
-            item { MessageBand(state.errorMessage, error = true) }
+        if (state.rangeErrorMessage.isNotBlank()) {
+            item { MessageBand(state.rangeErrorMessage, error = true) }
         }
     }
 }
@@ -802,6 +1062,7 @@ private fun AthleteDropdown(
     selectedId: String?,
     onSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
+    showDominantLeg: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selected = athletes.firstOrNull { it.id == selectedId }
@@ -825,7 +1086,7 @@ private fun AthleteDropdown(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            selected?.dominantLeg?.let {
+            selected?.dominantLeg?.takeIf { showDominantLeg }?.let {
                 Badge(text = it.label, type = BadgeType.Ok)
                 Spacer(Modifier.width(8.dp))
             }
@@ -850,6 +1111,32 @@ private fun AthleteDropdown(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun CompactSideTag(side: FootSide, present: Boolean) {
+    val color = when {
+        !present -> Muted
+        side == FootSide.Left -> Orange
+        else -> Green
+    }
+    Surface(
+        color = if (present) color.copy(alpha = 0.12f) else AppSurface,
+        shape = RoundedCornerShape(999.dp),
+        modifier = Modifier.border(
+            1.dp,
+            if (present) color.copy(alpha = 0.35f) else Border,
+            RoundedCornerShape(999.dp),
+        ),
+    ) {
+        Text(
+            text = side.label,
+            color = color,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        )
     }
 }
 
@@ -897,11 +1184,14 @@ private fun MetricSelectorRow(
     leftValue: Double?,
     rightValue: Double?,
     onClick: () -> Unit,
+    compact: Boolean = false,
 ) {
+    val valueWidth = if (compact) 78.dp else 112.dp
+    val symmetryWidth = if (compact) 150.dp else 252.dp
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(66.dp)
+            .height(if (compact) 62.dp else 66.dp)
             .background(
                 if (selected) item.color.copy(alpha = 0.08f) else Color.Transparent,
             )
@@ -918,12 +1208,15 @@ private fun MetricSelectorRow(
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(start = 16.dp, end = 16.dp),
+                .padding(
+                    start = if (compact) 10.dp else 16.dp,
+                    end = if (compact) 10.dp else 16.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
                 modifier = Modifier
-                    .size(20.dp)
+                    .size(if (compact) 16.dp else 20.dp)
                     .border(
                         1.5.dp,
                         item.color.copy(alpha = if (selected) 1f else 0.72f),
@@ -934,12 +1227,12 @@ private fun MetricSelectorRow(
                 if (selected) {
                     Box(
                         modifier = Modifier
-                            .size(10.dp)
+                            .size(if (compact) 8.dp else 10.dp)
                             .background(item.color, RoundedCornerShape(999.dp)),
                     )
                 }
             }
-            Spacer(Modifier.width(12.dp))
+            Spacer(Modifier.width(if (compact) 8.dp else 12.dp))
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.Center,
@@ -975,7 +1268,7 @@ private fun MetricSelectorRow(
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.End,
                 maxLines = 1,
-                modifier = Modifier.width(112.dp),
+                modifier = Modifier.width(valueWidth),
             )
             MetricSymmetry(
                 leftValue = leftValue,
@@ -983,7 +1276,8 @@ private fun MetricSelectorRow(
                 color = item.color,
                 formatter = item::format,
                 selected = selected,
-                modifier = Modifier.width(252.dp),
+                compact = compact,
+                modifier = Modifier.width(symmetryWidth),
             )
         }
     }
@@ -997,6 +1291,7 @@ private fun MetricSymmetry(
     formatter: (Double) -> String,
     selected: Boolean,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val hasBothSides = leftValue != null && rightValue != null
     val mean = if (leftValue != null && rightValue != null) {
@@ -1028,18 +1323,18 @@ private fun MetricSymmetry(
             style = MaterialTheme.typography.bodySmall,
             textAlign = TextAlign.End,
             maxLines = 1,
-            modifier = Modifier.width(54.dp),
+            modifier = Modifier.width(if (compact) 36.dp else 54.dp),
         )
         Text(
             text = "L",
             color = Muted,
             style = MaterialTheme.typography.labelSmall,
             textAlign = TextAlign.Center,
-            modifier = Modifier.width(20.dp),
+            modifier = Modifier.width(if (compact) 14.dp else 20.dp),
         )
         Row(
-            modifier = Modifier.width(84.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier = Modifier.width(if (compact) 50.dp else 84.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             repeat(7) { index ->
@@ -1052,13 +1347,19 @@ private fun MetricSymmetry(
                 }
                 Box(
                     modifier = Modifier
-                        .width(if (isCenter) 3.dp else 7.dp)
+                        .width(
+                            when {
+                                isCenter -> 3.dp
+                                compact -> 4.dp
+                                else -> 7.dp
+                            },
+                        )
                         .height(
                             when (index) {
-                                0, 6 -> 9.dp
-                                1, 5 -> 13.dp
-                                2, 4 -> 17.dp
-                                else -> 21.dp
+                                0, 6 -> if (compact) 7.dp else 9.dp
+                                1, 5 -> if (compact) 10.dp else 13.dp
+                                2, 4 -> if (compact) 13.dp else 17.dp
+                                else -> if (compact) 16.dp else 21.dp
                             },
                         )
                         .background(
@@ -1073,14 +1374,14 @@ private fun MetricSymmetry(
             color = Muted,
             style = MaterialTheme.typography.labelSmall,
             textAlign = TextAlign.Center,
-            modifier = Modifier.width(20.dp),
+            modifier = Modifier.width(if (compact) 14.dp else 20.dp),
         )
         Text(
             text = rightValue?.let(formatter) ?: "—",
             color = if (selected) AppText else Muted,
             style = MaterialTheme.typography.bodySmall,
             maxLines = 1,
-            modifier = Modifier.width(54.dp),
+            modifier = Modifier.width(if (compact) 36.dp else 54.dp),
         )
     }
 }
@@ -1092,7 +1393,9 @@ private fun metricSideAverage(
 ): Double? {
     val values = result.strides
         .asSequence()
-        .filter { it.side == side }
+        .filter {
+            it.side == side && it.bilaterallyPaired
+        }
         .mapNotNull(metric.value)
         .toList()
     return values.takeIf { it.isNotEmpty() }?.average()

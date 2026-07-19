@@ -17,8 +17,8 @@ enum class AnalysisSection {
 }
 
 enum class AnalysisMode(val code: String, val label: String) {
-    LongJump("long_jump", "跳远"),
     GeneralGait("general_gait", "通用"),
+    LongJump("long_jump", "跳远"),
     RaceWalk("race_walk", "竞走");
 
     companion object {
@@ -132,6 +132,7 @@ data class GaitStride(
     val flightTimeMs: Double?,
     val swingTimeMs: Double?,
     val vgrfPeakBw: Double?,
+    val bilaterallyPaired: Boolean,
 )
 
 data class SignalSeries(
@@ -266,6 +267,9 @@ data class AnalysisUiState(
     val selectedAttemptKey: String? = null,
     val rangeStartS: String = "",
     val rangeEndS: String = "",
+    val appliedRangeStartS: Double? = null,
+    val appliedRangeEndS: Double? = null,
+    val rangeErrorMessage: String = "",
     val isEngineWarming: Boolean = true,
     val isAnalyzing: Boolean = false,
     val result: AnalysisResult? = null,
@@ -355,12 +359,14 @@ fun parseAnalysisResult(rawJson: String): Result<AnalysisResult> = runCatching {
         strides = (primaryStrides + secondaryStrides).sortedBy { it.toTimestampMs ?: Double.MAX_VALUE },
         primarySignal = parseSideSignal(
             root.optJSONObject("signals"),
-            root.optJSONObject("events"),
+            root.optJSONObject("detected_events")
+                ?: root.optJSONObject("events"),
             primarySide,
         ),
         secondarySignal = parseSideSignal(
             contra?.optJSONObject("signals"),
-            contra?.optJSONObject("events"),
+            contra?.optJSONObject("detected_events")
+                ?: contra?.optJSONObject("events"),
             secondarySide,
         ),
         rawJson = rawJson,
@@ -404,6 +410,10 @@ private fun parseStrides(array: JSONArray?, side: FootSide?): List<GaitStride> {
                         legacyScale = 1000.0,
                     ),
                     vgrfPeakBw = item.finiteDouble("vGRF_peak_BW"),
+                    bilaterallyPaired = item.optBoolean(
+                        "bilaterally_paired",
+                        true,
+                    ),
                 )
             )
         }

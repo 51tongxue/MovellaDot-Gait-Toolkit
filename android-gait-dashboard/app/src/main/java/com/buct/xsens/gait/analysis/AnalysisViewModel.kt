@@ -57,6 +57,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 statusMessage = "",
                 errorMessage = "",
                 isAnalyzing = false,
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
             )
         }
     }
@@ -73,6 +78,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 result = null,
                 manifestPath = "",
                 errorMessage = "",
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
             )
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -103,6 +113,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 manifestPath = "",
                 statusMessage = "",
                 errorMessage = "",
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
             )
         }
         refreshAttemptNoForSelection()
@@ -113,18 +128,92 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateRangeStart(value: String) {
-        _uiState.update { it.copy(rangeStartS = numericInput(value), errorMessage = "") }
+        _uiState.update {
+            it.copy(
+                rangeStartS = numericInput(value),
+                rangeErrorMessage = "",
+            )
+        }
     }
 
     fun updateRangeEnd(value: String) {
-        _uiState.update { it.copy(rangeEndS = numericInput(value), errorMessage = "") }
+        _uiState.update {
+            it.copy(
+                rangeEndS = numericInput(value),
+                rangeErrorMessage = "",
+            )
+        }
     }
 
     fun clearRange() {
-        _uiState.update { it.copy(rangeStartS = "", rangeEndS = "", errorMessage = "") }
+        _uiState.update {
+            it.copy(
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
+            )
+        }
     }
 
-    fun analyze(useRange: Boolean = false) {
+    fun applyRange() {
+        val state = _uiState.value
+        val result = state.result ?: run {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "请先完成一次分析")
+            }
+            return
+        }
+        val start = state.rangeStartS.toDoubleOrNull()
+        val end = state.rangeEndS.toDoubleOrNull()
+        if (state.rangeStartS.isNotBlank() && start == null) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "开始时间格式不正确")
+            }
+            return
+        }
+        if (state.rangeEndS.isNotBlank() && end == null) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "结束时间格式不正确")
+            }
+            return
+        }
+        if (start != null && start < 0.0) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "开始时间不能小于 0")
+            }
+            return
+        }
+        if (start != null && end != null && start >= end) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "开始时间必须小于结束时间")
+            }
+            return
+        }
+        val duration = result.summary.durationS
+        if (duration != null && start != null && start >= duration) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "开始时间超出数据时长")
+            }
+            return
+        }
+        if (duration != null && end != null && end > duration) {
+            _uiState.update {
+                it.copy(rangeErrorMessage = "结束时间超出数据时长")
+            }
+            return
+        }
+        _uiState.update {
+            it.copy(
+                appliedRangeStartS = start,
+                appliedRangeEndS = end,
+                rangeErrorMessage = "",
+            )
+        }
+    }
+
+    fun analyze() {
         historyLoadJob?.cancel()
         historyLoadJob = null
         val state = _uiState.value
@@ -139,12 +228,6 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
         }
         val primaryPath = attempt.preferredPath(athlete.dominantLeg) ?: run {
             _uiState.update { it.copy(errorMessage = "当前试跳没有可分析的数据") }
-            return
-        }
-        val start = if (useRange) state.rangeStartS.toDoubleOrNull() else null
-        val end = if (useRange) state.rangeEndS.toDoubleOrNull() else null
-        if (start != null && end != null && start >= end) {
-            _uiState.update { it.copy(errorMessage = "开始时间必须小于结束时间") }
             return
         }
         val takeoffStep = if (state.analysisMode == AnalysisMode.LongJump) 0 else -1
@@ -165,6 +248,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 statusMessage = "正在分析",
                 errorMessage = "",
                 section = AnalysisSection.Main,
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
             )
         }
 
@@ -174,8 +262,8 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 analysisManager.analyzeGait(
                     primaryPath,
                     athlete.weightKg.takeIf { it > 0.0 }?.toString() ?: "75",
-                    (start ?: -1.0).toString(),
-                    (end ?: -1.0).toString(),
+                    "-1.0",
+                    "-1.0",
                     takeoffStep.toString(),
                     takeoffSide,
                     "0",
@@ -204,13 +292,6 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                         manifestJson.optJSONObject("summary")
                             ?.put("analysis_mode", state.analysisMode.code)
                         manifestJson.put("source_file_paths", sourcePaths)
-                        if (useRange && (start != null || end != null)) {
-                            val timeRangeJson = JSONObject()
-                            timeRangeJson.put("start", start ?: JSONObject.NULL)
-                            timeRangeJson.put("end", end ?: JSONObject.NULL)
-                            manifestJson.put("timeRange", timeRangeJson)
-                        }
-
                         val manifestPayload = manifestJson.toString()
                         val saveResult = withContext(Dispatchers.IO) {
                             repository.saveImuManifest(
@@ -349,6 +430,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 isAnalyzing = false,
                 statusMessage = "",
                 errorMessage = "",
+                rangeStartS = "",
+                rangeEndS = "",
+                appliedRangeStartS = null,
+                appliedRangeEndS = null,
+                rangeErrorMessage = "",
             )
         }
         historyLoadJob = viewModelScope.launch {
@@ -367,6 +453,11 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                         isAnalyzing = false,
                         statusMessage = "",
                         errorMessage = "",
+                        rangeStartS = "",
+                        rangeEndS = "",
+                        appliedRangeStartS = null,
+                        appliedRangeEndS = null,
+                        rangeErrorMessage = "",
                     )
                 }
             }.onFailure { error ->

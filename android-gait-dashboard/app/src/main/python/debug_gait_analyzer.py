@@ -12,6 +12,7 @@ from offline_gait_event_detector import (
     ACC_LOW_CUTOFF_HZ,
     GYRO_LOW_CUTOFF_HZ,
     OfflineGaitEventPipeline,
+    _separated_otsu_threshold,
     detect_offline_gait_events,
 )
 from offline_gait_metrics import (
@@ -392,7 +393,15 @@ def _find_ic_time(seg_signal, seg_timestamps, gyro_noise_level=None):
         min_same_foot_interval_ms=0.0,
     )
     if events:
-        return float(events[0]["ic_time"]), True
+        event = events[0]
+        segment_threshold = _separated_otsu_threshold(
+            np.abs(signal_values)
+        )
+        if (
+            segment_threshold is None
+            or -float(event["negative_value"]) >= segment_threshold
+        ):
+            return float(event["ic_time"]), True
     return None, False
 
 

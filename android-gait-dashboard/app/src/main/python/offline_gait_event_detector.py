@@ -5,7 +5,6 @@ from scipy.signal import butter, sosfiltfilt
 GYRO_LOW_CUTOFF_HZ = 6.0
 ACC_LOW_CUTOFF_HZ = 6.0
 GAIT_CONFIRM_WINDOW_MS = 120.0
-GAIT_REBOUND_MIN_DELAY_MS = 25.0
 GAIT_MIN_SAME_FOOT_INTERVAL_MS = 250.0
 GAIT_PROFILE_WINDOW = 5
 GAIT_STARTUP_CANDIDATES = 4
@@ -59,6 +58,41 @@ def _separated_otsu_threshold(values):
     return float(best_threshold)
 
 
+def _lobe_impulse(values, timestamps):
+    """用波瓣平均幅值和持续时间描述其整体形态强度。"""
+    samples = np.asarray(values, dtype=np.float64)
+    times = np.asarray(timestamps, dtype=np.float64)
+    if samples.size == 0:
+        return 0.0
+    if times.size > 1:
+        sample_interval = float(np.median(np.diff(times)))
+    else:
+        sample_interval = 1.0
+    duration = max(
+        float(times[-1] - times[0]) + sample_interval,
+        sample_interval,
+    )
+    return float(np.mean(np.maximum(samples, 0.0)) * duration)
+
+
+def _candidate_morphology_strength(candidate):
+    """合并摆动正波瓣和触地负波瓣，避免只按单点峰值判断。"""
+    if "morphology_strength" in candidate:
+        return float(candidate["morphology_strength"])
+    positive = max(float(candidate["msw_value"]), 0.0)
+    negative = max(-float(candidate["negative_value"]), 0.0)
+    return float(np.sqrt(positive * negative))
+
+
+def _cluster_high_mask(values):
+    """仅在数据自身形成高低两簇时标记高簇，否则全部保留。"""
+    samples = np.asarray(values, dtype=np.float64)
+    threshold = _separated_otsu_threshold(samples)
+    if threshold is None:
+        return np.ones(samples.size, dtype=bool), None
+    return samples >= threshold, threshold
+
+
 def _extract_candidates(
     timestamps,
     filtered_gyro,
@@ -77,6 +111,74 @@ def _extract_candidates(
     ends = np.flatnonzero(positive & ~np.r_[positive[1:], False])
     if starts.size == 0 or ends.size == 0:
         return []
+
+    positive_lobes = []
+    end_cursor = 0
+    for start_index in starts:
+        while end_cursor < ends.size and ends[end_cursor] < start_index:
+            end_cursor += 1
+        if end_cursor >= ends.size:
+            break
+        end_index = int(ends[end_cursor])
+        end_cursor += 1
+        lobe = gyro[start_index:end_index + 1]
+        lobe_times = timestamps[start_index:end_index + 1]
+        peak_index = int(start_index + np.argmax(lobe))
+        positive_lobes.append({
+            "start_index": int(start_index),
+            "end_index": end_index,
+            "peak_index": peak_index,
+            "peak_value": float(gyro[peak_index]),
+            "impulse": _lobe_impulse(lobe, lobe_times),
+        })
+
+    if not positive_lobes:
+        return []
+
+    peak_high, peak_threshold = _cluster_high_mask([
+        lobe["peak_value"] for lobe in positive_lobes
+    ])
+    impulse_high, impulse_threshold = _cluster_high_mask([
+        lobe["impulse"] for lobe in positive_lobes
+    ])
+    if peak_threshold is not None and impulse_threshold is not None:
+        structural_lobes = peak_high | impulse_high
+    elif peak_threshold is not None:
+        structural_lobes = peak_high
+    elif impulse_threshold is not None:
+        structural_lobes = impulse_high
+    else:
+        structural_lobes = np.ones(len(positive_lobes), dtype=bool)
+
+    negative = gyro < 0.0
+    negative_starts = np.flatnonzero(
+        negative & ~np.r_[False, negative[:-1]]
+    )
+    negative_ends = np.flatnonzero(
+        negative & ~np.r_[negative[1:], False]
+    )
+    negative_lobes = []
+    negative_end_cursor = 0
+    for start_index in negative_starts:
+        while (
+            negative_end_cursor < negative_ends.size
+            and negative_ends[negative_end_cursor] < start_index
+        ):
+            negative_end_cursor += 1
+        if negative_end_cursor >= negative_ends.size:
+            break
+        end_index = int(negative_ends[negative_end_cursor])
+        negative_end_cursor += 1
+        lobe_values = -gyro[start_index:end_index + 1]
+        lobe_times = timestamps[start_index:end_index + 1]
+        valley_index = int(start_index + np.argmax(lobe_values))
+        negative_lobes.append({
+            "start_index": int(start_index),
+            "end_index": end_index,
+            "valley_index": valley_index,
+            "depth": float(-gyro[valley_index]),
+            "impulse": _lobe_impulse(lobe_values, lobe_times),
+        })
 
     acc_norm = None
     jerk = None
@@ -98,60 +200,70 @@ def _extract_candidates(
         )
 
     candidates = []
-    end_cursor = 0
-    for start_index in starts:
-        while end_cursor < ends.size and ends[end_cursor] < start_index:
-            end_cursor += 1
-        if end_cursor >= ends.size:
-            break
-        end_index = int(ends[end_cursor])
-        end_cursor += 1
+    for lobe_index, lobe in enumerate(positive_lobes):
+        if not structural_lobes[lobe_index]:
+            continue
+
+        end_index = lobe["end_index"]
         crossing_index = end_index + 1
         if crossing_index >= gyro.size:
             continue
 
-        lobe = gyro[start_index:end_index + 1]
-        peak_index = int(start_index + np.argmax(lobe))
-        peak_value = float(gyro[peak_index])
-        if peak_value < 5.0:
-            continue
-
+        peak_index = lobe["peak_index"]
+        peak_value = lobe["peak_value"]
         crossing_time = float(timestamps[crossing_index])
         confirm_end = int(np.searchsorted(
             timestamps,
             crossing_time + GAIT_CONFIRM_WINDOW_MS,
             side="right",
         ))
+        next_structural_lobe_start = next((
+            positive_lobes[next_lobe_index]["start_index"]
+            for next_lobe_index in range(
+                lobe_index + 1,
+                len(positive_lobes),
+            )
+            if structural_lobes[next_lobe_index]
+        ), None)
+        if next_structural_lobe_start is not None:
+            confirm_end = min(
+                confirm_end,
+                int(next_structural_lobe_start),
+            )
         if confirm_end <= crossing_index:
             continue
 
-        negative_threshold = max(5.0, peak_value * 0.05)
-        confirmation_offsets = np.flatnonzero(
-            gyro[crossing_index:confirm_end] <= -negative_threshold
-        )
-        if confirmation_offsets.size == 0:
-            continue
-        confirmation_index = int(
-            crossing_index + confirmation_offsets[0]
-        )
-
-        rebound_start = int(np.searchsorted(
-            timestamps,
-            crossing_time + GAIT_REBOUND_MIN_DELAY_MS,
-            side="left",
-        ))
-        rebound_limit = max(10.0, peak_value * 0.25)
-        if (
-            rebound_start < confirmation_index
-            and np.any(
-                gyro[rebound_start:confirmation_index] >= rebound_limit
+        phase_negative_lobes = [
+            negative_lobe
+            for negative_lobe in negative_lobes
+            if (
+                negative_lobe["end_index"] >= crossing_index
+                and negative_lobe["start_index"] < confirm_end
             )
-        ):
+        ]
+        confirmation_lobe = max(
+            phase_negative_lobes,
+            key=lambda negative_lobe: np.sqrt(
+                negative_lobe["depth"]
+                * negative_lobe["impulse"]
+            ),
+            default=None,
+        )
+
+        if confirmation_lobe is None:
             continue
 
-        negative_value = float(
-            np.min(gyro[crossing_index:confirm_end])
-        )
+        confirmation_index = confirmation_lobe["valley_index"]
+        confirmation_segment = gyro[crossing_index:confirm_end]
+        negative_value = float(gyro[confirmation_index])
+        negative_impulse = float(confirmation_lobe["impulse"])
+        morphology_strength = float(np.sqrt(
+            max(lobe["impulse"], 0.0)
+            * max(negative_impulse, 0.0)
+        ))
+        if not np.isfinite(morphology_strength):
+            continue
+
         has_acc = acc_norm is not None
         if has_acc:
             impact_segment = acc_norm[crossing_index:confirm_end]
@@ -166,6 +278,9 @@ def _extract_candidates(
             "msw_value": peak_value,
             "ic_time": crossing_time,
             "negative_value": negative_value,
+            "positive_impulse": float(lobe["impulse"]),
+            "negative_impulse": negative_impulse,
+            "morphology_strength": morphology_strength,
             "impact_range": impact_range,
             "jerk_peak": jerk_peak,
             "has_acc": has_acc,
@@ -185,26 +300,17 @@ class OfflineGaitEventDetector:
         )
         self.candidates = []
         self.events = []
-        self.recent_peak_values = []
+        self.recent_morphology_strengths = []
         self.recent_impact_ranges = []
         self.recent_jerk_peaks = []
-        self.recent_stride_ms = []
         self.last_ic_time = None
 
     @staticmethod
     def _candidate_quality(candidate):
         return (
-            float(candidate["msw_value"])
-            + 20.0 * float(candidate["impact_range"])
-            + 0.25 * float(candidate["jerk_peak"])
-        )
-
-    def _adaptive_min_interval(self):
-        if not self.recent_stride_ms:
-            return self.min_same_foot_interval_ms
-        return max(
-            self.min_same_foot_interval_ms,
-            float(np.median(self.recent_stride_ms)) * 0.35,
+            _candidate_morphology_strength(candidate),
+            float(candidate["impact_range"]),
+            float(candidate["jerk_peak"]),
         )
 
     def _merge_close_candidates(self, candidates):
@@ -235,18 +341,15 @@ class OfflineGaitEventDetector:
                 "jerk_peak",
             )
         }
-        if self.last_ic_time is not None:
-            stride_ms = event["ic_time"] - self.last_ic_time
-            if stride_ms > 0.0:
-                self.recent_stride_ms.append(stride_ms)
-                self.recent_stride_ms = self.recent_stride_ms[
-                    -GAIT_PROFILE_WINDOW:
-                ]
         self.last_ic_time = event["ic_time"]
-        self.recent_peak_values.append(event["msw_value"])
-        self.recent_peak_values = self.recent_peak_values[
+        self.recent_morphology_strengths.append(
+            _candidate_morphology_strength(candidate)
+        )
+        self.recent_morphology_strengths = (
+            self.recent_morphology_strengths[
             -GAIT_PROFILE_WINDOW:
-        ]
+            ]
+        )
         if candidate["has_acc"]:
             self.recent_impact_ranges.append(event["impact_range"])
             self.recent_impact_ranges = self.recent_impact_ranges[
@@ -259,8 +362,9 @@ class OfflineGaitEventDetector:
         self.events.append(event)
 
     def _accept_startup(self, candidates):
-        peak_threshold = _separated_otsu_threshold([
-            candidate["msw_value"] for candidate in candidates
+        morphology_threshold = _separated_otsu_threshold([
+            _candidate_morphology_strength(candidate)
+            for candidate in candidates
         ])
         impact_threshold = _separated_otsu_threshold([
             candidate["impact_range"]
@@ -269,19 +373,23 @@ class OfflineGaitEventDetector:
         ])
         selected = []
         for candidate in candidates:
-            peak_high = (
-                peak_threshold is None
-                or candidate["msw_value"] >= peak_threshold
+            morphology_high = (
+                morphology_threshold is None
+                or _candidate_morphology_strength(candidate)
+                >= morphology_threshold
             )
             impact_high = (
                 impact_threshold is None
                 or not candidate["has_acc"]
                 or candidate["impact_range"] >= impact_threshold
             )
-            if peak_threshold is not None and impact_threshold is not None:
-                keep = peak_high or impact_high
+            if (
+                morphology_threshold is not None
+                and impact_threshold is not None
+            ):
+                keep = morphology_high or impact_high
             else:
-                keep = peak_high and impact_high
+                keep = morphology_high and impact_high
             if keep:
                 selected.append(candidate)
         for candidate in self._merge_close_candidates(selected):
@@ -291,19 +399,22 @@ class OfflineGaitEventDetector:
         if (
             self.last_ic_time is not None
             and candidate["ic_time"] - self.last_ic_time
-            < self._adaptive_min_interval()
+            < self.min_same_foot_interval_ms
         ):
             return False
 
-        peak_threshold = (
-            float(np.median(self.recent_peak_values))
+        morphology_threshold = (
+            float(np.median(self.recent_morphology_strengths))
             * GAIT_PROFILE_RATIO
-            if self.recent_peak_values
+            if self.recent_morphology_strengths
             else 0.0
         )
-        peak_ok = candidate["msw_value"] >= peak_threshold
+        morphology_ok = (
+            _candidate_morphology_strength(candidate)
+            >= morphology_threshold
+        )
         if not candidate["has_acc"] or not self.recent_impact_ranges:
-            return peak_ok
+            return morphology_ok
 
         impact_threshold = (
             float(np.median(self.recent_impact_ranges))
@@ -316,7 +427,7 @@ class OfflineGaitEventDetector:
             else 0.0
         )
         return (
-            peak_ok
+            morphology_ok
             or candidate["impact_range"] >= impact_threshold
             or candidate["jerk_peak"] >= jerk_threshold
         )
@@ -337,11 +448,18 @@ class OfflineGaitEventDetector:
             > 0.20
         ):
             return False
-        peaks = np.asarray(
-            [candidate["msw_value"] for candidate in recent],
+        morphology = np.asarray(
+            [
+                _candidate_morphology_strength(candidate)
+                for candidate in recent
+            ],
             dtype=np.float64,
         )
-        if np.std(peaks) / max(float(np.mean(peaks)), 1.0) > 0.35:
+        if (
+            np.std(morphology)
+            / max(float(np.mean(morphology)), np.finfo(float).eps)
+            > 0.35
+        ):
             return False
         impacts = np.asarray([
             candidate["impact_range"]
@@ -356,16 +474,24 @@ class OfflineGaitEventDetector:
 
     def validate(self, candidates):
         self.candidates = list(candidates)
+        self.events.clear()
+        self.recent_morphology_strengths.clear()
+        self.recent_impact_ranges.clear()
+        self.recent_jerk_peaks.clear()
+        self.last_ic_time = None
         if not self.candidates:
             return []
 
+        ordered_candidates = self._merge_close_candidates(
+            self.candidates
+        )
         startup_count = min(
             GAIT_STARTUP_CANDIDATES,
-            len(self.candidates),
+            len(ordered_candidates),
         )
-        self._accept_startup(self.candidates[:startup_count])
+        self._accept_startup(ordered_candidates[:startup_count])
         rejected = []
-        for candidate in self.candidates[startup_count:]:
+        for candidate in ordered_candidates[startup_count:]:
             if self._matches_profile(candidate):
                 rejected.clear()
                 self._accept_candidate(candidate)
@@ -380,10 +506,9 @@ class OfflineGaitEventDetector:
             if not self._is_regular_change_point(rejected):
                 continue
 
-            self.recent_peak_values.clear()
+            self.recent_morphology_strengths.clear()
             self.recent_impact_ranges.clear()
             self.recent_jerk_peaks.clear()
-            self.recent_stride_ms.clear()
             for changed_candidate in rejected:
                 if (
                     self.last_ic_time is None
