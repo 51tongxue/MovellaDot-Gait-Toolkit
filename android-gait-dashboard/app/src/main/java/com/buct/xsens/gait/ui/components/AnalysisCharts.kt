@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import com.buct.xsens.dot.ui.theme.Border
 import com.buct.xsens.dot.ui.theme.Green
 import com.buct.xsens.dot.ui.theme.Muted
+import com.buct.xsens.dot.ui.theme.Orange
 import com.buct.xsens.dot.ui.theme.Surface
 import com.buct.xsens.dot.ui.theme.Text as AppText
 import com.buct.xsens.gait.analysis.GaitEvents
@@ -77,7 +78,9 @@ fun AnalysisLineChart(
     threshold: AnalysisChartThreshold? = null,
     chartHeight: Dp = 220.dp,
     headerLabel: String? = null,
-    selectionResetKey: Int = 0,
+    showHeader: Boolean = true,
+    selectedPoint: AnalysisChartPoint?,
+    onSelectedPointChange: (AnalysisChartPoint?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val hasBothSides = leftPoints.isNotEmpty() && rightPoints.isNotEmpty()
@@ -101,12 +104,20 @@ fun AnalysisLineChart(
     val chartMinY = minY - yPadding
     val chartMaxY = maxY + yPadding
     val yRange = chartMaxY - chartMinY
-    var selectedPoint by remember(allPoints, selectionResetKey) {
-        mutableStateOf<AnalysisChartPoint?>(null)
+    var zoomScale by remember(allPoints) { mutableStateOf(1f) }
+    var viewportStartFraction by remember(allPoints) { mutableStateOf(0f) }
+    val viewportSpanFraction = 1f / zoomScale
+    val viewportMinX = minX + xRange * viewportStartFraction
+    val viewportXRange = xRange * viewportSpanFraction
+    val viewportMaxX = viewportMinX + viewportXRange
+    val visibleSeries = series.mapNotNull { (points, color, fillAlpha) ->
+        points
+            .filter { it.x in viewportMinX..viewportMaxX }
+            .takeIf { it.isNotEmpty() }
+            ?.let { Triple(it, color, fillAlpha) }
     }
-
     Column(modifier = modifier) {
-        if (headerLabel != null || hasBothSides) {
+        if (showHeader && (headerLabel != null || hasBothSides)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -144,41 +155,147 @@ fun AnalysisLineChart(
             height = chartHeight,
             canvasModifier = Modifier.pointerInput(
                 allPoints,
-                minX,
-                xRange,
                 chartMinY,
                 yRange,
             ) {
                 awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    selectedPoint = findNearestChartPoint(
-                        touch = down.position,
-                        canvasWidth = size.width.toFloat(),
-                        canvasHeight = size.height.toFloat(),
-                        points = allPoints,
-                        minX = minX,
-                        xRange = xRange,
-                        minY = chartMinY,
-                        yRange = yRange,
-                    )
-                    down.consume()
+                    val firstDown = awaitFirstDown(requireUnconsumed = false)
+                    var lastSinglePosition = firstDown.position
+                    var transforming = false
+                    var singleDragStarted = false
+                    val touchSlop = viewConfiguration.touchSlop
                     do {
                         val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull() ?: break
-                        if (change.pressed) {
-                            selectedPoint = findNearestChartPoint(
-                                touch = change.position,
-                                canvasWidth = size.width.toFloat(),
-                                canvasHeight = size.height.toFloat(),
-                                points = allPoints,
-                                minX = minX,
-                                xRange = xRange,
-                                minY = chartMinY,
-                                yRange = yRange,
-                            )
-                            change.consume()
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.size >= 2) {
+                            transforming = true
+                            onSelectedPointChange(null)
+                            val stablePointers = pressed.filter { it.previousPressed }
+                            if (stablePointers.size >= 2) {
+                                val currentCentroid = stablePointers
+                                    .map { it.position }
+                                    .averageOffset()
+                                val previousCentroid = stablePointers
+                                    .map { it.previousPosition }
+                                    .averageOffset()
+                                val currentSpan = stablePointers
+                                    .map { (it.position - currentCentroid).getDistance() }
+                                    .average()
+                                    .toFloat()
+                                val previousSpan = stablePointers
+                                    .map { (it.previousPosition - previousCentroid).getDistance() }
+                                    .average()
+                                    .toFloat()
+                                if (previousSpan > 0f && currentSpan > 0f) {
+                                    val zoomChange = currentSpan / previousSpan
+                                    val oldZoom = zoomScale
+                                    val newZoom = (oldZoom * zoomChange).coerceIn(1f, 16f)
+                                    val oldSpanFraction = 1f / oldZoom
+                                    val newSpanFraction = 1f / newZoom
+                                    val left = 66.dp.toPx()
+                                    val plotWidthPx = max(
+                                        1f,
+                                        size.width.toFloat() - left - 10.dp.toPx(),
+                                    )
+                                    val focusFraction = (
+                                        (currentCentroid.x - left) / plotWidthPx
+                                        ).coerceIn(0f, 1f)
+                                    val focusDataFraction =
+                                        viewportStartFraction + focusFraction * oldSpanFraction
+                                    val panFraction =
+                                        (currentCentroid.x - previousCentroid.x) /
+                                            plotWidthPx * newSpanFraction
+                                    val maxStart = (1f - newSpanFraction).coerceAtLeast(0f)
+                                    viewportStartFraction = (
+                                        focusDataFraction -
+                                            focusFraction * newSpanFraction -
+                                            panFraction
+                                        ).coerceIn(0f, maxStart)
+                                    zoomScale = newZoom
+                                    if (newZoom <= 1.001f) {
+                                        zoomScale = 1f
+                                        viewportStartFraction = 0f
+                                    }
+                                }
+                            }
+                            pressed.forEach { it.consume() }
+                        } else if (!transforming) {
+                            val change = event.changes.firstOrNull()
+                            if (change != null) {
+                                lastSinglePosition = change.position
+                                if (change.pressed) {
+                                    val totalMovement = change.position - firstDown.position
+                                    val shouldPan = zoomScale > 1.001f && (
+                                        singleDragStarted ||
+                                            (
+                                                abs(totalMovement.x) > touchSlop &&
+                                                    abs(totalMovement.x) >
+                                                    abs(totalMovement.y)
+                                                )
+                                        )
+                                    if (shouldPan) {
+                                        singleDragStarted = true
+                                        onSelectedPointChange(null)
+                                        val currentSpanFraction = 1f / zoomScale
+                                        val left = 66.dp.toPx()
+                                        val plotWidthPx = max(
+                                            1f,
+                                            size.width.toFloat() - left - 10.dp.toPx(),
+                                        )
+                                        val panFraction =
+                                            (change.position.x - change.previousPosition.x) /
+                                                plotWidthPx * currentSpanFraction
+                                        val maxStart =
+                                            (1f - currentSpanFraction).coerceAtLeast(0f)
+                                        viewportStartFraction =
+                                            (viewportStartFraction - panFraction)
+                                                .coerceIn(0f, maxStart)
+                                        change.consume()
+                                    } else if (zoomScale <= 1.001f) {
+                                        val currentMinX =
+                                            minX + xRange * viewportStartFraction
+                                        val currentXRange = xRange / zoomScale
+                                        val visiblePoints = allPoints.filter {
+                                            it.x in currentMinX..(currentMinX + currentXRange)
+                                        }
+                                        onSelectedPointChange(
+                                            findNearestChartPoint(
+                                                touch = change.position,
+                                                canvasWidth = size.width.toFloat(),
+                                                canvasHeight = size.height.toFloat(),
+                                                points = visiblePoints,
+                                                minX = currentMinX,
+                                                xRange = currentXRange,
+                                                minY = chartMinY,
+                                                yRange = yRange,
+                                            ),
+                                        )
+                                        change.consume()
+                                    }
+                                }
+                            }
                         }
                     } while (event.changes.any { it.pressed })
+                    if (!transforming && !singleDragStarted) {
+                        val currentSpanFraction = 1f / zoomScale
+                        val currentMinX = minX + xRange * viewportStartFraction
+                        val currentXRange = xRange * currentSpanFraction
+                        val visiblePoints = allPoints.filter {
+                            it.x in currentMinX..(currentMinX + currentXRange)
+                        }
+                        onSelectedPointChange(
+                            findNearestChartPoint(
+                                touch = lastSinglePosition,
+                                canvasWidth = size.width.toFloat(),
+                                canvasHeight = size.height.toFloat(),
+                                points = visiblePoints,
+                                minX = currentMinX,
+                                xRange = currentXRange,
+                                minY = chartMinY,
+                                yRange = yRange,
+                            ),
+                        )
+                    }
                 }
             },
         ) {
@@ -190,29 +307,31 @@ fun AnalysisLineChart(
                     yRange = yRange,
                 )
             }
-            if (allPoints.size >= 2) {
-                series.forEach { (points, color, fillAlpha) ->
+            if (visibleSeries.any { it.first.size >= 2 }) {
+                visibleSeries.forEach { (points, color, fillAlpha) ->
                     drawMetricSeries(
                         points = points,
                         color = color,
                         fillAlpha = fillAlpha,
-                        minX = minX,
-                        xRange = xRange,
+                        minX = viewportMinX,
+                        xRange = viewportXRange,
                         minY = chartMinY,
                         yRange = yRange,
                     )
                 }
             }
-            drawRangeLabels(minX, maxX, chartMinY, chartMaxY)
-            selectedPoint?.let { point ->
+            drawRangeLabels(viewportMinX, viewportMaxX, chartMinY, chartMaxY)
+            selectedPoint
+                ?.takeIf { it.x in viewportMinX..viewportMaxX }
+                ?.let { point ->
                 drawChartSelection(
                     point = point,
                     seriesColor = lineColor,
                     valueLabel = valueLabel,
                     valueUnit = valueUnit,
                     valueDecimals = valueDecimals,
-                    minX = minX,
-                    xRange = xRange,
+                    minX = viewportMinX,
+                    xRange = viewportXRange,
                     minY = chartMinY,
                     yRange = yRange,
                 )
@@ -350,13 +469,13 @@ fun SignalEventChart(
     secondary: SideSignalResult?,
     rangeStartS: Double? = null,
     rangeEndS: Double? = null,
+    chartHeight: Dp = 250.dp,
     modifier: Modifier = Modifier,
 ) {
-    ChartFrame(modifier = modifier.height(250.dp)) {
-        drawAxes("时间 (s)", "角速度 (°/s)")
-        val rangeStartMs = rangeStartS?.times(1000.0)
-        val rangeEndMs = rangeEndS?.times(1000.0)
-        val series = listOfNotNull(primary, secondary).mapNotNull { side ->
+    val rangeStartMs = rangeStartS?.times(1000.0)
+    val rangeEndMs = rangeEndS?.times(1000.0)
+    val series = remember(primary, secondary, rangeStartMs, rangeEndMs) {
+        listOfNotNull(primary, secondary).mapNotNull { side ->
             side.signal?.let { signal ->
                 val count = minOf(
                     signal.timestampsMs.size,
@@ -378,31 +497,159 @@ fun SignalEventChart(
                 }
             }
         }
-        if (series.isEmpty()) return@ChartFrame
-        val minX = series.minOf { it.second.minOrNull() ?: 0.0 }
-        val maxX = series.maxOf { it.second.maxOrNull() ?: 1.0 }
-        val allY = series.flatMap { it.third }
-        val minY = allY.minOrNull() ?: -1.0
-        val maxY = allY.maxOrNull() ?: 1.0
-        val xRange = (maxX - minX).takeIf { it > 0.0 } ?: 1.0
-        val yRange = (maxY - minY).takeIf { it > 0.0 } ?: 1.0
+    }
+    val minX = series.minOfOrNull { it.second.firstOrNull() ?: 0.0 } ?: 0.0
+    val maxX = series.maxOfOrNull { it.second.lastOrNull() ?: 1.0 } ?: 1.0
+    val allY = series.flatMap { it.third }
+    val minY = allY.minOrNull() ?: -1.0
+    val maxY = allY.maxOrNull() ?: 1.0
+    val xRange = (maxX - minX).takeIf { it > 0.0 } ?: 1.0
+    val yRange = (maxY - minY).takeIf { it > 0.0 } ?: 1.0
+    var zoomScale by remember(primary, secondary, rangeStartMs, rangeEndMs) {
+        mutableStateOf(1f)
+    }
+    var viewportStartFraction by remember(primary, secondary, rangeStartMs, rangeEndMs) {
+        mutableStateOf(0f)
+    }
+    val viewportSpanFraction = 1f / zoomScale
+    val viewportMinX = minX + xRange * viewportStartFraction
+    val viewportXRange = xRange * viewportSpanFraction
+    val viewportMaxX = viewportMinX + viewportXRange
 
-        series.forEachIndexed { index, item ->
+    ChartFrame(
+        modifier = modifier,
+        height = chartHeight,
+        canvasModifier = Modifier.pointerInput(series) {
+            awaitEachGesture {
+                val firstDown = awaitFirstDown(requireUnconsumed = false)
+                var transforming = false
+                var singleDragStarted = false
+                val touchSlop = viewConfiguration.touchSlop
+                do {
+                    val event = awaitPointerEvent()
+                    val pressed = event.changes.filter { it.pressed }
+                    if (pressed.size >= 2) {
+                        transforming = true
+                        val stablePointers = pressed.filter { it.previousPressed }
+                        if (stablePointers.size >= 2) {
+                            val currentCentroid = stablePointers
+                                .map { it.position }
+                                .averageOffset()
+                            val previousCentroid = stablePointers
+                                .map { it.previousPosition }
+                                .averageOffset()
+                            val currentSpan = stablePointers
+                                .map { (it.position - currentCentroid).getDistance() }
+                                .average()
+                                .toFloat()
+                            val previousSpan = stablePointers
+                                .map { (it.previousPosition - previousCentroid).getDistance() }
+                                .average()
+                                .toFloat()
+                            if (previousSpan > 0f && currentSpan > 0f) {
+                                val zoomChange = currentSpan / previousSpan
+                                val oldZoom = zoomScale
+                                val newZoom = (oldZoom * zoomChange).coerceIn(1f, 16f)
+                                val oldSpanFraction = 1f / oldZoom
+                                val newSpanFraction = 1f / newZoom
+                                val left = 66.dp.toPx()
+                                val plotWidthPx = max(
+                                    1f,
+                                    size.width.toFloat() - left - 10.dp.toPx(),
+                                )
+                                val focusFraction = (
+                                    (currentCentroid.x - left) / plotWidthPx
+                                    ).coerceIn(0f, 1f)
+                                val focusDataFraction =
+                                    viewportStartFraction + focusFraction * oldSpanFraction
+                                val panFraction =
+                                    (currentCentroid.x - previousCentroid.x) /
+                                        plotWidthPx * newSpanFraction
+                                val maxStart = (1f - newSpanFraction).coerceAtLeast(0f)
+                                viewportStartFraction = (
+                                    focusDataFraction -
+                                        focusFraction * newSpanFraction -
+                                        panFraction
+                                    ).coerceIn(0f, maxStart)
+                                zoomScale = newZoom
+                                if (newZoom <= 1.001f) {
+                                    zoomScale = 1f
+                                    viewportStartFraction = 0f
+                                }
+                            }
+                        }
+                        pressed.forEach { it.consume() }
+                    } else if (!transforming) {
+                        val change = event.changes.firstOrNull()
+                        if (change != null && change.pressed) {
+                            val totalMovement = change.position - firstDown.position
+                            val shouldPan = zoomScale > 1.001f && (
+                                singleDragStarted ||
+                                    (
+                                        abs(totalMovement.x) > touchSlop &&
+                                            abs(totalMovement.x) > abs(totalMovement.y)
+                                        )
+                                )
+                            if (shouldPan) {
+                                singleDragStarted = true
+                                val currentSpanFraction = 1f / zoomScale
+                                val left = 66.dp.toPx()
+                                val plotWidthPx = max(
+                                    1f,
+                                    size.width.toFloat() - left - 10.dp.toPx(),
+                                )
+                                val panFraction =
+                                    (change.position.x - change.previousPosition.x) /
+                                        plotWidthPx * currentSpanFraction
+                                val maxStart =
+                                    (1f - currentSpanFraction).coerceAtLeast(0f)
+                                viewportStartFraction =
+                                    (viewportStartFraction - panFraction)
+                                        .coerceIn(0f, maxStart)
+                                change.consume()
+                            }
+                        }
+                    }
+                } while (event.changes.any { it.pressed })
+            }
+        },
+    ) {
+        drawAxes("时间 (s)", "角速度 (°/s)")
+        if (series.isEmpty()) return@ChartFrame
+
+        series.forEach { item ->
             val timestamps = item.second
             val values = item.third
             val count = minOf(timestamps.size, values.size)
-            if (count < 2) return@forEachIndexed
-            val color = if (index == 0) Color.White else Green.copy(alpha = 0.7f)
+            if (count < 2) return@forEach
+            val firstVisibleIndex =
+                (timestamps.lowerBound(viewportMinX) - 1).coerceIn(0, count - 1)
+            val lastVisibleIndex =
+                timestamps.upperBound(viewportMaxX).coerceIn(firstVisibleIndex + 1, count)
+            val color = when (item.first.side) {
+                com.buct.xsens.gait.analysis.FootSide.Left -> Orange
+                com.buct.xsens.gait.analysis.FootSide.Right -> Green
+                null -> Color.White
+            }
             val path = Path()
-            for (i in 0 until count) {
-                val x = plotLeft + ((timestamps[i] - minX) / xRange).toFloat() * plotWidth
+            for (i in firstVisibleIndex until lastVisibleIndex) {
+                val x = plotLeft +
+                    ((timestamps[i] - viewportMinX) / viewportXRange).toFloat() * plotWidth
                 val y = plotBottom - ((values[i] - minY) / yRange).toFloat() * plotHeight
-                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                if (i == firstVisibleIndex) path.moveTo(x, y) else path.lineTo(x, y)
             }
             drawPath(path, color = color, style = Stroke(width = 2.2f))
-            drawEventMarkers(item.first.events, timestamps, values, minX, xRange, minY, yRange)
+            drawEventMarkers(
+                events = item.first.events,
+                timestamps = timestamps,
+                values = values,
+                minX = viewportMinX,
+                xRange = viewportXRange,
+                minY = minY,
+                yRange = yRange,
+            )
         }
-        drawRangeLabels(minX / 1000.0, maxX / 1000.0, minY, maxY)
+        drawRangeLabels(viewportMinX / 1000.0, viewportMaxX / 1000.0, minY, maxY)
     }
 }
 
@@ -460,6 +707,14 @@ private fun androidx.compose.ui.unit.Density.findNearestChartPoint(
         }
     }
     return nearestPoint.takeIf { nearestDistanceSquared <= 36.dp.toPx() * 36.dp.toPx() }
+}
+
+private fun List<Offset>.averageOffset(): Offset {
+    if (isEmpty()) return Offset.Zero
+    return Offset(
+        x = sumOf { it.x.toDouble() }.toFloat() / size,
+        y = sumOf { it.y.toDouble() }.toFloat() / size,
+    )
 }
 
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawChartSelection(
@@ -587,7 +842,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawAxes(
     drawLine(Muted, Offset(plotLeft, plotBottom), Offset(plotLeft + plotWidth, plotBottom), 1.5f)
     val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.rgb(113, 113, 122)
-        textSize = 11.sp.toPx()
+        textSize = 12.sp.toPx()
         textAlign = Paint.Align.CENTER
     }
     val verticalCenter = plotTop + plotHeight / 2f
@@ -615,16 +870,42 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawRangeLabels(
 ) {
     val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.rgb(113, 113, 122)
-        textSize = 10.sp.toPx()
+        textSize = 11.sp.toPx()
     }
     val xTickBaseline = plotBottom + 14.dp.toPx()
     val topTickBaseline = plotTop - paint.ascent()
     val bottomTickBaseline = plotBottom - paint.descent()
+    val xIntervalCount = (plotWidth / 112.dp.toPx()).toInt().coerceIn(2, 6)
+    val xSpan = maxX - minX
+
+    repeat(xIntervalCount + 1) { index ->
+        val fraction = index.toFloat() / xIntervalCount
+        val x = plotLeft + plotWidth * fraction
+        drawLine(
+            color = Muted.copy(alpha = 0.7f),
+            start = Offset(x, plotBottom),
+            end = Offset(x, plotBottom + 4.dp.toPx()),
+            strokeWidth = 1.dp.toPx(),
+        )
+    }
+
     drawContext.canvas.nativeCanvas.apply {
-        paint.textAlign = Paint.Align.LEFT
-        drawText("%.1f".format(minX), plotLeft, xTickBaseline, paint)
-        paint.textAlign = Paint.Align.RIGHT
-        drawText("%.1f".format(maxX), plotLeft + plotWidth, xTickBaseline, paint)
+        repeat(xIntervalCount + 1) { index ->
+            val fraction = index.toDouble() / xIntervalCount
+            val value = minX + xSpan * fraction
+            val x = plotLeft + plotWidth * fraction.toFloat()
+            paint.textAlign = when (index) {
+                0 -> Paint.Align.LEFT
+                xIntervalCount -> Paint.Align.RIGHT
+                else -> Paint.Align.CENTER
+            }
+            drawText(
+                String.format(Locale.US, "%.1f", value),
+                x,
+                xTickBaseline,
+                paint,
+            )
+        }
 
         val yTickX = plotLeft - 8.dp.toPx()
         paint.textAlign = Paint.Align.RIGHT
@@ -677,4 +958,32 @@ private fun List<Double>.binarySearchNearest(target: Double): Int {
     val lower = high.coerceIn(indices)
     val upper = low.coerceIn(indices)
     return if (abs(this[lower] - target) <= abs(this[upper] - target)) lower else upper
+}
+
+private fun List<Double>.lowerBound(target: Double): Int {
+    var low = 0
+    var high = size
+    while (low < high) {
+        val middle = (low + high) ushr 1
+        if (this[middle] < target) {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+}
+
+private fun List<Double>.upperBound(target: Double): Int {
+    var low = 0
+    var high = size
+    while (low < high) {
+        val middle = (low + high) ushr 1
+        if (this[middle] <= target) {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
 }

@@ -23,7 +23,7 @@ enum class AnalysisMode(val code: String, val label: String) {
 
     companion object {
         fun fromCode(raw: String?): AnalysisMode =
-            values().firstOrNull { it.code.equals(raw, ignoreCase = true) } ?: LongJump
+            values().firstOrNull { it.code.equals(raw, ignoreCase = true) } ?: GeneralGait
     }
 }
 
@@ -174,6 +174,8 @@ data class AnalysisHistoryItem(
     val hasLeft: Boolean,
     val hasRight: Boolean,
     val mode: AnalysisMode,
+    val stepFrequencySpm: Double?,
+    val strideLengthM: Double?,
 ) {
     val timeLabel: String
         get() = capturedAt?.let { SimpleDateFormat("HH:mm:ss", Locale.US).format(it) }
@@ -201,6 +203,7 @@ data class AnalysisHistoryItem(
                 .orEmpty()
             val mainName = mainFile.name.uppercase(Locale.US)
             val allNames = relatedNames + mainName
+            val summary = readSavedSummary(entity.manifestPath)
             return AnalysisHistoryItem(
                 id = entity.id,
                 athleteId = entity.athleteId,
@@ -213,7 +216,28 @@ data class AnalysisHistoryItem(
                 hasLeft = leftDeviceId != null && allNames.any { it.contains(leftDeviceId) },
                 hasRight = rightDeviceId != null && allNames.any { it.contains(rightDeviceId) },
                 mode = AnalysisMode.fromCode(entity.analysisMode),
+                stepFrequencySpm = summary?.optFiniteDouble("step_frequency_spm")
+                    ?: summary?.optFiniteDouble("step_frequency_hz")?.times(60.0),
+                strideLengthM = summary?.optFiniteDouble("stride_length_m"),
             )
+        }
+
+        private fun readSavedSummary(manifestPath: String): JSONObject? {
+            val manifestFile = File(manifestPath)
+            val cacheRoot = manifestFile.parentFile?.parentFile ?: return null
+            val cacheFile = File(
+                File(cacheRoot, "gait_result_cache"),
+                "${manifestFile.nameWithoutExtension}.analysis.json",
+            )
+            val raw = runCatching {
+                if (cacheFile.isFile) cacheFile.readText(Charsets.UTF_8) else return null
+            }.getOrNull() ?: return null
+            return runCatching { JSONObject(raw).optJSONObject("summary") }.getOrNull()
+        }
+
+        private fun JSONObject.optFiniteDouble(key: String): Double? {
+            val value = optDouble(key, Double.NaN)
+            return value.takeIf { it.isFinite() }
         }
 
         private fun extractDeviceId(name: String): String? {
@@ -259,7 +283,7 @@ data class LanShareUiConfig(
 
 data class AnalysisUiState(
     val section: AnalysisSection = AnalysisSection.Main,
-    val analysisMode: AnalysisMode = AnalysisMode.LongJump,
+    val analysisMode: AnalysisMode = AnalysisMode.GeneralGait,
     val athletes: List<AthleteProfile> = emptyList(),
     val selectedAthleteId: String? = null,
     val attemptNo: String = "R001",

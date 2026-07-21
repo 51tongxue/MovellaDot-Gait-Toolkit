@@ -327,9 +327,15 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     private val _participantConnectingSlots = MutableStateFlow<Set<String>>(emptySet())
     val participantConnectingSlots: StateFlow<Set<String>> =
         _participantConnectingSlots.asStateFlow()
+    private val _participantSyncQueuedSlots = MutableStateFlow<List<String>>(emptyList())
+    val participantSyncQueuedSlots: StateFlow<List<String>> =
+        _participantSyncQueuedSlots.asStateFlow()
+    private val _activeParticipantSyncSlotId = MutableStateFlow<String?>(null)
+    val activeParticipantSyncSlotId: StateFlow<String?> =
+        _activeParticipantSyncSlotId.asStateFlow()
     private var capturePreflightGeneration = 0
-    private var participantSyncJob: Job? = null
-    private var participantSyncSlotId: String? = null
+    private var participantSyncCoordinatorJob: Job? = null
+    private val participantSyncCancellationRequests = mutableSetOf<String>()
     private val participantStopJobs = ConcurrentHashMap<String, Job>()
 
     private val recordChannel = Channel<Pair<Int, SensorData>>(Channel.UNLIMITED)
@@ -679,6 +685,8 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             recEngine.fileInfoReadActiveTargets.value.isNotEmpty() ||
             _participantConnectingSlots.value.isNotEmpty() ||
             _participantPreparingSlots.value.isNotEmpty() ||
+            _activeParticipantSyncSlotId.value != null ||
+            _participantSyncQueuedSlots.value.isNotEmpty() ||
             recEngine.recordingPhase.value != FlashRecordingPhase.Idle ||
             recEngine.recordingExportDecisions.value.isNotEmpty() ||
             recEngine.exportTaskProgress.value.hasPendingFiles ||
@@ -863,6 +871,8 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
     ): Boolean {
         val locked =
             isSyncing.value ||
+                _activeParticipantSyncSlotId.value != null ||
+                _participantSyncQueuedSlots.value.isNotEmpty() ||
                 _isRecording.value ||
                 participantHistoryOperationBusy(slotId) ||
                 slotId in _participantConnectingSlots.value ||
@@ -985,76 +995,173 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             Toast.makeText(getApplication(), "采集准备正在同步设备，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
-        if (participantSyncJob?.isActive == true) {
-            val activeName = _deviceRoleConfig.value.participants
-                .firstOrNull { it.slotId == participantSyncSlotId }
-                ?.athleteName
-                .orEmpty()
+        if (_activeParticipantSyncSlotId.value == slotId) {
             Toast.makeText(
                 getApplication(),
-                if (participantSyncSlotId == slotId) "${participant.athleteName}正在同步"
-                else "${activeName.ifBlank { "其他运动员" }}正在同步，请稍候",
+                "${participant.athleteName}正在同步",
                 Toast.LENGTH_SHORT,
             ).show()
             return
         }
-        participantSyncSlotId = slotId
-        participantSyncJob = viewModelScope.launch {
+        if (slotId in _participantSyncQueuedSlots.value) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}已在同步队列中",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val waitsForAnotherGroup =
+            _activeParticipantSyncSlotId.value != null ||
+                isSyncing.value ||
+                _participantSyncQueuedSlots.value.isNotEmpty()
+        _participantSyncQueuedSlots.value = enqueueParticipantSyncSlot(
+            queuedSlotIds = _participantSyncQueuedSlots.value,
+            activeSlotId = _activeParticipantSyncSlotId.value,
+            requestedSlotId = slotId,
+        )
+        if (waitsForAnotherGroup) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}已加入同步队列",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+        ensureParticipantSyncCoordinator()
+    }
+
+    private fun ensureParticipantSyncCoordinator() {
+        if (participantSyncCoordinatorJob?.isActive == true) return
+        participantSyncCoordinatorJob = viewModelScope.launch {
             try {
-                val recordingQuietWaitMs = recEngine.releaseDevicesForSync(targets)
-                if (recordingQuietWaitMs < 0L) {
-                    Toast.makeText(
-                        getApplication(),
-                        "${participant.athleteName}仍有录制操作，暂不能同步",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                    return@launch
+                while (_participantSyncQueuedSlots.value.isNotEmpty()) {
+                    val slotId = _participantSyncQueuedSlots.value.first()
+                    _participantSyncQueuedSlots.value =
+                        _participantSyncQueuedSlots.value.drop(1)
+                    val participant = _deviceRoleConfig.value.participants
+                        .firstOrNull { it.slotId == slotId }
+                        ?: continue
+                    participantSyncCancellationRequests.remove(slotId)
+                    _activeParticipantSyncSlotId.value = slotId
+                    try {
+                        runParticipantSync(participant)
+                    } finally {
+                        participantSyncCancellationRequests.remove(slotId)
+                        if (_activeParticipantSyncSlotId.value == slotId) {
+                            _activeParticipantSyncSlotId.value = null
+                        }
+                    }
+                    delay(300L)
                 }
-                if (recordingQuietWaitMs > 0L) delay(recordingQuietWaitMs)
-                if (!waitForSyncTargetsReady(targets)) {
-                    Toast.makeText(
-                        getApplication(),
-                        "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                    return@launch
+            } finally {
+                _activeParticipantSyncSlotId.value = null
+                participantSyncCoordinatorJob = null
+                if (_participantSyncQueuedSlots.value.isNotEmpty()) {
+                    ensureParticipantSyncCoordinator()
                 }
-                val prepared = engine.prepareSyncParametersForDevices(
-                    targets,
-                    _recOutputRate.value,
-                    _recFilterProfile.value,
-                )
-                if (!prepared.success) {
-                    Toast.makeText(
-                        getApplication(),
-                        "${participant.athleteName}设备参数未准备好",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                    return@launch
-                }
-                if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
-                if (!waitForSyncTargetsReady(targets)) {
-                    Toast.makeText(
-                        getApplication(),
-                        "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                    return@launch
-                }
-                if (engine.startSync(targets)) return@launch
+            }
+        }
+    }
+
+    private suspend fun runParticipantSync(participant: CaptureParticipantBinding) {
+        val slotId = participant.slotId
+        val targets = participantTargets(participant)
+        if (targets.size != 2 || participantSyncCancelled(slotId)) return
+
+        val recordingQuietWaitMs = recEngine.releaseDevicesForSync(targets)
+        if (recordingQuietWaitMs < 0L) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}仍有录制操作，暂不能同步",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        if (recordingQuietWaitMs > 0L) delay(recordingQuietWaitMs)
+        if (participantSyncCancelled(slotId)) return
+        if (!waitForSyncTargetsReady(targets)) {
+            if (!participantSyncCancelled(slotId)) {
                 Toast.makeText(
                     getApplication(),
                     "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
                     Toast.LENGTH_SHORT,
                 ).show()
-            } finally {
-                participantSyncJob = null
-                participantSyncSlotId = null
             }
+            return
         }
+
+        val prepared = engine.prepareSyncParametersForDevices(
+            targets,
+            _recOutputRate.value,
+            _recFilterProfile.value,
+        )
+        if (!prepared.success) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}设备参数未准备好",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        if (prepared.waitMsBeforeSync > 0L) delay(prepared.waitMsBeforeSync)
+        if (participantSyncCancelled(slotId)) return
+        if (!waitForSyncTargetsReady(targets)) {
+            if (!participantSyncCancelled(slotId)) {
+                Toast.makeText(
+                    getApplication(),
+                    "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            return
+        }
+        if (!engine.startSync(targets)) {
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}${engine.syncReadinessDescription(targets)}",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+
+        val deadline = SystemClock.elapsedRealtime() + 70_000L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (participantSyncCancelled(slotId)) {
+                if (
+                    isSyncing.value &&
+                    syncTargetAddresses.value
+                        .map(LongJumpDeviceRoles::normalizeDeviceId)
+                        .toSet() == targets
+                ) {
+                    engine.stopSync(targets)
+                }
+                return
+            }
+            if (targets.all { deviceSyncStates.value[it] == true }) return
+            if (!isSyncing.value && syncTargetAddresses.value.isEmpty()) {
+                Toast.makeText(
+                    getApplication(),
+                    "${participant.athleteName}同步未完成，请重试",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return
+            }
+            delay(200L)
+        }
+        if (isSyncing.value) engine.stopSync(targets)
+        Toast.makeText(
+            getApplication(),
+            "${participant.athleteName}同步超时，请重试",
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 
+    private fun participantSyncCancelled(slotId: String): Boolean =
+        slotId in participantSyncCancellationRequests
+
     fun stopSync() {
+        _participantSyncQueuedSlots.value = emptyList()
+        _activeParticipantSyncSlotId.value?.let(participantSyncCancellationRequests::add)
         stopSyncTargets(null)
     }
 
@@ -1062,6 +1169,33 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         val participant = _deviceRoleConfig.value.participants
             .firstOrNull { it.slotId == slotId }
             ?: return
+        if (slotId in _participantSyncQueuedSlots.value) {
+            _participantSyncQueuedSlots.value = cancelQueuedParticipantSyncSlot(
+                queuedSlotIds = _participantSyncQueuedSlots.value,
+                slotId = slotId,
+            )
+            Toast.makeText(
+                getApplication(),
+                "${participant.athleteName}已取消等待同步",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val cancellingActiveSync = _activeParticipantSyncSlotId.value == slotId
+        if (cancellingActiveSync) {
+            participantSyncCancellationRequests += slotId
+            val activeTargets = syncTargetAddresses.value
+                .map(LongJumpDeviceRoles::normalizeDeviceId)
+                .toSet()
+            if (!isSyncing.value || activeTargets != participantTargets(participant)) {
+                Toast.makeText(
+                    getApplication(),
+                    "${participant.athleteName}已取消同步",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return
+            }
+        }
         if (participantHistoryOperationBusy(slotId)) {
             Toast.makeText(
                 getApplication(),
@@ -1756,7 +1890,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         fun requestCurrent(): Boolean =
             historyRequestGenerations[slotId] == request.generation
 
-        if (!requestCurrent()) return
+        if (!requestCurrent()) {
+            _historyLoadingParticipantSlots.value -= slotId
+            return
+        }
 
         val participant = _deviceRoleConfig.value.participants
             .firstOrNull { it.slotId == slotId }
@@ -1773,14 +1910,40 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
 
-        val acceptDeadline = SystemClock.elapsedRealtime() + 10 * 60_000L
+        _historyQueuedParticipantSlots.value -= slotId
+        _historyLoadingParticipantSlots.value += slotId
+
+        val targetDevices = engine.getDevices().filter { device ->
+            val address = device.address
+                ?.let(LongJumpDeviceRoles::normalizeDeviceId)
+                ?: return@filter false
+            address in targets &&
+                device.connectionState == DotDevice.CONN_STATE_CONNECTED
+        }
+        if (targetDevices.size != targets.size) {
+            _historyLoadingParticipantSlots.value -= slotId
+            _historyRequestErrors.value +=
+                (slotId to "文件管理器初始化失败，请确认左右脚设备已连接")
+            return
+        }
+
+        // 同步成功后 RecordingEngine 可能尚未接管设备。文件读取前按组补齐
+        // DotRecordingManager，并给初始化产生的 GATT 请求留出释放时间。
+        recEngine.ensureSetup(targetDevices)
+        delay(1_500L)
+        if (!requestCurrent()) {
+            _historyLoadingParticipantSlots.value -= slotId
+            return
+        }
+
+        val acceptDeadline = SystemClock.elapsedRealtime() + 20_000L
         var accepted = false
         while (requestCurrent() && SystemClock.elapsedRealtime() < acceptDeadline) {
             val connected = engine.connectedDevices.value
                 .map(LongJumpDeviceRoles::normalizeDeviceId)
                 .toSet()
             if (!connected.containsAll(targets)) {
-                _historyQueuedParticipantSlots.value -= slotId
+                _historyLoadingParticipantSlots.value -= slotId
                 _historyRequestErrors.value +=
                     (slotId to "设备已断开，回连后可重新读取")
                 return
@@ -1793,14 +1956,13 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         if (!requestCurrent()) return
-        _historyQueuedParticipantSlots.value -= slotId
         if (!accepted) {
+            _historyLoadingParticipantSlots.value -= slotId
             _historyRequestErrors.value +=
-                (slotId to "等待设备操作完成超时，请重试")
+                (slotId to "文件读取未启动，请保持设备靠近后重试")
             return
         }
 
-        _historyLoadingParticipantSlots.value += slotId
         val completionDeadline = SystemClock.elapsedRealtime() + 15_000L
         var disconnectReported = false
         while (requestCurrent() && SystemClock.elapsedRealtime() < completionDeadline) {
@@ -1893,7 +2055,10 @@ class CollectionViewModel(application: Application) : AndroidViewModel(applicati
 
     override fun onCleared() {
         super.onCleared()
-        participantSyncJob?.cancel()
+        participantSyncCoordinatorJob?.cancel()
+        _participantSyncQueuedSlots.value = emptyList()
+        _activeParticipantSyncSlotId.value = null
+        participantSyncCancellationRequests.clear()
         participantStopJobs.values.forEach { it.cancel() }
         participantStopJobs.clear()
         engine.isFlashRecordingDevice = null

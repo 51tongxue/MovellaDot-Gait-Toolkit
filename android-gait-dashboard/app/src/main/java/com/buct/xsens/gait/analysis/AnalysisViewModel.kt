@@ -245,7 +245,7 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
                 isAnalyzing = true,
                 result = null,
                 manifestPath = "",
-                statusMessage = "正在分析",
+                statusMessage = "",
                 errorMessage = "",
                 section = AnalysisSection.Main,
                 rangeStartS = "",
@@ -409,7 +409,7 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
         refreshHistory()
     }
 
-    fun selectHistoryDate(date: String) {
+    fun selectHistoryDate(date: String?) {
         _uiState.update { it.copy(selectedHistoryDate = date) }
     }
 
@@ -611,7 +611,6 @@ class AnalysisViewModel(application: Application) : AndroidViewModel(application
             _uiState.update { state ->
                 val selectedDate = state.selectedHistoryDate
                     ?.takeIf { date -> items.any { it.trainingDate == date } }
-                    ?: items.firstOrNull()?.trainingDate
                 state.copy(history = items, selectedHistoryDate = selectedDate)
             }
         }
